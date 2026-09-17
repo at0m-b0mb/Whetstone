@@ -23,10 +23,24 @@ from typing import Iterator
 
 from ..source import Document, Register, Side, SourceSpec, normalise
 
-#: Extensions worth keeping. Deliberately narrow: lockfiles, minified assets and
-#: generated output are technically text and are pure noise in a corpus this
-#: small.
-_KEEP = {".md", ".py", ".ps1", ".c", ".h", ".sh", ".yaml", ".yml", ".rst", ".txt"}
+#: Prose only. This source is tagged PROSE and must actually be prose.
+#:
+#: It originally kept ``.py``, ``.c``, ``.h``, ``.yaml`` and friends, which meant
+#: thousands of files of embedded-firmware C and Python were filed under the
+#: PROSE register. The register system exists so corpus composition is
+#: measurable, and mislabelling source as prose breaks exactly that. The first
+#: training run showed it: prompted with ``T1547.001`` the model emitted
+#: ``#define RADIOLIB_CFERI 0x0900`` — Flipper Zero firmware constants, learned
+#: from files claiming to be security writing.
+#:
+#: The argumentative READMEs are the reason this source is here at all, and they
+#: are markdown. The C is not lost to anything that wanted it: no register in
+#: this corpus is asking for embedded firmware source.
+#: ``.txt`` is excluded too: it sweeps up CMakeLists.txt, requirements.txt and
+#: other build files, which are configuration rather than writing. Code fenced
+#: *inside* a README stays, and should — prose that illustrates itself with a
+#: snippet is still prose.
+_KEEP = {".md", ".rst"}
 
 #: Virtualenv and toolchain directories. ``.piovenv`` is PlatformIO's, and it is
 #: named here because it got through an earlier pass and put generated
