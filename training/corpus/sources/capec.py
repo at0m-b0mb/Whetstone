@@ -90,8 +90,6 @@ _MIN_BYTES = 1_500_000
 #: an HTML redirect page.
 _ROOT = "Attack_Pattern_Catalog"
 
-_XHTML_NS = "http://www.w3.org/1999/xhtml"
-
 #: Below this a rendering is a header with nothing under it — a malformed entry,
 #: not an attack pattern. Real entries start around 350 characters.
 _MIN_CHARS = 200
@@ -421,7 +419,18 @@ def _header(entry: ET.Element, kind: str) -> list[str]:
 
 
 def _section(title: str, body: list[str]) -> list[str]:
-    return ["", f"## {title}", "", *body] if body else []
+    """A titled section, or nothing at all if there is nothing to put in it.
+
+    The blank filter is not belt-and-braces. Most call sites build ``body`` with
+    a comprehension that already drops empties, but the single-value sections —
+    Description, Summary, Objective — pass ``[_text(...)]`` straight through, and
+    a list holding one empty string is still a truthy list. CAPEC-434 and
+    CAPEC-435 carry a literal ``<Description />``, so that path emitted a bare
+    ``## Description`` header with the next header directly under it: structural
+    noise that teaches a heading can be followed by nothing.
+    """
+    kept = [line for line in body if line.strip()]
+    return ["", f"## {title}", "", *kept] if kept else []
 
 
 def _render_pattern(catalog: _Catalog, entry: ET.Element) -> str:

@@ -323,3 +323,66 @@ class TestShardInterleaving:
 
         texts = [t for _s, t in _interleaved([self._corpus(tmp_path)], seed=3)]
         assert len(texts) == len(set(texts)) == 80
+
+
+class TestBoilerplate:
+    """Corpus-wide line furniture removal, without eating diagram structure.
+
+    The filter's whole difficulty is that packet diagrams, table borders and bit
+    rulers legitimately recur thousands of times across the SYSTEM register. A
+    frequency filter that counts spaces as letters flags a whitespace-padded
+    ruler as prose and strips it — the exact +47% structure the corpus exists to
+    keep. These tests pin the separation.
+    """
+
+    def _docs(self, n, extra=""):
+        from training.corpus.source import Document, Register
+        notice = "This document is subject to BCP 78 and the IETF Trust legal provisions."
+        return [Document(text=f"{notice}\nUnique protocol detail number {i} here.\n{extra}",
+                         source="rfc", register=Register.SYSTEM, ident=str(i))
+                for i in range(n)]
+
+    def test_legal_notice_across_many_docs_is_caught(self):
+        from training.corpus.boilerplate import find_boilerplate
+        bp = find_boilerplate(self._docs(40))
+        assert any("bcp 78" in k for k in bp.keys)
+
+    def test_bit_ruler_is_spared(self):
+        from training.corpus.boilerplate import find_boilerplate
+        ruler = "0                   1                   2                   3"
+        bp = find_boilerplate(self._docs(40, extra=ruler))
+        assert not any(set(k) <= set("0123 ") for k in bp.keys), \
+            "a whitespace-padded bit ruler must not be treated as boilerplate"
+
+    def test_table_border_is_spared(self):
+        from training.corpus.boilerplate import find_boilerplate
+        border = "|          |          |          |          |"
+        bp = find_boilerplate(self._docs(40, extra=border))
+        assert not any("|" in k and k.replace("|", "").strip() == "" for k in bp.keys)
+
+    def test_stripping_does_not_weld_paragraphs(self):
+        from training.corpus.boilerplate import BoilerplateFilter
+        from training.corpus.boilerplate import _normalise_line
+        notice = "this document is subject to bcp 78 and the ietf trust legal provisions"
+        bp = BoilerplateFilter(keys=frozenset({notice}), stats={})
+        text = "First real paragraph.\n" + notice.upper() + "\nSecond real paragraph."
+        out = bp.strip(text)
+        assert notice.upper() not in out
+        assert "First real paragraph." in out and "Second real paragraph." in out
+        # The two real paragraphs must stay on separate lines. Excising a notice
+        # from between them must not weld them together — the same sentence-
+        # welding mistake the RFC page-break handling had to be fixed for.
+        lines = [ln for ln in out.split("\n") if ln.strip()]
+        assert lines == ["First real paragraph.", "Second real paragraph."], lines
+
+    def test_local_repetition_is_not_boilerplate(self):
+        """A line repeated within one document is structure, not furniture."""
+        from training.corpus.boilerplate import find_boilerplate
+        from training.corpus.source import Document, Register
+        docs = [Document(
+            text="\n".join(f"    config_option_{j} = value_that_is_long_enough_here"
+                           for j in range(50)),
+            source="x", register=Register.SYSTEM, ident=str(i)) for i in range(3)]
+        bp = find_boilerplate(docs)
+        # Distinct lines, each in few docs -> nothing qualifies.
+        assert bp.n_lines == 0

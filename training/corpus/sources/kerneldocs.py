@@ -52,7 +52,9 @@ same ``$id``/``$schema``/``maintainers``/``properties``/``required``/
 of hardware properties. That is the manpages/Perl failure in a new costume, and
 :data:`_SUBTREE_CAP` is the same answer: keep enough that the *form* is learned,
 refuse to let one embedded-hardware sub-topic own a third of the largest SYSTEM
-source. What is held back is printed, never silent.
+source. In practice 4,761 files / 13.0 MB are held back and the subtree lands at
+12.3% of what ships, still spanning 88 of its second-level directories. What is
+held back is printed on every build, never silent.
 
 **Indentation is the document.** reStructuredText encodes structure entirely in
 indentation: a ``.. code-block:: c`` directive's body, a definition-list term
@@ -62,17 +64,34 @@ is precisely why it is used here unmodified and no private cleaner exists in
 this file. The ABI files depend on it just as hard — a ``What:``/``Date:``/
 ``Description:`` stanza with its indentation collapsed is a different document.
 
-**Licence.** The kernel's ``COPYING`` states the whole work is GPL-2.0 *only*,
-with the ``Linux-syscall-note`` exception applied to the userspace-visible
-headers, and directs the reader to ``LICENSES/`` for the per-file SPDX tags that
-``Documentation/`` files carry individually. Both ``COPYING`` and the whole
-``LICENSES/`` directory are pulled into the cache alongside the text so the
-claim in :data:`SPEC` stays checkable next to what it covers. Many documentation
-files are dual-licensed — ``GPL-2.0-only OR BSD-2-Clause`` is the near-universal
-tag on the devicetree bindings, and ``GPL-2.0 OR CC-BY-SA-4.0`` appears across
-the prose tree — but the union of the set is GPL-2.0, and this project does not
-redistribute the corpus: the cache is built locally, from upstream, by whoever
-runs the build.
+**Licence, counted rather than assumed.** ``COPYING`` says the kernel is
+provided under ``GPL-2.0 WITH Linux-syscall-note``, and points at ``LICENSES/``
+for the per-file SPDX tags that individual files carry. Both ``COPYING`` and the
+whole ``LICENSES/`` directory are pulled into the cache beside the text, so the
+claim in :data:`SPEC` is checkable against the evidence it came from. Tallying
+the tags across the 10,612 cached files gives::
+
+    4904  GPL-2.0 OR BSD-2-Clause          (essentially all devicetree bindings)
+    2907  (untagged — falls back to COPYING)
+    2110  GPL-2.0
+     320  GFDL-1.1-no-invariants-or-later  (userspace-api/media/)
+     151  GPL-2.0-or-later
+      41  GPL-2.0-or-later OR MIT
+      38  GPL-2.0 OR GFDL-1.1-no-invariants-or-later
+      21  MIT            8  BSD-3-Clause          8  LGPL-2.1 OR BSD-2-Clause
+
+Two things in that table are worth saying out loud, because guessing would have
+got both wrong. The documentation-specific licence in this tree is **GFDL**, not
+Creative Commons: 367 files carry a GFDL tag — 362 of them under
+``userspace-api/media/``, a licence the kernel itself keeps in
+``LICENSES/deprecated/`` — while ``CC-BY-4.0`` appears on exactly seven files,
+always as the dual option in ``GPL-2.0+ OR CC-BY-4.0``, and ``CC-BY-SA-4.0``
+does not appear at all. And the set is not uniformly GPL: a few dozen files are
+MIT-only or BSD-3-Clause-only. So the spec declares the mixture, not a single
+tidy identifier.
+
+None of it is redistributed. The cache is fetched from upstream by whoever runs
+the build, on their own machine; this project ships the adapter, not the corpus.
 """
 
 from __future__ import annotations
@@ -126,10 +145,11 @@ _MARKER = ".kerneldocs-complete.json"
 #: files, which a v1 cache still contains.)
 _CACHE_VERSION = 2
 
-#: v7.2 shipped 11,300 files under ``Documentation/``. A floor an order of
-#: magnitude below that does not police upstream's growth, it catches the two
-#: ways this adapter breaks: the archive ordering assumption failing (abort
-#: before the subtree is reached) and the subtree being renamed.
+#: v7.2 shipped 11,300 files under ``Documentation/``, of which 10,612 survive
+#: the filters and reach the cache. A floor at roughly a third of that does not
+#: police upstream's churn; it catches the two ways this adapter breaks — the
+#: archive ordering assumption failing (so the stream aborts before the subtree
+#: is reached) and the subtree being renamed.
 _MIN_FILES = 4000
 
 #: Never write these into the cache. Images and stylesheets are presentation,
@@ -196,19 +216,59 @@ _RAW_BLOCK = re.compile(
     re.MULTILINE,
 )
 
-#: HTML tags, by name. Emphatically *not* ``<[^>]+>``: this text is full of
-#: ``#include <linux/types.h>``, ``<sysfs-path>`` placeholders and C generics,
-#: and a blanket angle-bracket strip would eat the very vocabulary the source
-#: was collected for. Only tags whose name is real HTML are removed.
-_HTML_TAG = re.compile(
-    r"</?(?:a|b|br|code|div|em|h[1-6]|hr|i|img|li|ol|p|pre|small|span|strong|"
-    r"sub|sup|table|tbody|td|th|thead|tr|tt|u|ul)\b[^>]*>",
-    re.IGNORECASE,
-)
+#: **There is no HTML tag stripper here, and that is a measured decision.**
+#:
+#: reStructuredText has no inline HTML. A ``<p>`` sitting in a ``.rst`` file is
+#: not markup and Sphinx does not render it as markup; HTML can only enter a
+#: document through a ``.. raw:: html`` block, which :data:`_RAW_BLOCK` already
+#: removes whole. So a tag regex over this corpus has nothing true to find, and
+#: two rounds of measurement say so.
+#:
+#: Matching *known HTML tag names* (``a|b|br|code|…|i|p|sub|u``) deleted 152
+#: spans from v7.2, of which **zero were HTML**::
+#:
+#:     hwmon/hwmon<i>/in0_input      -> hwmon/hwmon/in0_input      (x51, ABI)
+#:     Format: <a>,<b>               -> Format: ,                  (kernel-parameters)
+#:     …,<flags>,<table>[,<table>+]  -> …,<flags>,[,+]             (dm-init)
+#:     video=<fbname>:<sub-options…> -> video=<fbname>:            (m68k options)
+#:     Philipp Zabel <p.zabel@…>     -> Philipp Zabel              (x73 e-mails)
+#:
+#: ``<p.zabel@pengutronix.de>`` opens with a word-bounded ``p``, and ``<i>`` in
+#: a sysfs path *is* the letter i. That is precisely the SYSTEM-register
+#: vocabulary this source exists to supply, destroyed by the cleaner meant to
+#: protect it.
+#:
+#: Tightening the rule to *shape* instead of name — closing tags, self-closing
+#: tags, and opening tags carrying a real ``name="value"`` attribute — is no
+#: better. It matches 45 spans in v7.2 and all 45 are content too: the libvirt
+#: XML an administrator must type (``networking/net_failover.rst``,
+#: ``arch/s390/vfio-ap.rst``), the SVG example in ``doc-guide/sphinx.rst``, the
+#: Coccinelle ``</smpl>`` delimiter, and the pseudo-tags kernel notation uses
+#: for scope — ``</IRQ>`` in a stack trace, ``<interrupt>`` … ``</interrupt>``
+#: in ``memory-barriers.txt``.
+#:
+#: Direct evidence for the tree as a whole: zero closing HTML tags, zero
+#: attributed HTML tags, zero ``<br>``/``<hr>``, and all 210 ``.. raw::``
+#: directives are ``latex``. Every angle-bracket construct in this corpus is a
+#: metavariable, a devicetree cell literal, an e-mail address, kernel notation
+#: or a documented XML/SVG example. Nothing is stripped, because there is
+#: nothing to strip and the false-positive cost lands on exactly the text this
+#: source was collected for.
 
-#: Named and numeric HTML entities. ``&`` in shell and C text is left alone;
-#: only the entity forms are decoded, and to the character they denote rather
+#: Named and numeric HTML entities, resolved to the character they denote rather
 #: than deleted, so ``R&amp;D`` becomes ``R&D`` and not ``RD``.
+#:
+#: An unrecognised name is left untouched on purpose, and that branch earns its
+#: keep: all 39 ``&name;`` tokens surviving in the finished output (33 distinct)
+#: are ``&linfo;``, ``&req;``, ``&resp;``, ``&sym;`` (C address-of in example
+#: code: ``opts.link_info = &linfo;``) and ``&avb;``, ``&fiux;``, ``&dsp0;``,
+#: ``&usb1;`` … (devicetree phandle references: ``ethernet0 = &avb;``). None is
+#: an entity. A resolver that deleted whatever it could not name would have
+#: quietly corrupted working C and DT source instead.
+#:
+#: Counted the other way, this table fires **zero** times on v7.2: no named or
+#: numeric entity appears anywhere in the tree. It stays as a by-name guard
+#: that cannot do harm, not because it is doing work.
 _ENTITY = re.compile(r"&(?:#\d{1,5}|#[xX][0-9a-fA-F]{1,5}|[a-zA-Z][a-zA-Z0-9]{1,9});")
 _ENTITIES = {
     "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&apos;": "'",
@@ -335,6 +395,14 @@ def _fetch(cache_dir: Path) -> Path:
         if recorded.get("version") == _CACHE_VERSION and recorded.get("ref") == _REF:
             return cache_dir
 
+    # Retire the marker BEFORE touching the tree it vouches for, so the
+    # invariant "marker present implies tree complete" holds at every instant.
+    # Removing the old tree and renaming the new one into place is not atomic,
+    # and a run interrupted inside that window would otherwise leave a current
+    # marker sitting on top of a half-deleted Documentation/ — which the warm
+    # path above would accept.
+    marker.unlink(missing_ok=True)
+
     staging = cache_dir / ".staging"
     shutil.rmtree(staging, ignore_errors=True)
     try:
@@ -453,11 +521,25 @@ def _keeps(files: list[tuple[str, int]]) -> dict[str, float]:
         return {}
     remainder = total - sum(oversized.values())
     denominator = 1 - _SUBTREE_CAP * len(oversized)
-    if denominator <= 0:
-        # Would need every family capped at a share they cannot all have. Not
-        # reachable with one oversized subtree at 12%, but a silent negative
-        # budget here would delete the source, so fall back to the plain
-        # fraction-of-input budget and let the printed report show the damage.
+    if denominator <= 0 or remainder <= 0:
+        # Two ways the fixed point has no useful solution, and both would
+        # otherwise delete the source rather than cap it.
+        #
+        # ``denominator <= 0``: more than 1/cap families are oversized, so they
+        # cannot all be held to ``cap`` of the result — the solution is negative.
+        #
+        # ``remainder <= 0``: *every* family is oversized, so there is no
+        # uncapped text left to be a share of and ``b = cap·R/(1-cap·n)``
+        # evaluates to exactly 0 — a keep-probability of zero for every family,
+        # which yields an empty source. Measured: seven equal families at 14.3%
+        # each returns ``{a: 0.0 … g: 0.0}`` and 0 documents. Not reachable on
+        # today's tree (only devicetree/ is oversized and the remainder is 30 MB)
+        # but a reorganised Documentation/ would hit it, and silently shipping
+        # nothing is the worst available failure.
+        #
+        # In both cases fall back to the plain fraction-of-input budget, which
+        # bounds nothing but destroys nothing, and let the printed report show
+        # what the cap actually achieved.
         budget = total * _SUBTREE_CAP
     else:
         budget = _SUBTREE_CAP * remainder / denominator
@@ -485,17 +567,21 @@ def _decode(raw: bytes) -> str:
 
 
 def _strip_markup(text: str) -> str:
-    """Remove HTML that leaked into the documentation source.
+    """Remove renderer passthrough. Everything else is the document.
 
     reStructuredText is the corpus here and stays untouched — directives,
     ``::`` literal blocks and indentation are structure, and the brief for this
-    source is explicit that nothing structural is stripped. What goes is the
-    small amount of genuine HTML the tree carries: ``.. raw:: html`` passthrough
-    blocks and the stray inline tag. Markup with no referent teaches nothing and
-    costs vocabulary slots.
+    source is explicit that nothing structural is stripped.
+
+    That leaves exactly one thing to remove: ``.. raw::`` blocks, which are
+    literal renderer instructions (all 210 in v7.2 are ``latex`` —
+    ``\\begingroup``, ``\\tiny``, ``\\setlength{\\tabcolsep}{2pt}``) and appear
+    in no tool output anywhere. No tag stripping happens, for the reasons
+    measured at :data:`_RAW_BLOCK`'s neighbour above; the entity resolver stays
+    because it is by-name and therefore cannot corrupt, though on v7.2 it
+    resolves nothing at all.
     """
     text = _RAW_BLOCK.sub("", text)
-    text = _HTML_TAG.sub("", text)
     if "&" in text:
         text = _ENTITY.sub(_entity, text)
     return text
@@ -579,25 +665,27 @@ def _documents(path: Path) -> Iterator[Document]:
 SPEC = SourceSpec(
     name="kerneldocs",
     license=(
-        "GPL-2.0-only, per the kernel's own COPYING: 'Linux kernel is provided "
-        "under GPL-2.0 ... with an explicit syscall exception "
-        "(Linux-syscall-note)'. Individual Documentation/ files carry per-file "
-        "SPDX tags, very commonly the dual forms "
-        "'GPL-2.0-only OR BSD-2-Clause' (devicetree bindings) and "
-        "'GPL-2.0 OR CC-BY-SA-4.0' (prose). COPYING and the full LICENSES/ "
-        "directory are cached next to the text so the claim is checkable. The "
-        "corpus built from this is NOT redistributed; each build fetches "
-        "upstream itself."
+        "GPL-2.0 WITH Linux-syscall-note, per the kernel's own COPYING, which "
+        "is the licence of the work as a whole and the fallback for the 2,907 "
+        "cached files carrying no tag of their own. Documentation/ files are "
+        "individually SPDX-tagged and the set is genuinely mixed: 4,904 are "
+        "'GPL-2.0-only OR BSD-2-Clause' (the devicetree bindings), 2,110 plain "
+        "GPL-2.0, 320 are GFDL-1.1-no-invariants-or-later (userspace-api/media/ "
+        "— GFDL, NOT CC-BY-SA; CC-BY-4.0 appears on seven files), and a few "
+        "dozen are MIT-only or BSD-3-Clause-only. Counted from the tree, not "
+        "assumed. COPYING and the full LICENSES/ directory are cached beside "
+        "the text so the claim is checkable. Nothing here is redistributed: "
+        "each build fetches from upstream on its own machine."
     ),
     url="https://github.com/torvalds/linux/tree/v7.2/Documentation",
     register=Register.SYSTEM,
     side=Side.NEUTRAL,
     fetch=_fetch,
     documents=_documents,
-    #: v7.2 yields roughly 8,000 documents after translations are dropped, the
-    #: devicetree cap is applied and short stubs are floored out. The floor sits
-    #: well under that so it catches breakage, not upstream churn.
-    expect_min_docs=5000,
+    #: v7.2 yields 5,795 documents / 35.1M characters after translations are
+    #: dropped, the devicetree cap is applied and short stubs are floored out.
+    #: The floor sits well under that so it catches breakage, not upstream churn.
+    expect_min_docs=4800,
     notes=(
         "Documentation/ only, streamed out of the codeload tarball and aborted "
         "once the reader passes LICENSES/ — 15 MB on the wire instead of ~250 MB, "
@@ -607,7 +695,10 @@ SPEC = SourceSpec(
         "because 5,636 YAML binding schemas share one skeleton; images, "
         "stylesheets and the Sphinx build machinery are excluded. RST directive "
         "and code-block indentation is preserved — normalise() keeps horizontal "
-        "whitespace and no private cleaner exists here; only raw HTML blocks, "
-        "HTML tags and entities are removed."
+        "whitespace and no private cleaner exists here. The only thing removed "
+        "from the text is '.. raw::' renderer passthrough: there is no HTML in "
+        "this tree, and a tag stripper measurably deletes sysfs metavariables "
+        "(hwmon<i>), kernel-parameter formats (<a>,<b>), maintainer e-mails and "
+        "libvirt XML examples instead."
     ),
 )

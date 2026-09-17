@@ -96,6 +96,7 @@ def build(
     *,
     only: list[str] | None = None,
     balance: bool = False,
+    max_source_share: float = 0.30,
     min_chars: int = 40,
 ) -> list[BuildStats]:
     """Fetch, clean, dedupe and write the corpus. Returns per-source stats."""
@@ -147,18 +148,21 @@ def build(
             print(f"   ! {st.error}")
 
         collected[spec.name] = kept
-        note = f"   {st.docs:,} docs  {st.chars/1e6:.2f}M chars"
-        if st.duplicates:
-            note += f"  ({st.duplicates:,} duplicates dropped)"
-        print(note)
+        _note_source(st)
         if st.docs < spec.expect_min_docs:
             print(f"   ! expected at least {spec.expect_min_docs:,} docs but got "
                   f"{st.docs:,} — upstream layout may have changed")
 
+    _strip_boilerplate(collected, stats)
+
+    if max_source_share:
+        _cap_source_share(collected, stats, max_source_share)
+
     if balance:
         _apply_balance(collected, stats)
 
-    # Write after balancing so what lands on disk is what the report describes.
+    # Write after boilerplate removal and balancing so what lands on disk is
+    # exactly what the report describes.
     for spec in specs:
         docs = collected.get(spec.name, [])
         if not docs:
@@ -177,6 +181,96 @@ def build(
     _write_provenance(out_dir, specs, stats)
     print("\n" + balance_report(stats))
     return stats
+
+
+def _note_source(st: BuildStats) -> None:
+    note = f"   {st.docs:,} docs  {st.chars/1e6:.2f}M chars"
+    if st.duplicates:
+        note += f"  ({st.duplicates:,} duplicates dropped)"
+    print(note)
+
+
+def _cap_source_share(
+    collected: dict[str, list[Document]], stats: list[BuildStats], max_share: float
+) -> None:
+    """No single source may exceed ``max_share`` of the corpus by characters.
+
+    RFC is the reason this exists. At 505M chars it was 64% of the whole corpus
+    on its own — protocol text is genuinely valuable, but a model trained on a
+    corpus that is two-thirds one source learns that source's voice and little
+    else. This is the same argument the man-page family cap makes one level down,
+    applied across sources: breadth is what a from-scratch model has instead of
+    scale, and one source drowning the rest throws that away.
+
+    A cap, not an exclusion — RFC keeps its full share of the ceiling. What is
+    trimmed is the excess beyond it, oldest-document-first so the trim is
+    deterministic. Everything dropped is logged; a silent cap reads as coverage
+    that is not there.
+    """
+    total = sum(s.chars for s in stats if s.docs)
+    if not total:
+        return
+    ceiling = int(total * max_share)
+    st_by_name = {s.name: s for s in stats}
+
+    for name, docs in collected.items():
+        used = sum(d.n_chars for d in docs)
+        if used <= ceiling:
+            continue
+        kept: list[Document] = []
+        running = 0
+        for doc in docs:
+            if running + doc.n_chars > ceiling:
+                st_by_name[name].dropped_for_balance += 1
+                continue
+            running += doc.n_chars
+            kept.append(doc)
+        dropped = len(docs) - len(kept)
+        print(f"\n  source cap: {name} was {used/total:.0%} of the corpus "
+              f"({used/1e6:.0f}M chars); trimmed {dropped:,} docs to the "
+              f"{max_share:.0%} ceiling ({ceiling/1e6:.0f}M).")
+        collected[name] = kept
+        st_by_name[name].chars = running
+        st_by_name[name].docs = len(kept)
+
+
+def _strip_boilerplate(
+    collected: dict[str, list[Document]], stats: list[BuildStats]
+) -> None:
+    """Remove corpus-wide line furniture after every source is collected.
+
+    Runs here, once, rather than in each adapter, because a line is only
+    boilerplate relative to the *whole* corpus: the IETF copyright block is
+    furniture because it spans thousands of RFCs, and no single adapter can see
+    that. Two passes are unavoidable — you cannot know a line recurs until you
+    have read everything — but both are cheap line scans over text already in
+    memory.
+    """
+    from dataclasses import replace as _replace
+
+    from .boilerplate import find_boilerplate
+
+    all_docs = [d for docs in collected.values() for d in docs]
+    if not all_docs:
+        return
+    bp = find_boilerplate(all_docs)
+    if not bp.keys:
+        return
+
+    print("\n" + bp.report())
+    st_by_name = {s.name: s for s in stats}
+    for name, docs in collected.items():
+        rebuilt: list[Document] = []
+        for doc in docs:
+            stripped = bp.strip(doc.text)
+            # A document that was *entirely* boilerplate (a bare notice page)
+            # drops out rather than becoming an empty string.
+            if len(stripped) < 40:
+                continue
+            rebuilt.append(doc if stripped == doc.text else _replace(doc, text=stripped))
+        collected[name] = rebuilt
+        st_by_name[name].chars = sum(d.n_chars for d in rebuilt)
+        st_by_name[name].docs = len(rebuilt)
 
 
 def _apply_balance(collected: dict[str, list[Document]], stats: list[BuildStats]) -> None:
@@ -360,6 +454,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--only", nargs="*", help="build only these sources")
     p.add_argument("--balance", action="store_true",
                    help="subsample over-represented registers toward target")
+    p.add_argument("--max-source-share", type=float, default=0.30,
+                   help="cap any single source at this fraction of the corpus "
+                        "(0 disables). RFC alone was 64%% without it.")
     p.add_argument("--report", action="store_true",
                    help="report on an existing build without fetching")
     args = p.parse_args(argv)
@@ -379,7 +476,8 @@ def main(argv: list[str] | None = None) -> int:
         print(balance_report(stats))
         return 0
 
-    build(args.out, args.cache, only=args.only, balance=args.balance)
+    build(args.out, args.cache, only=args.only, balance=args.balance,
+          max_source_share=args.max_source_share)
     return 0
 
 

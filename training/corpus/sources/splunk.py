@@ -44,15 +44,25 @@ moment a cleaner touches it, and the shape is half of what the model is here to
 learn.
 
 **On markup (rule 6, measured rather than assumed).** This source contains
-*zero* HTML. It does contain 924 angle-bracketed tokens — ``<Data Name='...'>``,
-``<TimeCreated ...>``, ``</System>`` — and 45 entity references — ``&gt;``,
-``&amp;``, ``&lt;``. Every one was inspected and every one is real tool output
-or a real query literal: the angle brackets are Windows Event XML inside
-``example_log`` samples, and the entities are inside SPL string literals such as
-``TaskContent = "*&lt;Hidden&gt;true&lt;/Hidden&gt;*"``, which match the
-*escaped* XML Splunk actually indexes from Event 4698. Unescaping them would
-silently break the searches. So nothing is stripped here, and that is a finding,
-not an omission.
+*zero* HTML — the only two matches for an HTML tag name are one ``<img...>``
+literal inside an SPL comment. It does contain 5,701 angle-bracketed tokens
+(1,110 distinct) and 45 entity references — ``&gt;`` x20, ``&amp;`` x16,
+``&lt;`` x8, ``&#151;`` x1. Every kind was inspected and every one is real tool
+output, a real query literal, or a regex:
+
+* 4,974 of the angle tokens are Windows Event XML — ``<Data Name='...'>``,
+  ``<TimeCreated ...>``, ``</System>`` — inside ``data_sources`` ``example_log``
+  samples, i.e. verbatim log lines.
+* Most of the remaining 727 are **named capture groups in SPL ``rex``
+  commands**: ``rex field=Message "The (?<service>[-\\(\\)\\s\\w]+) service
+  entered the (?<state>\\w+) state"``. A markup stripper would eat the group
+  names and leave a regex that no longer compiles.
+* The entities are inside SPL string literals such as
+  ``TaskContent = "*&lt;Hidden&gt;true&lt;/Hidden&gt;*"``, which match the
+  *escaped* XML Splunk actually indexes from Event 4698.
+
+Unescaping or stripping would silently break the searches. So nothing is
+stripped here, and that is a finding, not an omission.
 
 **Two caps, both printed at build time.** See :data:`_BLOCK_QUOTA` and
 :data:`_CSV_MAX_ROWS`, and :func:`_documents` for the report.
@@ -97,8 +107,9 @@ _MARKER = ".fetched.json"
 #: Trees kept, as prefixes of the repo-relative path.
 #:
 #: ``detections/`` is the point of the source (2,169 analytics). ``removed/``
-#: holds 377 more — detections, baselines and investigations retired from the
-#: shipping app — whose SPL is no less real; their ids do not collide with the
+#: holds 360 more — detections, baselines and investigations retired from the
+#: shipping app, once its 17 stories are excluded by ``_SKIPPED_TREES`` —
+#: whose SPL is no less real; their ids do not collide with the
 #: live tree (checked: zero overlap), so they are volume with no duplication.
 #: ``baselines/`` are supporting searches, ``macros/`` define the backticked
 #: names every analytic calls, ``data_sources/`` is the log-schema dictionary
@@ -159,7 +170,11 @@ _CSV_MAX_ROWS = 200
 #: **No unique text is lost.** Every distinct block still appears, up to 50
 #: times; only the 51st identical copy is dropped. 50 exposures is ample for a
 #: form, and the alternative is a model that has memorised one drilldown
-#: paragraph 717 times.
+#: paragraph 717 times. Verified by replay on the live tree: 1,771 copies
+#: totalling 1,394,044 chars are dropped, and all 187 distinct
+#: ``drilldown_searches`` blocks and all 860 distinct ``how_to_implement``
+#: blocks are still present verbatim in the emitted corpus — zero distinct
+#: blocks disappear entirely.
 _BLOCK_QUOTA = 50
 _BLOCK_MIN_CHARS = 300
 
@@ -362,7 +377,7 @@ def _split_blocks(raw: str) -> list[tuple[str, str]]:
     return blocks
 
 
-def _cap_repeats(raw: str, seen: Counter[tuple[str, str]],
+def _cap_repeats(raw: str, rel: str, seen: Counter[tuple[str, str]],
                  held: Counter[str]) -> str:
     """Drop long top-level blocks already emitted :data:`_BLOCK_QUOTA` times.
 
@@ -371,7 +386,16 @@ def _cap_repeats(raw: str, seen: Counter[tuple[str, str]],
     truncated — and every distinct block survives up to the quota.
     """
     blocks = _split_blocks(raw)
-    assert "\n".join(text for _, text in blocks) == raw, "block split is lossy"
+    # Not an assert: `python -O` strips asserts, and this is the invariant that
+    # stands between an upstream formatting change and a corpus of silently
+    # truncated YAML. It has to survive optimisation.
+    if "\n".join(text for _, text in blocks) != raw:
+        raise SourceError(
+            f"splunk: the top-level block splitter is lossy on {rel}. Upstream "
+            "formatting has changed (a top-level key now appears inside a block "
+            "scalar, or a line ending survived normalisation). Fix the splitter "
+            "rather than emitting truncated documents."
+        )
 
     out: list[str] = []
     for key, text in blocks:
@@ -393,8 +417,12 @@ def _csv_document(path: Path, rel: str, held: Counter[str]) -> str | None:
     collecting — the same argument the atomic adapter makes for restating a
     technique id above every command.
     """
+    # utf-8-sig, not utf-8: six of these tables ship a UTF-8 BOM, and a BOM is
+    # not a control byte, so normalise() leaves it in place — landing a stray
+    # U+FEFF on the header line of six documents. It decodes plain UTF-8
+    # identically, so this costs nothing on the other sixty-eight tables.
     try:
-        text = path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeDecodeError):
         return None
     lines = text.split("\n")
@@ -454,9 +482,10 @@ def _documents(path: Path) -> Iterator[Document]:
             body = _csv_document(file, rel, held)
         elif rel.endswith(".yml"):
             try:
-                body = _cap_repeats(file.read_text(encoding="utf-8"), seen, held)
+                raw = file.read_text(encoding="utf-8-sig")
             except (OSError, UnicodeDecodeError):
                 continue
+            body = _cap_repeats(raw, rel, seen, held)
         else:
             continue
         if body is None:
@@ -510,6 +539,12 @@ def _report(root: Path, emitted: int, by_tree: Counter[str],
         print(f"   splunk: held back {held['lookup rows']:,} lookup-CSV rows "
               f"({held['lookup chars']:,} chars) past {_CSV_MAX_ROWS} rows per table; "
               "one dynamic-DNS table was 57% of that tree on its own.")
+    if held["short files"]:
+        # This counter existed and was never printed, which is precisely the
+        # silent edit the rest of this report is written to avoid. On the live
+        # tree it is 13 lookup CSVs that ship a header row and no data.
+        print(f"   splunk: dropped {held['short files']} files under {_MIN_CHARS} "
+              "chars — empty lookup tables (header row, no rows).")
 
     marker = root.parent / _MARKER
     try:
@@ -542,11 +577,13 @@ SPEC = SourceSpec(
     side=Side.BLUE,
     fetch=_fetch,
     documents=_documents,
-    #: 3,186 files were collected on ``develop`` at the time of writing
-    #: (2,169 detections, 377 removed, 315 data sources, 255 macros, 103 lookup
-    #: definitions, 74 lookup tables, 41 baselines). The floor sits well below
-    #: that so ordinary churn is quiet, while a tree that stops being walked —
-    #: the realistic regression — trips it immediately.
+    #: 3,317 files were collected on ``develop`` at the time of writing
+    #: (2,169 detections, 360 removed, 315 data sources, 255 macros, 103 lookup
+    #: definitions, 74 lookup tables, 41 baselines), yielding 3,304 documents —
+    #: the 13 missing ones are lookup tables that are a header row and nothing
+    #: else. The floor sits well below that so ordinary churn is quiet, while a
+    #: tree that stops being walked — the realistic regression — trips it
+    #: immediately.
     expect_min_docs=2800,
     notes=(
         "Raw YAML per file, verbatim: the SPL in `search:` keeps its leading "

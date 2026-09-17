@@ -126,6 +126,13 @@ _LICENSE_FILE = "LICENSE.md"
 #: presence means "extraction finished". An interrupted fetch therefore
 #: re-downloads instead of leaving a half tree that a later run would mistake
 #: for a complete cache and silently train on.
+#:
+#: It records ``ref``, ``url`` and the page directories that were actually
+#: populated, and the warm path checks all three. Presence alone is not enough:
+#: a marker that only vouches for ``cheatsheets/`` accepts a cache whose
+#: ``cheatsheets_draft/`` has gone missing, which costs eight documents and
+#: still clears :data:`expect_min_docs` — the one shape of loss that is loud
+#: nowhere.
 _MARKER = ".owasp-complete.json"
 
 #: 122 cheat sheets plus 8 drafts were present when this was written. A floor
@@ -140,12 +147,13 @@ _MIN_CHARS = 400
 
 #: No single topic family may exceed this share of the source's characters.
 #:
-#: Measured before choosing it, over all 130 pages: identity and access
-#: (authentication, authorization, session, SAML, OAuth, JWT, passwords) is the
-#: largest real family at 17.9%, then language/framework guides at 13.0%,
-#: injection at 12.3%, web platform at 10.4%, process at 10.4%, infrastructure
-#: at 9.5%, AI at 4.8% and cryptography at 2.5%; the remaining 19.3% is 31
-#: one-off topics that share no family at all. Nothing is held back today.
+#: Measured with this module's own :func:`_family` over the 126 documents it
+#: actually yields: identity and access (authentication, authorization,
+#: session, SAML, OAuth, JWT, passwords) is the largest family at 17.7%, then
+#: language and framework guides at 13.6%, injection at 12.6%, infrastructure
+#: at 12.2%, web platform at 11.7%, process at 11.3%, AI at 7.9% and
+#: cryptography at 3.1%; the remaining 9.9% is ``other``, meaning one-off topics
+#: that share no family at all. Nothing is held back today.
 #:
 #: The cap exists anyway, as a tripwire rather than a filter. This source grows
 #: by pull request, its recent growth is concentrated (six AI cheat sheets and
@@ -311,11 +319,35 @@ def _fetch(cache_dir: Path) -> Path:
     upstream changes, and a populated cache short-circuits on the marker file
     rather than on the directory, because a directory can exist and be half
     written. Nothing is created outside *cache_dir*, including the temporaries.
+
+    The marker has to be *read*, not merely counted. Three cheap checks, each
+    for a loss that is otherwise silent:
+
+    * every page directory the marker says it populated is still a directory —
+      a cache that kept ``cheatsheets/`` and lost ``cheatsheets_draft/`` yields
+      118 documents instead of 126 and still clears ``expect_min_docs=100``, so
+      nothing in the build log would say the drafts had gone;
+    * the recorded ``ref`` and ``url`` match the ones this module declares —
+      otherwise repointing :data:`_REF` at a tag keeps serving the old tree
+      while the provenance file names the new one;
+    * a marker written by an older version of this adapter, which recorded no
+      page directories, is treated as stale. That costs exactly one re-download
+      on first run after the upgrade.
     """
     cache_dir.mkdir(parents=True, exist_ok=True)
     marker = cache_dir / _MARKER
-    if marker.is_file() and (cache_dir / _PAGE_DIRS[0]).is_dir():
-        return cache_dir
+    if marker.is_file():
+        try:
+            recorded = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            recorded = {}
+        cached_dirs = recorded.get("page_dirs")
+        if (isinstance(cached_dirs, list) and cached_dirs
+                and recorded.get("ref") == _REF
+                and recorded.get("url") == _TARBALL_URL
+                and all(isinstance(name, str) and (cache_dir / name).is_dir()
+                        for name in cached_dirs)):
+            return cache_dir
 
     archive = cache_dir / "_cheatsheetseries.tar.gz"
     staging = cache_dir / "_incoming"
@@ -337,8 +369,19 @@ def _fetch(cache_dir: Path) -> Path:
                 "training on a fraction of the blue prose register."
             )
 
+        # Retire the marker BEFORE the swap starts destroying the tree it
+        # vouches for. Removing the old directory and renaming the new one into
+        # place is not atomic, and an interruption inside that window would
+        # otherwise leave a current marker on top of a cheatsheets/ that had
+        # been replaced and a cheatsheets_draft/ that had not yet been — which
+        # the warm path above would accept. It is retired here rather than at
+        # the top of the function so that a failed download leaves the existing
+        # cache intact and usable offline.
+        marker.unlink(missing_ok=True)
+
         # Swap into place only once the staging tree is known good, so a reader
         # never observes a partially written cheatsheets/ directory.
+        populated: list[str] = []
         for subdir in _PAGE_DIRS:
             incoming = staging / subdir
             if not incoming.is_dir():
@@ -346,6 +389,7 @@ def _fetch(cache_dir: Path) -> Path:
             final = cache_dir / subdir
             shutil.rmtree(final, ignore_errors=True)
             incoming.replace(final)
+            populated.append(subdir)
         license_file = staging / _LICENSE_FILE
         if license_file.is_file():
             license_file.replace(cache_dir / _LICENSE_FILE)
@@ -359,6 +403,11 @@ def _fetch(cache_dir: Path) -> Path:
                 "url": _TARBALL_URL,
                 "repo": _REPO,
                 "ref": _REF,
+                # What the warm path is allowed to vouch for. Recorded rather
+                # than assumed from _PAGE_DIRS: the day upstream drops
+                # cheatsheets_draft/, requiring it would re-download the
+                # tarball on every single build, forever.
+                "page_dirs": populated,
                 "pages": written,
                 "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             },
@@ -418,9 +467,18 @@ def _family_budgets(pages: list[tuple[str, Path]]) -> dict[str, int]:
         return {}
 
     cap = int(total * _FAMILY_CAP)
-    # "other" is not a family, it is the absence of one: 31 unrelated topics
-    # that happen to share no keyword. Capping it would hold back the source's
-    # broadest coverage in the name of protecting the corpus from breadth.
+    # "other" is not a family, it is the absence of one: 15 documents (9.9% of
+    # the yielded characters) on unrelated topics that happen to share no
+    # keyword — automotive, drones, bots, XS-Leaks, NoSQL, terminology. Capping
+    # it would hold back the source's broadest coverage in the name of
+    # protecting the corpus from breadth.
+    #
+    # The cost of that exemption, stated so it is not discovered later: a topic
+    # family this crude classifier does not know about lands in "other" and is
+    # therefore uncappable. Thirty new cheat sheets on one subject none of the
+    # keyword lists mention would grow unchecked. If "other" ever climbs much
+    # past its present share, that is the signal to teach :func:`_family` the
+    # new family, not to cap the bucket.
     return {
         family: cap
         for family, size in sizes.items()
