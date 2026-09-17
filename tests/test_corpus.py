@@ -128,9 +128,27 @@ class TestTargets:
             assert reg in REGISTER_TARGETS
 
     def test_shell_and_system_dominate(self):
-        """The registers the first corpus was starved of get the largest share."""
-        assert REGISTER_TARGETS[Register.SHELL] >= 0.25
-        assert REGISTER_TARGETS[Register.SYSTEM] >= 0.25
+        """The registers the first corpus was starved of get the largest share.
+
+        Asserted as a ranking rather than as thresholds. The earlier version
+        hardcoded >= 0.25 for both and broke the moment TRAJECTORY was raised
+        from 0 to 0.08 — a change that did not violate the intent at all, since
+        shell and system remained the two largest. A test that fails on a
+        correct change is measuring the wrong thing.
+        """
+        ranked = sorted(REGISTER_TARGETS.items(), key=lambda kv: -kv[1])
+        top_two = {reg for reg, _share in ranked[:2]}
+        assert top_two == {Register.SHELL, Register.SYSTEM}, ranked
+
+    def test_trajectory_register_is_funded(self):
+        """The task register must not sit at zero.
+
+        It did, and the benchmark found it: action-json scored 0/5 because the
+        corpus contained no trajectories at all, so the protocol tokens were in
+        the vocabulary but never used. A zero here is not a neutral default, it
+        is a model that never sees the job it exists to do.
+        """
+        assert REGISTER_TARGETS[Register.TRAJECTORY] > 0
 
 
 class TestBalanceReport:

@@ -96,13 +96,19 @@ class Side(Enum):
 #: must both read (command output) and reason about, and they are precisely
 #: where the first tokenizer attempt was starved.
 REGISTER_TARGETS: dict[Register, float] = {
-    Register.SHELL: 0.28,
-    Register.SYSTEM: 0.26,
-    Register.DETECTION: 0.14,
-    Register.ADVERSARY: 0.12,
-    Register.ADVISORY: 0.10,
-    Register.PROSE: 0.10,
-    Register.TRAJECTORY: 0.00,   # grows later, from the runtime's audit logs
+    Register.SHELL: 0.26,
+    Register.SYSTEM: 0.24,
+    Register.DETECTION: 0.13,
+    Register.ADVERSARY: 0.11,
+    Register.ADVISORY: 0.09,
+    Register.PROSE: 0.09,
+    # Raised from 0.00 once the benchmark showed why it mattered. action-json
+    # scored 0/5 — the model could not emit an action the registry accepts —
+    # and the cause was that this register was empty, so the protocol tokens
+    # sat in the vocabulary unused. 8% is modest on purpose: trajectories are
+    # highly structured and repetitive, so a little teaches the format while a
+    # lot would teach this machine's particular service list.
+    Register.TRAJECTORY: 0.08,
 }
 
 
