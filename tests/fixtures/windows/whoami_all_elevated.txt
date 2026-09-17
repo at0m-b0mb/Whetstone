@@ -1,0 +1,35 @@
+
+USER INFORMATION
+----------------
+
+User Name         SID
+================= =============================================
+desktop-7a1\alice S-1-5-21-1004336348-1177238915-682003330-1001
+
+
+GROUP INFORMATION
+-----------------
+
+Group Name                           Type             SID          Attributes
+==================================== ================ ============ ===============================================================
+Everyone                             Well-known group S-1-1-0      Mandatory group, Enabled by default, Enabled group
+BUILTIN\Administrators               Alias            S-1-5-32-544 Mandatory group, Enabled by default, Enabled group, Group owner
+BUILTIN\Users                        Alias            S-1-5-32-545 Mandatory group, Enabled by default, Enabled group
+Mandatory Label\High Mandatory Level Label            S-1-16-12288
+
+
+PRIVILEGES INFORMATION
+----------------------
+
+Privilege Name           Description                               State
+======================== ========================================= ========
+SeIncreaseQuotaPrivilege Adjust memory quotas for a process        Disabled
+SeSecurityPrivilege      Manage auditing and security log          Disabled
+SeTakeOwnershipPrivilege Take ownership of files or other objects  Disabled
+SeLoadDriverPrivilege    Load and unload device drivers            Disabled
+SeBackupPrivilege        Back up files and directories             Disabled
+SeRestorePrivilege       Restore files and directories             Disabled
+SeDebugPrivilege         Debug programs                            Enabled
+SeImpersonatePrivilege   Impersonate a client after authentication Enabled
+SeChangeNotifyPrivilege  Bypass traverse checking                  Enabled
+

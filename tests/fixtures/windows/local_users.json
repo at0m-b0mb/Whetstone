@@ -1,0 +1,46 @@
+[
+  {
+    "Name": "Administrator",
+    "Enabled": false,
+    "SID": "S-1-5-21-1004336348-1177238915-682003330-500",
+    "Description": "Built-in account for administering the computer/domain",
+    "LastLogon": null,
+    "PasswordRequired": true,
+    "PasswordExpires": null,
+    "PasswordLastSet": "2026-01-04T09:11:02+00:00",
+    "PrincipalSource": "Local"
+  },
+  {
+    "Name": "alice",
+    "Enabled": true,
+    "SID": "S-1-5-21-1004336348-1177238915-682003330-1001",
+    "Description": "",
+    "LastLogon": "2026-09-16T22:15:40+00:00",
+    "PasswordRequired": true,
+    "PasswordExpires": null,
+    "PasswordLastSet": "2026-06-01T08:00:00+00:00",
+    "PrincipalSource": "Local"
+  },
+  {
+    "Name": "svcweb",
+    "Enabled": true,
+    "SID": "S-1-5-21-1004336348-1177238915-682003330-1105",
+    "Description": "IIS web service account",
+    "LastLogon": "2026-09-17T06:00:01+00:00",
+    "PasswordRequired": false,
+    "PasswordExpires": "2027-06-01T08:00:00+00:00",
+    "PasswordLastSet": "2026-05-01T08:00:00+00:00",
+    "PrincipalSource": "Local"
+  },
+  {
+    "Name": "Guest",
+    "Enabled": false,
+    "SID": "S-1-5-21-1004336348-1177238915-682003330-501",
+    "Description": "Built-in account for guest access to the computer/domain",
+    "LastLogon": null,
+    "PasswordRequired": false,
+    "PasswordExpires": null,
+    "PasswordLastSet": null,
+    "PrincipalSource": "Local"
+  }
+]

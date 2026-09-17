@@ -1,0 +1,14 @@
+
+Currently stored credentials:
+
+    Target: LegacyGeneric:target=git:https://github.com
+    Type: Generic
+    User: alice@example.com
+
+    Target: Domain:target=TERMSRV/fileserver01
+    Type: Domain Password
+    User: CORP\backup_svc
+
+    Target: WindowsLive:target=virtualapp/didlogical
+    Type: Generic
+    User: 02abcdef

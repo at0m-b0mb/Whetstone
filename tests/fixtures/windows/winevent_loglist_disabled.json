@@ -1,0 +1,3 @@
+[
+  {"LogName": "Security", "IsEnabled": false, "RecordCount": 0, "MaximumSizeInBytes": 20971520, "LogMode": "Circular", "LastWriteTime": "2026-05-01T00:00:00+00:00"}
+]

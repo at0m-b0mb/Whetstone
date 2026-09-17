@@ -1,0 +1,8 @@
+Machine Name,Policy Target,Subcategory,Subcategory GUID,Inclusion Setting,Exclusion Setting
+DESKTOP-7A1,System,Security System Extension,{0cce9211-69ae-11d9-bed3-505054503030},No Auditing,
+DESKTOP-7A1,System,Logon,{0cce9215-69ae-11d9-bed3-505054503030},Success and Failure,
+DESKTOP-7A1,System,Logoff,{0cce9216-69ae-11d9-bed3-505054503030},Success,
+DESKTOP-7A1,System,Process Creation,{0cce922b-69ae-11d9-bed3-505054503030},No Auditing,
+DESKTOP-7A1,System,Process Termination,{0cce922c-69ae-11d9-bed3-505054503030},No Auditing,
+DESKTOP-7A1,System,Audit Policy Change,{0cce922f-69ae-11d9-bed3-505054503030},Success,
+DESKTOP-7A1,System,Sensitive Privilege Use,{0cce9228-69ae-11d9-bed3-505054503030},No Auditing,

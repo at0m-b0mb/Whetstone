@@ -1,0 +1,28 @@
+[
+  {
+    "id": 4688,
+    "time": "2026-09-17T07:58:41.1230000+00:00",
+    "provider": "Microsoft-Windows-Security-Auditing",
+    "log": "Security",
+    "data": {
+      "SubjectUserName": "SVCWEB",
+      "NewProcessId": "0x1400",
+      "NewProcessName": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+      "CommandLine": "powershell.exe -nop -w hidden -enc SQBFAFgA",
+      "ParentProcessName": "C:\\Windows\\System32\\svchost.exe"
+    }
+  },
+  {
+    "id": 4688,
+    "time": "2026-09-17T07:59:02.5550000+00:00",
+    "provider": "Microsoft-Windows-Security-Auditing",
+    "log": "Security",
+    "data": {
+      "SubjectUserName": "SVCWEB",
+      "NewProcessId": "0x1770",
+      "NewProcessName": "C:\\Windows\\System32\\rundll32.exe",
+      "CommandLine": "rundll32.exe C:\\Users\\Public\\evil.dll,Start",
+      "ParentProcessName": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+    }
+  }
+]

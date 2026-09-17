@@ -1,0 +1,17 @@
+{
+  "run_keys": {
+    "hive": "HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+    "name": "SecurityHealth",
+    "command": "%windir%\\system32\\SecurityHealthSystray.exe"
+  },
+  "scheduled_tasks": {
+    "name": "OnlyTask",
+    "path": "\\",
+    "action": "C:\\tools\\one.exe",
+    "author": "admin",
+    "state": "Ready"
+  },
+  "startup_folder": [],
+  "wmi_subscriptions": [],
+  "auto_services": []
+}

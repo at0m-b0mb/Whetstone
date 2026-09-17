@@ -1,0 +1,7 @@
+{
+  "services": [
+    {"Name": "Sysmon64", "Status": "Running"}
+  ],
+  "driver_registered": true,
+  "config_hash": "SHA256=2E9F...A1"
+}

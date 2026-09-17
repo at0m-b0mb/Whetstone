@@ -1,0 +1,12 @@
+{
+  "id": 1,
+  "time": "2026-09-17T07:58:41.9990000+00:00",
+  "provider": "Microsoft-Windows-Sysmon",
+  "log": "Microsoft-Windows-Sysmon/Operational",
+  "data": {
+    "Image": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+    "CommandLine": "powershell.exe -nop -w hidden -enc SQBFAFgA",
+    "ParentImage": "C:\\Windows\\System32\\svchost.exe",
+    "User": "DESKTOP-7A1\\svcweb"
+  }
+}

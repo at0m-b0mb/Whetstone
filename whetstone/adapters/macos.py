@@ -175,22 +175,48 @@ def parse_sudo_l(stdout: str, stderr: str, rc: int) -> dict[str, Any]:
 
     ``-n`` guarantees no password prompt: if a password would be needed, sudo
     prints to stderr and exits non-zero, and we report that rather than hang.
+
+    The critical distinction — and the one a naive parser gets wrong — is that
+    ``(ALL) ALL`` grants every command but **still requires a password**;
+    passwordless root exists only when an entry carries ``NOPASSWD:`` *and*
+    grants ``ALL``. Conflating the two produces a privilege-escalation chain
+    that claims instant root when a password is actually needed, which the live
+    ``sudo -n id`` check then contradicts. So ``passwordless_all`` is set only by
+    a genuine ``NOPASSWD: ... ALL`` line.
     """
     blob = f"{stdout}\n{stderr}"
+    base = {"available": None, "passwordless_all": False, "may_run_all": False,
+            "nopasswd_commands": [], "entries": []}
     if "password is required" in blob or (rc != 0 and "may run" not in stdout):
-        return {"available": None, "reason": "password required (not tested interactively)",
-                "passwordless": False}
+        return {**base, "reason": "listing needs a password; not tested interactively"}
     if "may not run sudo" in blob or "not allowed" in blob:
-        return {"available": False, "passwordless": False, "entries": []}
-    entries = []
-    passwordless = False
+        return {**base, "available": False}
+
+    entries: list[str] = []
+    nopasswd_cmds: list[str] = []
+    passwordless_all = False
+    may_run_all = False
+    grants_all = re.compile(r"\)\s*(?:NOPASSWD:\s*)?ALL\b")
     for line in stdout.splitlines():
         s = line.strip()
-        if s.startswith("(") and ")" in s:
-            entries.append(s)
-            if "NOPASSWD" in s or "(ALL) ALL" in s or "(ALL : ALL) ALL" in s:
-                passwordless = True
-    return {"available": True, "passwordless": passwordless, "entries": entries[:20]}
+        if not (s.startswith("(") and ")" in s):
+            continue
+        entries.append(s)
+        is_nopasswd = "NOPASSWD:" in s
+        is_all = bool(grants_all.search(s))
+        if is_nopasswd and is_all:
+            passwordless_all = True
+        elif is_all:
+            may_run_all = True
+        if is_nopasswd:
+            nopasswd_cmds.append(s.split("NOPASSWD:", 1)[1].strip())
+    return {
+        "available": True,
+        "passwordless_all": passwordless_all,
+        "may_run_all": may_run_all,
+        "nopasswd_commands": nopasswd_cmds[:20],
+        "entries": entries[:20],
+    }
 
 
 def parse_ps(text: str) -> list[dict[str, Any]]:
@@ -1336,18 +1362,30 @@ def _vuln_privilege_path(self: MacosAdapter, verb: Verb, action: Action) -> dict
     if idr.get("uid") == 0:
         chains.append({"chain": "already_root", "steps": ["current identity is uid 0"],
                       "to": "root"})
-    if sudo.get("passwordless"):
+    if sudo.get("passwordless_all"):
         chains.append({
             "chain": "sudo_nopasswd",
-            "steps": ["current identity has a passwordless sudo entry",
+            "steps": ["current identity has a NOPASSWD sudo entry granting ALL",
                       "run any command via `sudo` as root without a prompt"],
             "to": "root", "reachable_now": True,
         })
-    elif sudo.get("available"):
+    elif sudo.get("may_run_all") or sudo.get("available"):
         chains.append({
             "chain": "sudo_password",
-            "steps": ["current identity may sudo",
-                      "root reachable with this user's password"],
+            "steps": ["current identity may run `sudo` (ALL) but a password is "
+                      "required — no NOPASSWD:ALL entry",
+                      "root reachable interactively with this user's password"],
+            "to": "root", "reachable_now": False,
+        })
+    if sudo.get("nopasswd_commands"):
+        # Specific NOPASSWD commands are a lesser primitive: root only if one of
+        # them is itself exploitable (a shell-out, a writable target, etc.).
+        chains.append({
+            "chain": "sudo_nopasswd_commands",
+            "steps": [f"passwordless sudo for specific commands: "
+                      f"{sudo['nopasswd_commands']}",
+                      "root only if one of these can be turned into code "
+                      "execution (GTFOBins-style); not automatically a full path"],
             "to": "root", "reachable_now": False,
         })
     if is_admin:
@@ -1450,8 +1488,11 @@ def _harden_fix_permissions(self: MacosAdapter, verb: Verb, action: Action) -> A
 
     Removes group/other write with a stdlib ``chmod`` (no shell). The previous
     mode is captured first and returned so the change can be reverted by hand.
+
+    The object to correct is the ``path`` parameter (the verb's HOST target
+    scopes the *engagement*, not the file), so params take precedence.
     """
-    target = action.target or action.params.get("path")
+    target = action.params.get("path") or action.target
     if not target:
         return Observation(action=action, ok=False, platform="macos",
                            error="no path supplied to harden.fix_permissions.")
@@ -1624,7 +1665,14 @@ def _exploit_service_permissions(self: MacosAdapter, verb: Verb, action: Action)
                            error=f"service {service!r} not found among writable "
                                  "launchd scopes.")
     facts = _stat_facts(program)
-    if not facts or not facts["writable_by_me"]:
+    if facts is None:
+        return Observation(
+            action=action, ok=False, platform="macos",
+            data={"service": service, "program": program, "plist": source},
+            error=(f"service binary {program} cannot be stat'd (it does not "
+                   "exist, or its directory is not searchable by this identity), "
+                   "so the technique does not apply."))
+    if not facts["writable_by_me"]:
         return Observation(
             action=action, ok=False, platform="macos",
             data={"service": service, "program": program, "plist": source,

@@ -53,7 +53,14 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from ..actions import Action, Observation, Verb
-from .base import Adapter, AdapterError, CommandResult, register_adapter, run, which
+from .base import (
+    Adapter,
+    AdapterError,
+    CommandResult,
+    register_adapter,
+    run,
+    which,
+)
 
 __all__ = ["WindowsAdapter"]
 
@@ -87,9 +94,23 @@ def _powershell() -> str | None:
 def _run_ps(script: str, *, timeout: int = 45) -> CommandResult:
     """Run a PowerShell script as an argv list, or a synthetic failure result.
 
-    The script is passed as a single ``-Command`` argument. It is never
-    interpolated into a shell, so a parameter that reached this script (for
-    example a service name) cannot break out of it into command syntax.
+    The script is passed as a single ``-Command`` argument, so no *operating
+    system* shell ever parses it.
+
+    That is worth stating precisely, because the obvious reading of it is wrong
+    and cost this file three injection bugs. PowerShell parses the whole
+    ``-Command`` string as **source code**. The argv boundary protects the
+    boundary between Python and the OS; it does nothing inside the string. Any
+    value spliced into ``script`` is PowerShell source, and a value like
+    ``$(Start-Process calc.exe)`` inside a double-quoted PowerShell literal runs
+    before the cmdlet is reached.
+
+    So the rule in this module is: **a script that embeds a value either quotes
+    it with :func:`_ps_quote` or does not embed it at all.** The second option is
+    preferred and is what :func:`_lookup_service` does — fetch with a constant
+    script and select the row in Python. Values that must be embedded are
+    validated against what the Windows object can actually be named
+    (:func:`_is_valid_service_name`, :func:`_is_valid_logname`) *and* quoted.
     """
     exe = _powershell()
     if exe is None:
@@ -137,7 +158,22 @@ def _load_json(text: str) -> Any:
         text = text[1:]
     if not text:
         return None
-    return json.loads(text)
+    try:
+        return json.loads(text)
+    except ValueError as exc:
+        # A command that exited 0 and printed something that is not JSON is a
+        # real occurrence on Windows \u2014 a cmdlet that wrote to the host, a
+        # localised "Access is denied.", a truncated pipeline. Raising the bare
+        # JSONDecodeError would reach the agent as
+        # "Expecting value: line 1 column 1", which names neither the command
+        # nor the problem. AdapterError is the contract's failure channel and
+        # carries a message worth reading, with a slice of the offending output
+        # so a human can see what actually came back.
+        snippet = text[:160].replace("\n", " ")
+        raise AdapterError(
+            f"expected JSON from PowerShell but got something else ({exc}); "
+            f"output began: {snippet!r}"
+        ) from None
 
 
 def _as_list(obj: Any) -> list[Any]:
@@ -1060,29 +1096,45 @@ def scan_for_credentials(text: str, source: str, *, redact: bool = True) -> list
     de-duplicate, never the secret itself.
     """
     findings: list[dict[str, Any]] = []
+
+    def _record(label: str, secret: str, lineno: int) -> None:
+        if not secret or len(secret) < 3:
+            return
+        findings.append(
+            {
+                "source": source,
+                "line": lineno,
+                "kind": label,
+                "match": _redact_secret(secret) if redact else secret,
+                "redacted": redact,
+            }
+        )
+
+    # Line-oriented patterns: shell histories, config files, connection strings —
+    # the secret lives on one line, and the line number is a useful locator.
     for lineno, line in enumerate((text or "").splitlines(), start=1):
-        for label, pattern in _CREDENTIAL_PATTERNS:
+        for label, pattern in _LINE_PATTERNS:
             for m in pattern.finditer(line):
                 secret = m.group("secret") if "secret" in m.groupdict() else m.group(0)
-                if not secret or len(secret) < 3:
-                    continue
-                findings.append(
-                    {
-                        "source": source,
-                        "line": lineno,
-                        "kind": label,
-                        "match": _redact_secret(secret) if redact else secret,
-                        "redacted": redact,
-                    }
-                )
+                _record(label, secret, lineno)
+
+    # Block patterns run over the whole blob because the match spans lines — an
+    # unattend ``<Password><Value>…</Value>`` is split across three lines, and a
+    # per-line scan would never see it.
+    for label, pattern in _BLOCK_PATTERNS:
+        for m in pattern.finditer(text or ""):
+            secret = m.group("secret") if "secret" in m.groupdict() else m.group(0)
+            lineno = (text or "").count("\n", 0, m.start()) + 1
+            _record(label, secret, lineno)
+
     return findings
 
 
 #: Deliberately conservative patterns. Each is anchored on a key/label so a bare
 #: high-entropy string does not trip it — the goal is "a credential is sitting in
 #: cleartext here", which is a specific, defensible finding, not "this looks
-#: random". Extending this list is how the blue side improves the check.
-_CREDENTIAL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+#: random". Extending these lists is how the blue side improves the check.
+_LINE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("password_assignment", re.compile(
         r"(?i)(?:password|passwd|pwd)\s*[:=]\s*(?P<secret>[^\s'\";]{3,})")),
     ("connection_string", re.compile(
@@ -1092,9 +1144,13 @@ _CREDENTIAL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("api_key", re.compile(
         r"(?i)(?:api[_-]?key|secret[_-]?key|access[_-]?key)\s*[:=]\s*(?P<secret>[A-Za-z0-9/+_\-]{8,})")),
     ("aws_key", re.compile(r"(?P<secret>AKIA[0-9A-Z]{16})")),
-    ("private_key", re.compile(r"(?P<secret>-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)")),
+)
+
+_BLOCK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("unattend_password", re.compile(
-        r"(?i)<Password>\s*<Value>(?P<secret>[^<]{3,})</Value>")),
+        r"(?is)<Password>\s*(?:<PlainText>[^<]*</PlainText>\s*)?<Value>(?P<secret>[^<]{3,})</Value>")),
+    ("private_key", re.compile(
+        r"(?P<secret>-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----)")),
 )
 
 
@@ -1837,7 +1893,9 @@ def _harden_enable_telemetry(self: WindowsAdapter, verb: Verb, action: Action) -
 
 @WindowsAdapter.implements("harden.fix_permissions")
 def _harden_fix_permissions(self: WindowsAdapter, verb: Verb, action: Action) -> Any:
-    path = action.target or action.params.get("path")
+    # The path is the 'path' parameter, not the action target: this verb's target
+    # is the HOST it runs on, and the object to correct is a parameter.
+    path = action.params.get("path")
     if not path:
         return Observation(action=action, ok=False, platform="windows",
                            error="no path given to correct")
@@ -1894,11 +1952,26 @@ def _harden_remove_persistence(self: WindowsAdapter, verb: Verb, action: Action)
                                  "result": r.to_dict()},
                            error="" if r.ok else r.stderr.strip()[:200])
     if kind == "startup_folder":
+        # Confined on purpose. `entry` is a free-text parameter, so without this
+        # check the verb is "delete any file the model names" wearing a blue
+        # verb's label — the most destructive primitive in the file, reachable
+        # by a typo rather than by an attack. A startup-folder entry lives in a
+        # Startup directory by definition, so anything else is refused.
+        target = Path(rest)
+        if not _in_startup_folder(target):
+            return Observation(
+                action=action, ok=False, platform="windows",
+                error=f"{rest!r} is not inside a Startup folder; refusing to "
+                "delete it. This verb removes startup-folder persistence, and "
+                "an entry outside one of the Startup directories is not that.",
+                data={"path": str(target), "searched": _startup_folders()},
+            )
         try:
-            existed = Path(rest).exists()
-            Path(rest).unlink(missing_ok=True)
+            existed = target.exists()
+            target.unlink(missing_ok=True)
             return Observation(action=action, ok=True, platform="windows",
-                               data={"removed": entry, "existed": existed})
+                               data={"removed": entry, "path": str(target),
+                                     "existed": existed})
         except OSError as exc:
             return Observation(action=action, ok=False, platform="windows",
                                error=str(exc))
@@ -1921,14 +1994,10 @@ def _exploit_service_permissions(self: WindowsAdapter, verb: Verb, action: Actio
     service = str(action.params["service"]).strip()
     restore = bool(action.params.get("restore", True))
 
-    svc_res = _run_ps(
-        f"Get-CimInstance Win32_Service -Filter \"Name='{service}'\" | "
-        "Select-Object Name,PathName,StartName,State | ConvertTo-Json -Depth 3"
-    )
-    rows = parse_services(svc_res.stdout) if svc_res.ok else []
-    if not rows:
-        return Observation(action=action, ok=False, platform="windows",
-                           error=f"service {service!r} not found")
+    row, err = _lookup_service(service, "Name,PathName,StartName,State")
+    if row is None:
+        return Observation(action=action, ok=False, platform="windows", error=err or "")
+    rows = [row]
     exe = parse_pathname(rows[0].get("path") or "")["executable"]
     if not exe:
         return Observation(action=action, ok=False, platform="windows",
@@ -1995,15 +2064,10 @@ def _exploit_unquoted_path(self: WindowsAdapter, verb: Verb, action: Action) -> 
     service = str(action.params["service"]).strip()
     restore = bool(action.params.get("restore", True))
 
-    svc_res = _run_ps(
-        f"Get-CimInstance Win32_Service -Filter \"Name='{service}'\" | "
-        "Select-Object Name,PathName,StartName | ConvertTo-Json -Depth 3"
-    )
-    rows = parse_services(svc_res.stdout) if svc_res.ok else []
-    if not rows:
-        return Observation(action=action, ok=False, platform="windows",
-                           error=f"service {service!r} not found")
-    path = rows[0].get("path") or ""
+    row, err = _lookup_service(service, "Name,PathName,StartName")
+    if row is None:
+        return Observation(action=action, ok=False, platform="windows", error=err or "")
+    path = row.get("path") or ""
     points = interception_paths(path)
     if not points:
         return Observation(
@@ -2146,9 +2210,12 @@ def _postex_credential_dump(self: WindowsAdapter, verb: Verb, action: Action) ->
             "reports which accounts/targets have credentials exposed and how many, "
             "never the secret material. LSASS memory (the classic credential dump "
             "surface) is deliberately not read: doing so needs SeDebug and a memory "
-            "read this verb will not perform. Set redact=false in a lab engagement "
-            "to collect raw values."
+            "read this verb will not perform. This handler has no collection mode: "
+            "it never reads a secret value, so redact=false does not unlock one — "
+            "the flag is recorded because the engagement asked for it, and the "
+            "output is identical either way."
         ),
+        "redaction_is_structural": True,
         "lsass_note": "LSASS not accessed; would require elevated debug rights",
     }
 
@@ -2247,7 +2314,7 @@ def _postex_persistence_install(self: WindowsAdapter, verb: Verb, action: Action
         script = (
             "$p=$PROFILE.CurrentUserCurrentHost;"
             "New-Item -ItemType File -Path $p -Force | Out-Null;"
-            f"Add-Content -Path $p -Value '{marker_line}';"
+            f"Add-Content -Path $p -Value {_ps_quote(marker_line)};"
             "[pscustomobject]@{profile=$p} | ConvertTo-Json -Compress"
         )
         res = _run_ps(script)
@@ -2257,7 +2324,7 @@ def _postex_persistence_install(self: WindowsAdapter, verb: Verb, action: Action
         if cleanup and profile_path:
             rm = _run_ps(
                 f"(Get-Content -LiteralPath {_ps_quote(profile_path)}) "
-                f"| Where-Object {{ $_ -ne '{marker_line}' }} "
+                f"| Where-Object {{ $_ -ne {_ps_quote(marker_line)} }} "
                 f"| Set-Content -LiteralPath {_ps_quote(profile_path)}"
             )
             removed = rm.ok
@@ -2284,9 +2351,14 @@ def _postex_persistence_install(self: WindowsAdapter, verb: Verb, action: Action
 @WindowsAdapter.implements("postex.privilege_escalate")
 def _postex_privilege_escalate(self: WindowsAdapter, verb: Verb, action: Action) -> Any:
     chain = str(action.params["chain"]).strip()
-    # Chains come from vuln.privilege_path and encode which primitive to run. We
-    # only ever execute a primitive the analysis named; an unknown chain is
-    # refused rather than guessed.
+    # Chains are *shaped* like what vuln.privilege_path emits, and the prefix
+    # decides which primitive runs. Be precise about the strength of that check:
+    # only the prefix is verified. This handler holds no record of the earlier
+    # analysis, so it cannot confirm the service named after the prefix was one
+    # vuln.privilege_path actually reported — it verifies the *form* of the
+    # chain, not its provenance. The primitive it dispatches to re-checks the
+    # finding on the live host before it changes anything, which is what makes
+    # an invented service name harmless rather than merely unlikely.
     if chain.startswith("chain:service_binary:"):
         service = chain.split(":", 2)[2]
         sub = action.__class__(verb_id="exploit.service_permissions",
@@ -2311,8 +2383,10 @@ def _postex_privilege_escalate(self: WindowsAdapter, verb: Verb, action: Action)
         )
     return Observation(
         action=action, ok=False, platform="windows",
-        error=f"chain {chain!r} was not produced by vuln.privilege_path; refusing to "
-        "attempt an escalation route that was not identified first.",
+        error=f"chain {chain!r} is not one of the escalation routes this adapter "
+        "can carry out. Run vuln.privilege_path first and pass a chain id it "
+        "reported: 'chain:service_binary:<service>', "
+        "'chain:unquoted_path:<service>' or 'chain:seimpersonate'.",
     )
 
 
@@ -2416,12 +2490,23 @@ def _failed(action: Action, res: CommandResult, what: str) -> Observation:
 def _ps_quote(value: str) -> str:
     """Single-quote a value for embedding in a PowerShell string literal.
 
-    PowerShell single-quoted strings escape an embedded quote by doubling it.
-    This is only ever used for values *we* generate (paths we already hold), not
-    model-supplied command syntax — the argv boundary is still what stops
-    injection; this just keeps a legitimate path with a space intact.
+    **This is mandatory for every interpolated value, including ones we believe
+    we generated ourselves.** The argv boundary in :func:`whetstone.adapters.base.run`
+    stops the *operating system's* shell from parsing our parameters — it does
+    nothing about PowerShell, which parses the whole ``-Command`` string as
+    source. A value spliced into that string is source code, so it has to be
+    quoted here or PowerShell will execute it.
+
+    PowerShell single-quoted strings escape an embedded quote by doubling it and
+    perform no ``$`` or ``$(...)`` expansion, which is why single quotes are the
+    safe form and double quotes are not: ``"$(calc)"`` runs ``calc``.
+
+    Embedded NUL and newline are stripped rather than escaped — neither can
+    appear in a legitimate service name, log name or path, and both are ways to
+    confuse a reader of the audit log about what actually ran.
     """
-    return "'" + value.replace("'", "''") + "'"
+    cleaned = value.replace("\x00", "").replace("\r", " ").replace("\n", " ")
+    return "'" + cleaned.replace("'", "''") + "'"
 
 
 def _icacls_weak_principals(text: str) -> list[str]:
@@ -2431,24 +2516,146 @@ def _icacls_weak_principals(text: str) -> list[str]:
     Everyone, Authenticated Users, BUILTIN\\Users — on a service binary is the
     weak-permission finding. Admin/SYSTEM/TrustedInstaller grants are expected
     and ignored, so the result is only the *unexpected* writers.
+
+    Two icacls quirks are handled: the *first* ACE prints on the same line as the
+    object's path (``C:\\dir\\svc.exe BUILTIN\\Users:(M)``), so a leading path
+    token is stripped from an un-indented line; and permissions can arrive as
+    several parenthesised groups (``(I)(M)`` or ``(OI)(CI)(F)`` for directories),
+    so every group is gathered before checking for a write bit.
     """
     weak: list[str] = []
     broad = ("everyone", "authenticated users", "builtin\\users", "users",
              "nt authority\\authenticated users", "domain users")
-    for line in (text or "").splitlines():
-        s = line.strip()
-        m = re.search(r"\(([^)]*)\)\s*$", s)
-        if not m:
+    for raw in (text or "").splitlines():
+        if ":(" not in raw:
             continue
-        rights = m.group(1).upper().replace(" ", "")
+        indented = raw[:1].isspace()
+        s = raw.strip()
+        if not indented:
+            # First ACE line leads with the object path; drop that first token.
+            head, _, rest = s.partition(" ")
+            if ":(" in rest:
+                s = rest.strip()
+        idx = s.find(":(")
+        if idx <= 0:
+            continue
+        principal = s[:idx].strip()
+        rights = "".join(re.findall(r"\(([^)]*)\)", s[idx:])).upper().replace(" ", "")
         if not any(tok in rights for tok in ("W", "M", "F", "WD", "AD")):
             continue
-        principal = s[: m.start()].strip()
-        # icacls may print multiple (..)(..) groups; take the text before the first.
-        principal = re.split(r"\s*\(", principal)[0].strip()
         if principal.lower() in broad:
             weak.append(principal)
     return sorted(set(weak))
+
+
+#: The two Startup directories Windows runs at logon. Kept as a function rather
+#: than a constant because both depend on environment variables that differ per
+#: user and are absent off-Windows (where this must still be importable).
+_STARTUP_SUFFIX = r"Microsoft\Windows\Start Menu\Programs\Startup"
+
+
+def _startup_folders() -> list[str]:
+    """Absolute paths of the machine and per-user Startup folders.
+
+    Joined with an explicit backslash rather than ``Path`` or ``os.path.join``,
+    which use the *host's* separator: on the Mac this project's CI runs on they
+    produce ``C:\\ProgramData/Microsoft\\Windows\\...``, which then matches
+    nothing. A Windows path is built as a Windows path on every platform, so the
+    guard below behaves identically here and there — and is therefore testable
+    here, which is the whole point of the parse/execute split in this module.
+    """
+    out: list[str] = []
+    for base_var in ("ProgramData", "APPDATA"):
+        base = os.environ.get(base_var)
+        if base:
+            out.append(base.rstrip("\\/") + "\\" + _STARTUP_SUFFIX)
+    return out
+
+
+def _normalise_win_path(path: str) -> str:
+    """Lower-case a Windows path with ``/`` folded to ``\\`` and ``..`` resolved.
+
+    Hand-rolled instead of ``os.path.normpath`` because that function applies
+    *POSIX* semantics off-Windows: it leaves ``a\\b\\..\\c`` untouched on a Mac,
+    so a traversal would sail through a prefix check in CI and only be caught in
+    production. Resolving the segments here makes the check mean the same thing
+    on both platforms.
+    """
+    segments: list[str] = []
+    for seg in path.replace("/", "\\").split("\\"):
+        if seg == "." or seg == "":
+            continue
+        if seg == "..":
+            if segments:
+                segments.pop()
+            continue
+        segments.append(seg)
+    return "\\".join(segments).lower()
+
+
+def _in_startup_folder(path: Path) -> bool:
+    """Whether ``path`` is inside a Startup folder — the guard on a deletion.
+
+    Compared case-insensitively because Windows paths are, and after resolving
+    ``..`` so that ``...\\Startup\\..\\..\\important.docx`` does not pass a naive
+    prefix test. Returns False when neither Startup folder can be located, which
+    is the safe answer: a deletion that cannot be shown to be in scope does not
+    happen.
+    """
+    folders = _startup_folders()
+    if not folders:
+        return False
+    candidate = _normalise_win_path(str(path))
+    for folder in folders:
+        root = _normalise_win_path(folder)
+        if root and candidate.startswith(root + "\\") and len(candidate) > len(root) + 1:
+            return True
+    return False
+
+
+def _lookup_service(service: str, fields: str) -> tuple[dict[str, Any] | None, str | None]:
+    """One service row by name, selected in Python rather than in a WQL filter.
+
+    The obvious implementation is ``Get-CimInstance Win32_Service -Filter
+    "Name='<service>'"``, and it is wrong: that filter is built by splicing a
+    model-supplied name into a *double-quoted* PowerShell string, where
+    ``$(...)`` is expanded before Get-CimInstance ever sees it. A service named
+    ``$(Start-Process calc.exe)`` would run. The argv boundary does not help —
+    PowerShell parses the whole ``-Command`` string as source, so the injection
+    happens inside the one argument we handed it.
+
+    So nothing is interpolated at all: the full service list is fetched with a
+    constant script and the row is matched here, case-insensitively as the SCM
+    does. The name is still validated first, so a name that could not be a
+    service is refused with a clear message instead of matching nothing.
+
+    Returns ``(row, error)`` — exactly one of the two is set.
+    """
+    if not _is_valid_service_name(service):
+        return None, (
+            f"{service!r} is not a legal Windows service name (no slash or "
+            "backslash, no control characters, at most 256 chars). "
+            "Refusing to use it."
+        )
+    # `fields` is a literal at both call sites and must stay one: it is the only
+    # thing this function splices into PowerShell source. Asserted rather than
+    # trusted, so a future caller that threads a parameter through here fails
+    # loudly instead of reopening the injection this function exists to close.
+    if not re.fullmatch(r"[A-Za-z0-9,]+", fields):
+        raise AdapterError(
+            f"_lookup_service fields must be a literal column list, got {fields!r}"
+        )
+    res = _run_ps(
+        f"Get-CimInstance Win32_Service | Select-Object {fields} | "
+        "ConvertTo-Json -Depth 3"
+    )
+    if not res.ok:
+        return None, f"could not enumerate services: {res.stderr.strip()[:200]}"
+    wanted = service.lower()
+    for row in parse_services(res.stdout):
+        if (row.get("name") or "").lower() == wanted:
+            return row, None
+    return None, f"service {service!r} not found"
 
 
 def _reg_hive_path(hive: str) -> str:
@@ -2475,6 +2682,30 @@ _NAMED_RULES: dict[str, tuple[str, list[int]]] = {
 }
 
 
+#: A Windows event-log (channel) name is ``Provider-Name/Channel`` or a classic
+#: name like ``Security`` / ``Windows PowerShell``. Letters, digits, space,
+#: hyphen, underscore, dot and slash cover every real channel; nothing else is
+#: accepted, because this value is spliced into PowerShell source.
+_LOGNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._/-]{0,254}$")
+
+#: The SCM's actual rule for a service name: 1-256 characters, and neither the
+#: forward slash nor the backslash. Everything else is legal, which is wider than
+#: it looks — ``MSSQL$SQLEXPRESS`` is a real service on any box with a named SQL
+#: Server instance, so a tidier-looking alphanumeric pattern would refuse to
+#: examine a service that genuinely exists. The validator is therefore the real
+#: rule and nothing stricter; what keeps a ``$`` harmless is that the name is
+#: matched in Python by :func:`_lookup_service` and never reaches PowerShell.
+_SERVICE_NAME_FORBIDDEN = re.compile(r"[/\\\x00-\x1f\x7f]")
+
+
+def _is_valid_logname(name: str) -> bool:
+    return bool(_LOGNAME_RE.match(name or ""))
+
+
+def _is_valid_service_name(name: str) -> bool:
+    return bool(name) and len(name) <= 256 and not _SERVICE_NAME_FORBIDDEN.search(name)
+
+
 def _resolve_rule(rule: str) -> tuple[str, list[int], str] | None:
     """Resolve a rule id to (logname, event ids, label), or None if unknown.
 
@@ -2490,7 +2721,12 @@ def _resolve_rule(rule: str) -> tuple[str, list[int], str] | None:
         log, _, ids_s = rule.partition("/")
         log = _RULE_LOG_ALIASES.get(log.strip().lower(), log.strip())
         ids = [int(x) for x in re.findall(r"\d+", ids_s)]
-        if log and ids:
+        # The log half of a raw query is model-supplied text that ends up in
+        # PowerShell source, so an unresolvable name is refused here rather than
+        # quoted downstream and hoped for. A rule that fails this is reported as
+        # unknown, which is the honest answer: it is not a query this engine can
+        # run.
+        if log and ids and _is_valid_logname(log):
             return log, ids, rule
     return None
 
@@ -2512,10 +2748,18 @@ def _query_events(logname: str, ids: Sequence[int], since_seconds: int) -> list[
     """
     if _powershell() is None:
         return []
-    id_list = ",".join(str(i) for i in ids)
+    if not _is_valid_logname(logname):
+        raise AdapterError(
+            f"refusing to query log name {logname!r}: it contains characters no "
+            "Windows event log name can contain. A log name reaches PowerShell "
+            "as source, so it is validated before it is quoted."
+        )
+    # int() on every id and _ps_quote on the name: both halves of this filter are
+    # interpolated into PowerShell *source*, so neither may carry syntax.
+    id_list = ",".join(str(int(i)) for i in ids)
     script = (
         f"$since=(Get-Date).AddSeconds(-{int(since_seconds)});"
-        f"$f=@{{LogName='{logname}'; Id={id_list}; StartTime=$since}};"
+        f"$f=@{{LogName={_ps_quote(logname)}; Id={id_list}; StartTime=$since}};"
         "Get-WinEvent -FilterHashtable $f -ErrorAction SilentlyContinue | "
         "ForEach-Object { $x=[xml]$_.ToXml(); $d=@{};"
         "foreach($n in $x.Event.EventData.Data){ if($n.Name){ $d[$n.Name]=$n.'#text' } }"

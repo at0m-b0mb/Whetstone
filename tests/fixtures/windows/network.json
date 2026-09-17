@@ -1,0 +1,18 @@
+{
+  "interfaces": [
+    {"InterfaceAlias": "Ethernet0", "IPAddress": "10.0.0.24", "AddressFamily": "IPv4", "PrefixLength": 24},
+    {"InterfaceAlias": "Loopback Pseudo-Interface 1", "IPAddress": "127.0.0.1", "AddressFamily": "IPv4", "PrefixLength": 8}
+  ],
+  "routes": [
+    {"DestinationPrefix": "0.0.0.0/0", "NextHop": "10.0.0.1", "InterfaceAlias": "Ethernet0"}
+  ],
+  "tcp": [
+    {"LocalAddress": "0.0.0.0", "LocalPort": 445, "RemoteAddress": "0.0.0.0", "RemotePort": 0, "State": "Listen", "OwningProcess": 4, "Process": "System"},
+    {"LocalAddress": "0.0.0.0", "LocalPort": 3389, "RemoteAddress": "0.0.0.0", "RemotePort": 0, "State": "Listen", "OwningProcess": 1120, "Process": "svchost"},
+    {"LocalAddress": "10.0.0.24", "LocalPort": 49712, "RemoteAddress": "10.0.0.5", "RemotePort": 4444, "State": "Established", "OwningProcess": 5120, "Process": "powershell"},
+    {"LocalAddress": "10.0.0.24", "LocalPort": 49713, "RemoteAddress": "140.82.121.4", "RemotePort": 443, "State": "Established", "OwningProcess": 6600, "Process": "msedge"}
+  ],
+  "udp": [
+    {"LocalAddress": "0.0.0.0", "LocalPort": 5353, "OwningProcess": 2400, "Process": "svchost"}
+  ]
+}

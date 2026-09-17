@@ -1,0 +1,6 @@
+C:\Windows\System32\spoolsv.exe NT SERVICE\TrustedInstaller:(F)
+                                NT AUTHORITY\SYSTEM:(RX)
+                                BUILTIN\Administrators:(RX)
+                                BUILTIN\Users:(RX)
+
+Successfully processed 1 files; Failed processing 0 files

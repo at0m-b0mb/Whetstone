@@ -1,0 +1,13 @@
+{
+  "hostname": "DESKTOP-7A1",
+  "os_caption": "Microsoft Windows 11 Pro",
+  "version": "10.0.22631",
+  "build": "22631",
+  "architecture": "64-bit",
+  "last_boot": "2026-09-16T22:14:05.000+00:00",
+  "domain": "WORKGROUP",
+  "part_of_domain": false,
+  "manufacturer": "Dell Inc.",
+  "model": "OptiPlex 7090",
+  "logged_on_user": "DESKTOP-7A1\\alice"
+}

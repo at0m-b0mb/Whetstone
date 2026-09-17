@@ -1,0 +1,13 @@
+{
+  "software": [
+    {"DisplayName": "Google Chrome", "DisplayVersion": "128.0.6613.120", "Publisher": "Google LLC", "InstallDate": "20260710"},
+    {"DisplayName": "7-Zip 22.01 (x64)", "DisplayVersion": "22.01", "Publisher": "Igor Pavlov", "InstallDate": "20260215"},
+    {"DisplayName": "Microsoft Visual C++ 2015-2022 Redistributable (x64)", "DisplayVersion": "14.38.33130", "Publisher": "Microsoft Corporation", "InstallDate": null},
+    {"DisplayName": "Acme Updater", "DisplayVersion": "3.1.0", "Publisher": "Acme Corp", "InstallDate": "20260501"}
+  ],
+  "hotfixes": [
+    {"HotFixID": "KB5041585", "Description": "Update", "InstalledOn": "8/13/2026"},
+    {"HotFixID": "KB5043145", "Description": "Security Update", "InstalledOn": "9/10/2026"},
+    {"HotFixID": "KB5012170", "Description": "Security Update", "InstalledOn": "6/01/2026"}
+  ]
+}

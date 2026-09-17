@@ -1,0 +1,6 @@
+C:\ProgramData\Contoso\agent.exe BUILTIN\Users:(M)
+                                 NT AUTHORITY\SYSTEM:(F)
+                                 BUILTIN\Administrators:(F)
+                                 CREATOR OWNER:(F)
+
+Successfully processed 1 files; Failed processing 0 files

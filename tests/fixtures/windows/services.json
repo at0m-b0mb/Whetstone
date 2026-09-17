@@ -1,0 +1,38 @@
+[
+  {
+    "Name": "Spooler",
+    "DisplayName": "Print Spooler",
+    "State": "Running",
+    "StartMode": "Auto",
+    "PathName": "C:\\Windows\\System32\\spoolsv.exe",
+    "StartName": "LocalSystem",
+    "ProcessId": 1840
+  },
+  {
+    "Name": "VulnSvc",
+    "DisplayName": "Acme Updater",
+    "State": "Running",
+    "StartMode": "Auto",
+    "PathName": "C:\\Program Files\\Acme Updater\\bin\\updater.exe --run",
+    "StartName": "LocalSystem",
+    "ProcessId": 3021
+  },
+  {
+    "Name": "WritableSvc",
+    "DisplayName": "Contoso Agent",
+    "State": "Running",
+    "StartMode": "Auto",
+    "PathName": "\"C:\\ProgramData\\Contoso\\agent.exe\"",
+    "StartName": "LocalSystem",
+    "ProcessId": 4188
+  },
+  {
+    "Name": "wuauserv",
+    "DisplayName": "Windows Update",
+    "State": "Stopped",
+    "StartMode": "Manual",
+    "PathName": "C:\\Windows\\system32\\svchost.exe -k netsvcs -p",
+    "StartName": "LocalSystem",
+    "ProcessId": 0
+  }
+]

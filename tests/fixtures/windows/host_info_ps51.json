@@ -1,0 +1,13 @@
+{
+  "hostname": "DC01",
+  "os_caption": "Microsoft Windows Server 2019 Standard",
+  "version": "10.0.17763",
+  "build": "17763",
+  "architecture": "64-bit",
+  "last_boot": "/Date(1789592045000)/",
+  "domain": "corp.example.com",
+  "part_of_domain": true,
+  "manufacturer": "VMware, Inc.",
+  "model": "VMware Virtual Platform",
+  "logged_on_user": "CORP\\administrator"
+}

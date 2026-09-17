@@ -1,0 +1,31 @@
+[
+  {
+    "Name": "ADMIN$",
+    "Path": "C:\\Windows",
+    "Description": "Remote Admin",
+    "Access": []
+  },
+  {
+    "Name": "C$",
+    "Path": "C:\\",
+    "Description": "Default share",
+    "Access": []
+  },
+  {
+    "Name": "Public",
+    "Path": "C:\\Users\\Public",
+    "Description": "",
+    "Access": [
+      {"AccountName": "Everyone", "AccessRight": "Full", "AccessControlType": "Allow"},
+      {"AccountName": "BUILTIN\\Administrators", "AccessRight": "Full", "AccessControlType": "Allow"}
+    ]
+  },
+  {
+    "Name": "Finance",
+    "Path": "D:\\Finance",
+    "Description": "Finance department",
+    "Access": [
+      {"AccountName": "CORP\\Finance", "AccessRight": "Change", "AccessControlType": "Allow"}
+    ]
+  }
+]

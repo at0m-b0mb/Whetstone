@@ -1,0 +1,14 @@
+[
+  {
+    "source": "C:\\Windows\\Panther\\unattend.xml",
+    "content": "<AutoLogon>\n  <Password>\n    <Value>P@ssw0rd-Unattend!</Value>\n  </Password>\n  <Username>Administrator</Username>\n</AutoLogon>"
+  },
+  {
+    "source": "C:\\Users\\alice\\AppData\\Roaming\\Microsoft\\Windows\\PowerShell\\PSReadLine\\ConsoleHost_history.txt",
+    "content": "Get-Process\n$cred = 'Password=SuperSecret123'\nnet use X: \\\\fs01\\share /user:alice Hunter2Hunter2\naws configure set aws_secret_access_key AKIAIOSFODNN7EXAMPLE"
+  },
+  {
+    "source": "registry:Winlogon",
+    "content": "DefaultPassword=WinlogonAutoLogonPass!"
+  }
+]

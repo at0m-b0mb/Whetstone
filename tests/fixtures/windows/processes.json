@@ -1,0 +1,34 @@
+[
+  {
+    "ProcessId": 4,
+    "ParentProcessId": 0,
+    "Name": "System",
+    "CommandLine": null,
+    "ExecutablePath": null,
+    "Owner": null
+  },
+  {
+    "ProcessId": 720,
+    "ParentProcessId": 588,
+    "Name": "svchost.exe",
+    "CommandLine": "C:\\Windows\\system32\\svchost.exe -k netsvcs -p",
+    "ExecutablePath": "C:\\Windows\\system32\\svchost.exe",
+    "Owner": "NT AUTHORITY\\SYSTEM"
+  },
+  {
+    "ProcessId": 5120,
+    "ParentProcessId": 720,
+    "Name": "powershell.exe",
+    "CommandLine": "powershell.exe -nop -w hidden -enc SQBFAFgA",
+    "ExecutablePath": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+    "Owner": "DESKTOP-7A1\\svcweb"
+  },
+  {
+    "ProcessId": 6002,
+    "ParentProcessId": 5120,
+    "Name": "rundll32.exe",
+    "CommandLine": "rundll32.exe C:\\Users\\Public\\evil.dll,Start",
+    "ExecutablePath": "C:\\Windows\\System32\\rundll32.exe",
+    "Owner": "DESKTOP-7A1\\svcweb"
+  }
+]
