@@ -666,3 +666,46 @@ class TestCliEncoding:
             _force_utf8_output()
         finally:
             _sys.stdout = real_out
+
+
+class TestCheckRehearsal:
+    """`whet check` must rehearse against the engagement's own scope.
+
+    It previously used a hardcoded 127.0.0.1, so every host verb failed on
+    scope.host.unlisted and it reported "2 of 32 verbs, 0 of them red" for an
+    engagement that plainly authorises eight red verbs.
+    """
+
+    def test_representative_host_comes_from_scope(self):
+        from whetstone.cli import _representative_host
+        e = _engagement(scope=Scope(hosts=("10.20.4.0/24",)))
+        assert _representative_host(e) == "10.20.4.1"
+
+    def test_representative_host_skips_excluded_addresses(self):
+        from whetstone.cli import _representative_host
+        e = _engagement(scope=Scope(hosts=("10.20.4.0/24",),
+                                    exclude_hosts=("10.20.4.1", "10.20.4.2")))
+        assert _representative_host(e) == "10.20.4.3"
+
+    def test_glob_scope_yields_a_matching_name(self):
+        from whetstone.cli import _representative_host
+        e = _engagement(scope=Scope(hosts=("*.lab.internal",)))
+        host = _representative_host(e)
+        assert host and Scope(hosts=("*.lab.internal",)).host_included(host)
+
+    def test_empty_host_scope_yields_none(self):
+        from whetstone.cli import _representative_host
+        e = Engagement(name="x", scope=Scope())
+        assert _representative_host(e) is None
+
+    def test_null_engagement_rehearses_against_loopback(self):
+        from whetstone.cli import _representative_host
+        assert _representative_host(null_engagement()) == "127.0.0.1"
+
+    def test_check_counts_the_authorised_red_verbs(self, capsys):
+        from whetstone.cli import main
+        assert main(["-e", "examples/engagement.yaml", "check"]) == 0
+        out = capsys.readouterr().out
+        # 4 techniques authorised; exactly 3 red verbs fall inside them.
+        assert "3 of them red" in out
+        assert "blocked by technique.unauthorized" in out

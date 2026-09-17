@@ -172,7 +172,7 @@ Phase 0. The spine is built and tested; the rest is scaffolded and empty.
 | ✅ Action schema, verb catalogue, detection pairing | `whetstone/actions.py`, `verbs.py` |
 | ✅ The gate — engagement, policy, hash-chained audit | `whetstone/gate/` |
 | ✅ CLI — `verbs`, `coverage`, `check`, `plan`, `audit` | `whetstone/cli.py` |
-| ✅ 66 tests, whole safety surface, no lab required | `tests/` |
+| ✅ 74 tests, whole safety surface, no lab required | `tests/` |
 | ⬜ Platform adapters (Windows / Linux / macOS) | `whetstone/adapters/` |
 | ⬜ Agent loop with self-correction | `whetstone/kernel/` |
 | ⬜ MCP + HTTP surfaces | `whetstone/surfaces/` |

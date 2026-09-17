@@ -20,10 +20,12 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 from typing import Sequence
 
 from . import verbs as _catalogue  # noqa: F401  (registers the catalogue)
-from .actions import NO_DETECTION, REGISTRY, Intent, SchemaError, Side
+from .actions import NO_DETECTION, REGISTRY, Intent, SchemaError, Side, TargetKind
+from .gate.engagement import _as_network
 from .gate import (
     Engagement,
     EngagementError,
@@ -115,16 +117,37 @@ def _cmd_check(args: argparse.Namespace) -> int:
         print(f"\nthis engagement is {state}; every action would be denied")
         return 1
 
-    permitted = [
-        v for v in REGISTRY
-        if decide(engagement, v, v.bind(
-            {p.name: _placeholder(p) for p in v.params if p.required},
-            target=_placeholder_target(v),
-        )).verdict is not Verdict.DENY
-    ]
+    host = _representative_host(engagement)
+    path = _representative_path(engagement)
+
+    permitted, blocked = [], []
+    for verb in REGISTRY:
+        target = {TargetKind.HOST: host, TargetKind.PATH: path,
+                  TargetKind.NONE: None}[verb.target]
+        if verb.target is not TargetKind.NONE and target is None:
+            blocked.append((verb, "no such scope in this engagement"))
+            continue
+        decision = decide(engagement, verb, verb.bind(
+            {p.name: _placeholder(p) for p in verb.params if p.required},
+            target=target,
+        ))
+        if decision.verdict is Verdict.DENY:
+            blocked.append((verb, decision.rule))
+        else:
+            permitted.append(verb)
+
     red = [v for v in permitted if v.side is Side.RED]
+    where = f" against {host}" if host else ""
     print(f"\n{len(permitted)} of {len(REGISTRY)} verbs could run under this "
-          f"engagement, {len(red)} of them red.")
+          f"engagement{where}, {len(red)} of them red.")
+
+    # Say *why* the rest cannot. A bare count invites the reader to assume the
+    # engagement is narrower or wider than it is.
+    reasons: dict[str, int] = {}
+    for _verb, rule in blocked:
+        reasons[rule] = reasons.get(rule, 0) + 1
+    for rule, count in sorted(reasons.items(), key=lambda kv: -kv[1]):
+        print(f"  {count:>2} blocked by {rule}")
     return 0
 
 
@@ -134,13 +157,56 @@ def _placeholder(param) -> object:
     }.get(param.type, "placeholder")
 
 
-def _placeholder_target(verb) -> str | None:
-    from .actions import TargetKind
-    if verb.target is TargetKind.NONE:
-        return None
-    if verb.target is TargetKind.PATH:
-        return "/nonexistent/placeholder"
-    return "127.0.0.1"
+def _representative_host(engagement: Engagement) -> str | None:
+    """An in-scope address to rehearse against, or None if the scope is empty.
+
+    ``check`` asks what an engagement *permits* — which techniques and intents
+    it clears — not what may be done to one particular machine. Rehearsing
+    against a hardcoded loopback address made every verb fail on
+    ``scope.host.unlisted`` and reported "2 of 32 verbs, 0 of them red" for an
+    engagement that plainly authorises eight red verbs. The answer has to be
+    scope-relative, so it is derived from the document being checked.
+    """
+    for pattern in engagement.scope.hosts:
+        net = _as_network(pattern)
+        if net is not None:
+            # Prefer a usable host inside the range over the network address,
+            # which for a /24 is reserved and reads oddly in output. Walk a few
+            # candidates rather than taking the first: .1 is the address most
+            # likely to be the gateway and therefore most likely to be the one
+            # the engagement carved out.
+            found = None
+            for offset, addr in enumerate(net.hosts()):
+                if offset >= 16:
+                    break
+                if not engagement.scope.host_excluded(str(addr)):
+                    found = str(addr)
+                    break
+            if found is None and not engagement.scope.host_excluded(str(net.network_address)):
+                found = str(net.network_address)
+            if found is not None:
+                return found
+            continue
+        if "*" in pattern or "?" in pattern:
+            # A glob stands for a class of names; substitute something concrete
+            # that the same glob still matches.
+            concrete = pattern.replace("*", "host").replace("?", "h")
+            if not engagement.scope.host_excluded(concrete):
+                return concrete
+            continue
+        if not engagement.scope.host_excluded(pattern):
+            return pattern
+    if engagement.scope.allow_loopback:
+        return "127.0.0.1"
+    return None
+
+
+def _representative_path(engagement: Engagement) -> str | None:
+    for pattern in engagement.scope.paths:
+        candidate = str(Path(pattern) / "placeholder")
+        if not engagement.scope.path_excluded(candidate):
+            return candidate
+    return None
 
 
 def _cmd_plan(args: argparse.Namespace) -> int:
