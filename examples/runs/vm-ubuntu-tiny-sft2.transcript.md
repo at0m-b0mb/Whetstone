@@ -1,0 +1,219 @@
+# Whetstone run — real Lima Ubuntu 24.04 VM (auditd, no rules loaded)
+
+> A real run, captured verbatim. The observations are what the adapter
+> returned from the actual target; nothing here is illustrative.
+
+| | |
+|---|---|
+| driver | trained model (constrained decoding) |
+| checkpoint | `tiny-sft2 (step 5699)` |
+| target | real Lima Ubuntu 24.04 VM (auditd, no rules loaded) |
+| telemetry | auditd active, 0 rules |
+| captured | 2026-09-17T20:53:14+00:00 |
+
+**Task** — Assess this Ubuntu host, prove the writable-service finding, and tell me whether auditd saw it.
+
+**Result** — 10 turns, 10 observations, 0 refusals, **1 findings**.
+
+---
+
+## The run, turn by turn
+
+### 1. `enum.host() on 127.0.0.1` — ok
+*model chose this over: `enum.processes`, `enum.privileges`, `enum.services`*
+
+```json
+{
+  "os": "Ubuntu 24.04.5 LTS",
+  "kernel": "Linux lima-whetstone-lab 6.8.0-139-generic #139-Ubuntu SMP PREEMPT_DYNAMIC Sat Aug  1 03:32:48 UTC 2026 aarch64 aarch64 aarch64 GNU/Linux",
+  "hostname": "lima-whetstone-lab"
+}
+```
+
+### 2. `enum.processes() on 127.0.0.1` — ok
+*model chose this over: `enum.privileges`, `enum.services`, `detect.process_creation`*
+
+```json
+{
+  "processes": [
+    {
+      "pid": "1",
+      "ppid": "0",
+      "user": "root",
+      "comm": "systemd"
+    },
+    {
+      "pid": "2",
+      "ppid": "0",
+      "user": "root",
+      "comm": "kthreadd"
+    },
+    {
+      "pid": "3",
+      "ppid": "2",
+      "user": "root",
+      "comm": "pool_workqueue_release"
+    },
+    {
+      "pid": "4",
+      "ppid": "2",
+      "user": "root",
+      "comm": "kworker/R-rcu_g"
+    },
+    "+100 more"
+  ]
+}
+```
+
+### 3. `enum.privileges() on 127.0.0.1` — ok
+*model chose this over: `detect.process_creation`, `detect.telemetry`, `enum.services`*
+
+```json
+{
+  "groups": [
+    {
+      "id": 1000,
+      "name": "b0mba_at0mica"
+    },
+    {
+      "id": 999,
+      "name": "systemd-journal"
+    }
+  ],
+  "uid": {
+    "id": 501,
+    "name": "b0mba_at0mica"
+  },
+  "gid": {
+    "id": 1000,
+    "name": "b0mba_at0mica"
+  }
+}
+```
+
+### 4. `detect.process_creation(since_seconds=300) on 127.0.0.1` — ok
+*model chose this over: `detect.telemetry`, `vuln.weak_permissions`, `enum.services`*
+
+```json
+{
+  "logged": false,
+  "count": 0,
+  "note": "auditd has no record of the change — either no watch rule is loaded, or it is not watching this path"
+}
+```
+
+### 5. `detect.telemetry() on 127.0.0.1` — ok
+*model chose this over: `enum.services`, `vuln.weak_permissions`, `vuln.credential_exposure`*
+
+```json
+{
+  "sources": [
+    {
+      "source": "auditd",
+      "enabled": true,
+      "rules_loaded": 0
+    }
+  ],
+  "process_creation_auditing": false,
+  "summary": "auditd is active with 0 rule(s) loaded"
+}
+```
+
+### 6. `enum.services() on 127.0.0.1` — ok
+*model chose this over: `vuln.weak_permissions`, `vuln.credential_exposure`, `exploit.service_permissions`*
+
+```json
+{
+  "services": [
+    {
+      "unit": "apparmor.service",
+      "load": "loaded",
+      "active": "active",
+      "sub": "exited",
+      "description": "Load AppArmor profiles"
+    },
+    {
+      "unit": "apport-autoreport.service",
+      "load": "loaded",
+      "active": "inactive",
+      "sub": "dead",
+      "description": "Process error reports when automatic reporting is enabled"
+    },
+    {
+      "unit": "apport.service",
+      "load": "loaded",
+      "active": "active",
+      "sub": "exited",
+      "description": "automatic crash report generation"
+    },
+    {
+      "unit": "apt-daily-upgrade.service",
+      "load": "loaded",
+      "active": "inactive",
+      "sub": "dead",
+      "description": "Daily apt upgrade and clean activities"
+    },
+    "+162 more"
+  ]
+}
+```
+
+### 7. `vuln.credential_exposure() on 127.0.0.1` — ok
+*model chose this over: `vuln.weak_permissions`, `exploit.service_permissions`*
+
+```json
+{
+  "findings": [
+    {
+      "path": "/etc/acme.conf",
+      "technique": "T1552.001"
+    }
+  ]
+}
+```
+
+### 8. `vuln.weak_permissions() on 127.0.0.1` — ok
+*model chose this over: `exploit.service_permissions`*
+
+```json
+{
+  "findings": [
+    {
+      "path": "/opt/acme/acme-agent",
+      "technique": "T1574.010",
+      "why": "world-writable file owned by root"
+    }
+  ]
+}
+```
+
+### 9. `exploit.service_permissions(restore=True, service=unset) on 127.0.0.1` — ok
+
+```json
+{
+  "changed": "/opt/acme/acme-agent",
+  "ran_as": "root",
+  "wrote": true,
+  "cleanup": "succeeded"
+}
+```
+
+### 10. `detect.process_creation(since_seconds=300) on 127.0.0.1` — ok
+
+```json
+{
+  "logged": false,
+  "count": 0,
+  "note": "auditd has no record of the change — either no watch rule is loaded, or it is not watching this path"
+}
+```
+
+---
+
+## Findings
+
+- **🔴 DETECTION GAP** — `T1574.010` — exploit.service_permissions ran and detect.process_creation did not fire — the technique succeeded unobserved
+
+---
+
+*Generated by `lab/capture.py`. Reproduce with the command in the run's header comment.*

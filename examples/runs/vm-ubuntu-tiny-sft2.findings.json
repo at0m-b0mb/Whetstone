@@ -1,0 +1,21 @@
+{
+  "meta": {
+    "checkpoint": "tiny-sft2 (step 5699)",
+    "target": "real Lima Ubuntu 24.04 VM (auditd, no rules loaded)",
+    "telemetry": "auditd active, 0 rules",
+    "captured": "2026-09-17T20:53:14+00:00",
+    "driver": "trained model (constrained decoding)",
+    "task": "Assess this Ubuntu host, prove the writable-service finding, and tell me whether auditd saw it."
+  },
+  "turns": 10,
+  "observations": 10,
+  "refusals": 0,
+  "findings": [
+    {
+      "kind": "detection_gap",
+      "technique": "T1574.010",
+      "expected": "detect.process_creation",
+      "detail": "exploit.service_permissions ran and detect.process_creation did not fire — the technique succeeded unobserved"
+    }
+  ]
+}

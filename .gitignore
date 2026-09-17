@@ -31,3 +31,7 @@ runs/
 lab/lima/
 *.qcow2
 *.img
+
+# The captured example runs ARE committed — they are the project's proof of work.
+!examples/runs/
+!examples/runs/**

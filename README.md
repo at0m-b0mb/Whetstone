@@ -96,6 +96,34 @@ gap on the local host, found in fifteen seconds, with no attack run at all.
 
 ---
 
+## See it run
+
+The agent loop chains these verbs, and after every red action runs the detection
+that should catch it — silence becomes a finding. The trained model drives the
+loop under constrained decoding, so every action it emits is valid by
+construction.
+
+**[`examples/runs/`](examples/runs/) holds real, captured runs** — the 14.6M
+model driving the loop against a sandbox and against a live Ubuntu VM, with the
+observations exactly as the adapters returned them. On the VM, auditd was running
+with no rules loaded, so the model's binary-overwrite went unseen:
+
+```
+### 9. exploit.service_permissions(...) on 127.0.0.1 — ok
+### 10. detect.process_creation(...) on 127.0.0.1 — ok
+FINDING 🔴 DETECTION GAP  T1574.010
+        exploit.service_permissions ran and detect.process_creation did not fire
+        — the technique succeeded unobserved
+```
+
+Each run is captured three ways: a human transcript that shows what the model
+chose *over*, a machine-readable findings file, and the wire-protocol trajectory
+that doubles as a training example. Reproduce with `python -m lab.run --both
+--model <checkpoint>` or, against the real VM, `python -m lab.vm.run --model
+<checkpoint>`.
+
+---
+
 ## Autonomy and authorisation are different axes
 
 The usual objection to a gate is that it makes the agent stop and ask permission.
