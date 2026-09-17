@@ -38,7 +38,11 @@ yaml = ["PyYAML>=5.4"]
 # Training is a separate install on purpose: the runtime must stay usable on a
 # machine that will never train anything, which is most machines it runs on.
 train = ["mlx>=0.18", "mlx-lm>=0.18", "numpy>=1.24", "tokenizers>=0.20"]
-dev = ["pytest>=7.0", "pytest-cov>=4.0", "PyYAML>=5.4"]
+# numpy is here, not only in [train], because tests/test_corpus.py exercises
+# the shard interleaving in training/data.py — the fix for a validation split
+# that was 100% one source. That regression must be covered in plain CI, not
+# only on a machine with MLX installed.
+dev = ["pytest>=7.0", "pytest-cov>=4.0", "PyYAML>=5.4", "numpy>=1.24"]
 
 [project.scripts]
 whet = "whetstone.cli:main"

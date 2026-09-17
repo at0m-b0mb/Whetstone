@@ -281,6 +281,11 @@ class TestNet:
 class TestShardInterleaving:
     """The validation split must be representative of the corpus.
 
+    Needs numpy, which the data layer uses for memory-mapped shards. It is a
+    dev dependency precisely so this regression is covered in ordinary CI and
+    not only on a machine with the training extras installed; the skip below is
+    for a minimal install, not an excuse to leave it untested.
+
     build.py writes one JSONL per source and they are read in sorted order, so
     an unshuffled corpus ends with whichever source sorts last. That made the
     held-out split 100% Sigma rules: validation loss measured how well the model
@@ -289,6 +294,7 @@ class TestShardInterleaving:
     """
 
     def _corpus(self, tmp_path):
+        pytest.importorskip("numpy", reason="training.data needs numpy")
         import json as _json
         for name, body, n in (("aaa", "alpha alpha alpha", 40),
                               ("zzz", "omega omega omega", 40)):
