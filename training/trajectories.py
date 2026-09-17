@@ -142,7 +142,7 @@ _OUT_OF_SCOPE = ("10.20.4.77", "192.168.1.50", "dc01.lab.internal",
                  "172.16.8.9", "10.0.0.5", "fileserver.corp.internal")
 
 
-def _derived_scenarios(rng: random.Random, count: int = 60) -> list[Scenario]:
+def _derived_scenarios(rng: random.Random, count: int = 240) -> list[Scenario]:
     """Build scenarios combinatorially from the catalogue itself.
 
     Ten hand-written scenarios cap the corpus at ten verb sequences, and a model

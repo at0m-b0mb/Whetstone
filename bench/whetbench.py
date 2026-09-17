@@ -120,23 +120,62 @@ def check_cwe_shape(text: str) -> tuple[bool, str]:
     return (True, m.group(0)) if m else (False, "no CWE id")
 
 
+def extract_json_object(text: str) -> str | None:
+    """First balanced ``{...}`` in ``text``, or None.
+
+    A non-greedy ``\\{.*?\\}`` cannot do this and the difference is not
+    academic: an action is ``{"verb":"enum.host","params":{},"target":"..."}``
+    and the lazy match stops at the ``}`` closing the empty ``params``, handing
+    the parser ``{"verb":"enum.host","params":{}`` — invalid JSON. The benchmark
+    scored a correct model 0/5 and reported "Expecting ',' delimiter" as though
+    the model had produced malformed output. Brace depth, tracked properly, with
+    string literals and escapes respected so a brace inside a value does not
+    close the object.
+    """
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
+
+
 def check_action_json(text: str) -> tuple[bool, str]:
     """The task the model exists for: emit an action the registry accepts."""
     from whetstone.actions import REGISTRY, SchemaError
     import whetstone.verbs  # noqa: F401
 
-    candidate = re.search(r"\{.*?\}", text, re.S)
-    if not candidate:
+    blob = extract_json_object(text)
+    if blob is None:
         return False, "no JSON object emitted"
-    blob = candidate.group(0)
     try:
         payload = json.loads(blob)
-    except json.JSONDecodeError:
-        return False, f"unparseable JSON: {blob[:56]}"
+    except json.JSONDecodeError as exc:
+        return False, f"unparseable: {exc.msg} — {blob[:44]}"
     try:
         action = REGISTRY.parse(payload)
     except SchemaError as exc:
-        return False, f"rejected: {str(exc)[:70]}"
+        return False, f"rejected: {str(exc)[:66]}"
     return True, action.render()[:70]
 
 
@@ -185,6 +224,25 @@ class Probe:
             d.startswith("SKIP") for _ok, d in self.results)
 
 
+def _action_prompt() -> str:
+    """A realistic trajectory prefix, ending at the point the model must act."""
+    from whetstone.actions import REGISTRY, Intent, TargetKind
+    import whetstone.verbs  # noqa: F401
+
+    from training.tokenizer.protocol import ACT, BOS, HOST, SCOPE, TASK, VERBS
+
+    catalogue = "; ".join(
+        f"{v.id}({', '.join(p.name for p in v.params)})"
+        for v in REGISTRY.select(intent=Intent.OBSERVE)
+        if v.target is TargetKind.HOST)[:400]
+    return (f"{BOS}{TASK}Find anything on this host that runs without a human "
+            f"starting it.{HOST}macos{SCOPE}observe; loopback only; no red "
+            f"verbs{VERBS}{catalogue}{ACT}")
+
+
+_ACTION_PROMPT = _action_prompt()
+
+
 PROBES: list[Probe] = [
     Probe("cvss-vector", "CVE-2024-",
           check_cvss,
@@ -207,10 +265,16 @@ PROBES: list[Probe] = [
     Probe("detection-routing", "title: Suspicious Process Creation\nlogsource:\n",
           check_detection,
           "continues a detection rule as a detection rule"),
-    Probe("action-json", '{"verb": "enum.',
+    # Prompted in the WIRE PROTOCOL, because that is what the model was trained
+    # on. The first version prompted with a bare `{"verb": "enum.` fragment,
+    # which resembles nothing in any trajectory: the model had no reason to
+    # continue it as an action and the probe measured prompt mismatch rather
+    # than capability. A probe must speak the format it is testing.
+    Probe("action-json", _ACTION_PROMPT,
           check_action_json,
           "THE TASK: emit an action the verb registry accepts. Hallucinated "
-          "verbs, missing params and invented param names all fail here"),
+          "verbs, missing params and invented param names all fail here",
+          max_tokens=48),
 ]
 
 

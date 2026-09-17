@@ -131,6 +131,28 @@ def masked_loss(model: Whetstone, ids: mx.array, mask: mx.array) -> mx.array:
     return total / count
 
 
+def load_replay(shard_dir: Path, seq_len: int, n: int, seed: int) -> np.ndarray:
+    """Sample ``n`` windows of pretraining text, to rehearse against forgetting.
+
+    **Measured, not precautionary.** Fine-tuning on trajectories alone took
+    ``cvss-vector`` from 3/5 to 0/10 while taking ``action-json`` from 0/5 to
+    5/10. The model traded schema knowledge for the task, because trajectories
+    contain no CVSS vectors and four epochs of gradient on text that never
+    mentions one is enough to lose it at this scale.
+
+    Mixing pretraining windows back in is the standard remedy and it is cheap:
+    the shards are already on disk and memory-mapped. These windows carry
+    ordinary next-token loss over their whole length — there is no "model turn"
+    in a man page — which is why the sampler returns ids only and the trainer
+    supplies an all-ones mask for them.
+    """
+    from .data import Dataset
+
+    data = Dataset(shard_dir, seq_len, split="train", seed=seed)
+    x, _y = data.batch(n)
+    return np.asarray(x, dtype=np.int64)
+
+
 def sft(
     base_checkpoint: Path,
     trajectory_dir: Path,
@@ -141,6 +163,8 @@ def sft(
     batch_size: int = 4,
     learning_rate: float = 5e-5,
     seed: int = 1337,
+    replay_dir: Path | None = None,
+    replay_fraction: float = 0.25,
 ) -> Path:
     """Fine-tune a pretrained checkpoint on trajectories.
 
@@ -164,6 +188,20 @@ def sft(
                       weight_decay=0.0)
 
     ids_all, mask_all = build_examples(trajectory_dir, tokenizer_path, cfg.max_seq_len)
+
+    # Replay: rehearse pretraining text so the task does not cost the language.
+    if replay_dir is not None and replay_fraction > 0:
+        n_replay = int(len(ids_all) * replay_fraction)
+        if n_replay:
+            replay_ids = load_replay(replay_dir, cfg.max_seq_len, n_replay, seed)
+            # An all-ones mask: every token of a man page is the model's to
+            # predict. There is no "turn" to mask in pretraining text.
+            replay_mask = np.ones_like(replay_ids, dtype=np.int8)
+            ids_all = np.concatenate([ids_all, replay_ids])
+            mask_all = np.concatenate([mask_all, replay_mask])
+            print(f"replay: +{n_replay:,} pretraining windows "
+                  f"({replay_fraction:.0%}) to rehearse against forgetting")
+
     n = len(ids_all)
     supervised = int(mask_all.sum())
     print(f"{cfg.name} {cfg.n_params/1e6:.1f}M — resuming from step {state['step']:,}")
@@ -217,10 +255,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--epochs", type=int, default=3)
     p.add_argument("--batch-size", type=int, default=4)
     p.add_argument("--lr", type=float, default=5e-5)
+    p.add_argument("--replay", type=Path,
+                   help="pretraining shard dir to rehearse from; strongly "
+                        "advised — without it cvss-vector fell 3/5 to 0/10")
+    p.add_argument("--replay-fraction", type=float, default=0.25)
     args = p.parse_args(argv)
 
     sft(args.checkpoint, args.trajectories, args.tokenizer, args.out,
-        epochs=args.epochs, batch_size=args.batch_size, learning_rate=args.lr)
+        epochs=args.epochs, batch_size=args.batch_size, learning_rate=args.lr,
+        replay_dir=args.replay, replay_fraction=args.replay_fraction)
     return 0
 
 
