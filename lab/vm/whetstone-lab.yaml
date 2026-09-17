@@ -1,0 +1,30 @@
+# A real Linux target for Whetstone: Ubuntu with auditd, driven over SSH.
+# The genuine version of the sandbox — real systemd, real cron, real auditd,
+# real file permissions — so the red verbs and the detection verifier run
+# against an actual operating system rather than a contained directory tree.
+vmType: "vz"
+os: "Linux"
+arch: "aarch64"
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+cpus: 2
+memory: "2GiB"
+disk: "12GiB"
+mounts: []
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -y
+      apt-get install -y auditd audispd-plugins
+      # A deliberately weak target for the exercise, mirroring the sandbox.
+      useradd -m -s /bin/bash operator || true
+      mkdir -p /opt/acme
+      printf '#!/bin/sh\nexec /usr/bin/true\n' > /opt/acme/acme-agent
+      chmod 0777 /opt/acme/acme-agent
+      printf '[db]\nhost = 10.20.4.9\npassword = hunter2-do-not-ship\n' > /etc/acme.conf
+      # auditd is running and ready to be the blue side.
+      systemctl enable --now auditd || true

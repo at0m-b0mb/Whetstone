@@ -26,3 +26,8 @@ engagement.yaml
 *.jsonl
 whetstone-session.jsonl
 runs/
+
+# Lab VM state — disk images live on the NVMe, never committed
+lab/lima/
+*.qcow2
+*.img
