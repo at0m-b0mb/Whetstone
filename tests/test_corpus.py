@@ -276,3 +276,50 @@ class TestNet:
                                 and node.value.value is False):
                             offenders.append(f"{path.name}:{node.lineno} check_hostname=False")
         assert not offenders, f"unverified TLS in code: {offenders}"
+
+
+class TestShardInterleaving:
+    """The validation split must be representative of the corpus.
+
+    build.py writes one JSONL per source and they are read in sorted order, so
+    an unshuffled corpus ends with whichever source sorts last. That made the
+    held-out split 100% Sigma rules: validation loss measured how well the model
+    predicted YAML, sat 1.3 nats above training loss, and looked exactly like
+    overfitting. Nothing else in the pipeline showed it.
+    """
+
+    def _corpus(self, tmp_path):
+        import json as _json
+        for name, body, n in (("aaa", "alpha alpha alpha", 40),
+                              ("zzz", "omega omega omega", 40)):
+            rows = [{"text": f"{body} {i}", "source": name,
+                     "register": "prose", "side": "neutral", "ident": str(i)}
+                    for i in range(n)]
+            (tmp_path / f"{name}.jsonl").write_text(
+                "\n".join(_json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+        return tmp_path
+
+    def test_documents_are_interleaved_across_sources(self, tmp_path):
+        from training.data import _interleaved
+
+        got = list(_interleaved([self._corpus(tmp_path)], seed=1337))
+        assert len(got) == 80
+        # The tail must not be a single source, which is the whole bug.
+        tail = {src for src, _ in got[-20:]}
+        assert len(tail) == 2, f"tail is a monoculture: {tail}"
+
+    def test_interleaving_is_deterministic(self, tmp_path):
+        from training.data import _interleaved
+
+        root = self._corpus(tmp_path)
+        a = [s for s, _ in _interleaved([root], seed=7)]
+        b = [s for s, _ in _interleaved([root], seed=7)]
+        c = [s for s, _ in _interleaved([root], seed=8)]
+        assert a == b, "same seed must give the same order"
+        assert a != c, "different seeds must give different orders"
+
+    def test_every_document_appears_exactly_once(self, tmp_path):
+        from training.data import _interleaved
+
+        texts = [t for _s, t in _interleaved([self._corpus(tmp_path)], seed=3)]
+        assert len(texts) == len(set(texts)) == 80
