@@ -97,6 +97,7 @@ def build(
     only: list[str] | None = None,
     balance: bool = False,
     max_source_share: float = 0.30,
+    max_register_multiple: float = 0.0,
     min_chars: int = 40,
 ) -> list[BuildStats]:
     """Fetch, clean, dedupe and write the corpus. Returns per-source stats."""
@@ -157,6 +158,9 @@ def build(
 
     if max_source_share:
         _cap_source_share(collected, stats, max_source_share)
+
+    if max_register_multiple:
+        _cap_register_share(collected, stats, max_register_multiple)
 
     if balance:
         _apply_balance(collected, stats)
@@ -232,6 +236,84 @@ def _cap_source_share(
         collected[name] = kept
         st_by_name[name].chars = running
         st_by_name[name].docs = len(kept)
+
+
+def _cap_register_share(
+    collected: dict[str, list[Document]], stats: list[BuildStats], multiple: float
+) -> None:
+    """Cap each register at ``multiple`` times its target share.
+
+    The middle ground between the two bad options. ``--balance`` scales every
+    register down to whichever is scarcest relative to target, which discarded
+    78% of the corpus when ADVERSARY was the constraint. Doing nothing leaves
+    ADVISORY at 37% and SYSTEM at 51% against targets of 9% and 24%, because NVD
+    is 167M characters and the RFC series is half a gigabyte.
+
+    Per-*source* capping cannot fix that: SYSTEM is over target because three
+    separate sources (rfc, kerneldocs, manpages) are each legitimately large,
+    and no per-source ceiling that keeps them individually reasonable keeps
+    their sum reasonable. The register is the level the imbalance exists at, so
+    it is the level to control it at.
+
+    Trimming only — a register under target is left alone and reported as a gap,
+    because the alternative is repeating text, and repeated text in a corpus
+    this size is memorised rather than learned.
+    """
+    by_register: Counter[Register] = Counter()
+    for docs in collected.values():
+        for d in docs:
+            by_register[d.register] += d.n_chars
+    total = sum(by_register.values())
+    if not total:
+        return
+
+    # Solve for the ceiling as a FIXED POINT, not in one shot.
+    #
+    # A single pass computes ceilings from the pre-trim total, then trims — and
+    # the total shrinks, so every surviving register's *share* rises. The first
+    # version of this did exactly that and pushed SYSTEM from 50.9% to 59.4%,
+    # making the imbalance worse while reporting that it had capped it.
+    #
+    # T = Σ min(available_r, k · target_r · T) is monotone decreasing from
+    # T = Σ available_r, so iterating converges from above. Ten passes is far
+    # more than enough at this precision and costs nothing.
+    keys = [r for r in by_register if REGISTER_TARGETS.get(r, 0.0) > 0]
+    resolved = float(total)
+    for _ in range(10):
+        nxt = sum(min(by_register[r], REGISTER_TARGETS[r] * multiple * resolved)
+                  for r in keys)
+        nxt += sum(by_register[r] for r in by_register if r not in keys)
+        if abs(nxt - resolved) < 1.0:
+            break
+        resolved = nxt
+
+    ceilings: dict[Register, int] = {}
+    for reg in keys:
+        ceiling = int(REGISTER_TARGETS[reg] * multiple * resolved)
+        if by_register[reg] > ceiling:
+            ceilings[reg] = ceiling
+    if not ceilings:
+        return
+
+    spent: Counter[Register] = Counter()
+    st_by_name = {s.name: s for s in stats}
+    for name, docs in collected.items():
+        kept: list[Document] = []
+        for doc in docs:
+            cap = ceilings.get(doc.register)
+            if cap is not None and spent[doc.register] + doc.n_chars > cap:
+                st_by_name[name].dropped_for_balance += 1
+                continue
+            spent[doc.register] += doc.n_chars
+            kept.append(doc)
+        collected[name] = kept
+        st_by_name[name].chars = sum(d.n_chars for d in kept)
+        st_by_name[name].docs = len(kept)
+
+    print(f"\n  register cap at {multiple:.1f}x target:")
+    for reg, ceiling in sorted(ceilings.items(), key=lambda kv: kv[0].value):
+        print(f"    {reg.value:<11} {by_register[reg]/1e6:>7.1f}M -> "
+              f"{spent[reg]/1e6:>6.1f}M  (ceiling {ceiling/1e6:.0f}M)")
 
 
 def _strip_boilerplate(
@@ -454,6 +536,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--only", nargs="*", help="build only these sources")
     p.add_argument("--balance", action="store_true",
                    help="subsample over-represented registers toward target")
+    p.add_argument("--max-register-multiple", type=float, default=0.0,
+                   help="cap each register at N times its target share "
+                        "(e.g. 1.6). Trims the over-represented without "
+                        "scaling everything to the scarcest, which --balance "
+                        "does and which cost 78%% of the corpus.")
     p.add_argument("--max-source-share", type=float, default=0.30,
                    help="cap any single source at this fraction of the corpus "
                         "(0 disables). RFC alone was 64%% without it.")
@@ -477,7 +564,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     build(args.out, args.cache, only=args.only, balance=args.balance,
-          max_source_share=args.max_source_share)
+          max_source_share=args.max_source_share,
+          max_register_multiple=args.max_register_multiple)
     return 0
 
 

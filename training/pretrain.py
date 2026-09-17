@@ -179,6 +179,16 @@ def train(
             x, y = train_data.batch(micro)
             loss, g = grad_fn(model, mx.array(x), mx.array(y))
             grads = g if grads is None else _tree_add(grads, g)
+            # Materialise each micro-batch before building the next one. MLX is
+            # lazy: without this, the graphs for all `accum` micro-batches are
+            # held simultaneously and peak memory scales with accumulation
+            # depth rather than with micro-batch size. `small` at 4x1024 with
+            # 16 accumulation steps drove this machine to 13 GB of swap and
+            # never reached step 1, while `tiny` survived the same bug only
+            # because eight shallow graphs happened to fit. Gradient
+            # accumulation exists precisely to keep peak memory flat, and
+            # without this line it does the opposite of its job.
+            mx.eval(grads)
             total_loss += loss.item()
             seen += micro * cfg.max_seq_len
 
@@ -255,6 +265,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--data", type=Path, default=Path("data/corpus/tokenized"))
     p.add_argument("--out", type=Path, default=Path("data/models/checkpoints"))
     p.add_argument("--max-steps", type=int, default=None)
+    p.add_argument("--micro-batch", type=int, default=None,
+                   help="sequences per forward pass. Lower it if the run swaps: "
+                        "gradient accumulation is raised to keep the effective "
+                        "batch identical, so this trades speed for memory and "
+                        "nothing else. small at 8 x 1024 swapped this machine to "
+                        "24.9 GB and never reached step 1.")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--verify-resume", action="store_true",
                    help="prove checkpoints round-trip, then exit")
@@ -270,7 +286,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if verify_resume(args.model, args.data, args.out) else 1
 
     train(args.model, args.data, args.out,
-          max_steps=args.max_steps, resume=args.resume)
+          max_steps=args.max_steps, resume=args.resume,
+          train_cfg=(TrainConfig(micro_batch=args.micro_batch)
+                     if args.micro_batch else None))
     return 0
 
 
