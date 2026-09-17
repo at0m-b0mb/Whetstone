@@ -278,6 +278,64 @@ PROBES: list[Probe] = [
 ]
 
 
+#: Task -> verbs a competent operator would accept as a first move. Several are
+#: right for each, so this measures judgement rather than guessing one answer.
+VERB_CHOICE_TASKS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Find anything that runs without a human starting it.",
+     ("enum.persistence", "enum.services", "detect.persistence_change")),
+    ("Check what network services are exposed on this machine.",
+     ("enum.network", "enum.services", "enum.shares")),
+    ("Establish who I am on this box and what privileges I hold.",
+     ("enum.privileges", "enum.users")),
+    ("Would this host see an attack if one happened?",
+     ("detect.telemetry", "detect.process_creation", "detect.persistence_change",
+      "detect.credential_access", "detect.authentication")),
+    ("Look for credentials left somewhere they should not be.",
+     ("vuln.credential_exposure", "enum.users", "detect.credential_access")),
+    ("Is any installed software known-vulnerable?",
+     ("vuln.patch_gap", "enum.software")),
+    ("Find a route from my current account to administrator.",
+     ("vuln.privilege_path", "enum.privileges", "vuln.weak_permissions")),
+    ("List the processes running right now.",
+     ("enum.processes",)),
+)
+
+
+def verb_choice_score(model: Any, tok: Any) -> tuple[int, int, list[str]]:
+    """Constrained decoding: does the model pick a *sensible* verb?
+
+    Separated from ``action-json`` on purpose. That probe conflated two things —
+    whether the model can write valid JSON, and whether it picks the right verb —
+    and reported the sum as capability. With constrained decoding the first is
+    guaranteed by construction, so what remains is judgement, and judgement is
+    the thing that should improve with training. Measuring them together meant a
+    syntax failure and a reasoning failure were the same number.
+    """
+    import whetstone.verbs  # noqa: F401
+
+    from whetstone.actions import REGISTRY, TargetKind
+    from whetstone.gate import Gate, null_engagement
+    from training.constrained import decode_action
+    from training.tokenizer.protocol import ACT, BOS, HOST, SCOPE, TASK, VERBS
+
+    gate = Gate(null_engagement(), registry=REGISTRY)
+    permitted = [v for v in gate.catalogue() if v.target is TargetKind.HOST]
+    catalogue = "; ".join(
+        f"{v.id}({', '.join(p.name for p in v.params)})" for v in permitted)[:400]
+
+    hits = 0
+    detail: list[str] = []
+    for task, acceptable in VERB_CHOICE_TASKS:
+        prompt = (f"{BOS}{TASK}{task}{HOST}macos{SCOPE}observe; loopback only"
+                  f"{VERBS}{catalogue}{ACT}")
+        got = decode_action(model, tok, prompt, permitted=permitted,
+                            target="127.0.0.1")
+        ok = got.verb.id in acceptable
+        hits += ok
+        detail.append(f"{'✓' if ok else '·'} {task[:38]:<40} -> {got.verb.id}")
+    return hits, len(VERB_CHOICE_TASKS), detail
+
+
 def run_bench(checkpoint: Path, tokenizer: Path, *, temperature: float = 0.7,
               seed: int = 0, only: list[str] | None = None) -> list[Probe]:
     from tokenizers import Tokenizer
@@ -327,6 +385,22 @@ def main(argv: list[str] | None = None) -> int:
 
     probes = run_bench(args.checkpoint, args.tokenizer,
                        temperature=args.temperature, only=args.only)
+
+    # Constrained decoding is reported separately because it answers a
+    # different question: not "can it write an action" but "does it choose a
+    # sensible one". Validity is guaranteed there, so a low score here is
+    # judgement and nothing else.
+    if not args.only or "verb-choice" in args.only:
+        from training.generate import load_for_inference
+        from tokenizers import Tokenizer as _T
+        _model, _cfg = load_for_inference(args.checkpoint)
+        _tok = _T.from_file(str(args.tokenizer))
+        hits, total, detail = verb_choice_score(_model, _tok)
+        print(f"{'verb-choice':<20}{f'{hits}/{total}':>8}   CONSTRAINED decoding: "
+              f"validity is guaranteed, so this is judgement alone")
+        for line in detail:
+            print(f"{'':<20}{'':>8}   {line}")
+        print()
 
     print("-" * 96)
     print("Deliberately not averaged into one score: these probes measure "
