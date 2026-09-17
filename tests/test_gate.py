@@ -615,3 +615,54 @@ class TestCatalogue:
         for verb in REGISTRY:
             assert "command" not in {p.name for p in verb.params}, verb.id
             assert verb.id not in {"run.shell", "exec.command", "shell.run"}
+
+
+# --------------------------------------------------------------------------
+# cross-platform output
+# --------------------------------------------------------------------------
+
+
+class TestCliEncoding:
+    """Windows defaults its console to a legacy code page. CI caught this the
+    hard way: `whet coverage` prints an arrow, cp1252 cannot encode it, and the
+    command died with a UnicodeEncodeError on the happy path."""
+
+    def test_every_command_survives_a_legacy_codepage(self, capsys, tmp_path):
+        import io
+        import sys as _sys
+
+        from whetstone.cli import main
+
+        commands = [
+            ["verbs"],
+            ["verbs", "--side", "red"],
+            ["coverage"],
+            ["-e", "examples/engagement.yaml", "check"],
+            ["plan", "enum.host", "127.0.0.1"],
+        ]
+        for argv in commands:
+            buf = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+            real_out, real_err = _sys.stdout, _sys.stderr
+            _sys.stdout = _sys.stderr = buf
+            try:
+                main(argv)
+                buf.flush()
+            finally:
+                _sys.stdout, _sys.stderr = real_out, real_err
+
+    def test_reconfigure_failure_is_survivable(self):
+        """A stream that refuses to reconfigure must not take the command down."""
+        import sys as _sys
+
+        from whetstone.cli import _force_utf8_output
+
+        class Stubborn:
+            def reconfigure(self, **kw):
+                raise ValueError("nope")
+
+        real_out = _sys.stdout
+        _sys.stdout = Stubborn()
+        try:
+            _force_utf8_output()
+        finally:
+            _sys.stdout = real_out

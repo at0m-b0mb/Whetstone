@@ -225,7 +225,33 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _force_utf8_output() -> None:
+    """Make stdout/stderr UTF-8 safe before printing anything.
+
+    Windows still defaults its console to a legacy code page — cp1252 on most
+    en-US installs — and the moment `whet coverage` prints its ``←`` the whole
+    command dies with a UnicodeEncodeError. That is a crash on the happy path of
+    a tool whose entire premise is running on all three platforms, so it is
+    fixed here rather than by writing ASCII-only output forever.
+
+    ``errors="replace"`` is the safety net for a console that genuinely cannot
+    render a character: a lone ``?`` in a report is a cosmetic problem, and a
+    traceback instead of the report is not.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            # A redirected or wrapped stream may refuse; printing still works,
+            # and a degraded encoding is not worth failing the command over.
+            pass
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    _force_utf8_output()
     args = build_parser().parse_args(argv)
     try:
         return int(args.func(args))
