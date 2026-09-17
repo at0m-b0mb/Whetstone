@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" width="1280" height="640"
+     role="img" aria-label="Whetstone — a purple-team agent, and a model trained from scratch">
+  <defs>
+    <linearGradient id="purple" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%"   stop-color="#b03a2e"/>
+      <stop offset="46%"  stop-color="#a34a52"/>
+      <stop offset="52%"  stop-color="#d99b2b"/>
+      <stop offset="58%"  stop-color="#7a5a86"/>
+      <stop offset="100%" stop-color="#2e5f8a"/>
+    </linearGradient>
+    <linearGradient id="fade" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1280" height="640" fill="#f7f4ee"/>
+  <rect width="1280" height="220" fill="url(#fade)"/>
+  <rect x="0" y="634" width="1280" height="6" fill="url(#purple)"/>
+
+  <!-- the mark: red blade, blue stone, gold spark where they meet -->
+  <g transform="translate(96 132) scale(2.55)">
+    <rect x="4" y="46" width="56" height="12" rx="2.5" fill="#2e5f8a"/>
+    <rect x="4" y="46" width="56" height="3.4" rx="1.7" fill="#3f79ab"/>
+    <path d="M46 4.5 L54.2 10 L24.6 41.4 L20.4 37.2 Z" fill="#b03a2e"/>
+    <path d="M46 4.5 L54.2 10 L50.6 13.8 L42.6 8.2 Z" fill="#8d2c22"/>
+    <path d="M22.4 39.2 L48.4 12.0" stroke="#f7f4ee" stroke-width="1.5"
+          stroke-linecap="round" opacity="0.5" fill="none"/>
+    <g stroke="#d99b2b" stroke-width="2.6" stroke-linecap="round" fill="none">
+      <path d="M18.6 35.4 L13.2 30.6"/>
+      <path d="M16.4 41.0 L9.8 40.0"/>
+      <path d="M21.2 44.2 L18.4 49.6"/>
+    </g>
+  </g>
+
+  <text x="300" y="196" font-family="Iowan Old Style, Palatino, Georgia, serif"
+        font-size="82" font-weight="600" letter-spacing="18" fill="#101625">WHETSTONE</text>
+  <text x="305" y="246" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif"
+        font-size="22" letter-spacing="5" fill="#5c6679">PURPLE-TEAM AGENT &#183; MODEL TRAINED FROM SCRATCH</text>
+  <text x="305" y="306" font-family="Iowan Old Style, Palatino, Georgia, serif"
+        font-size="31" font-style="italic" fill="#5c6679">&#8220;The stone cuts nothing. That is the point.&#8221;</text>
+
+  <g stroke="#dcd7cc" stroke-width="2"><path d="M96 364 H1184"/></g>
+
+  <!-- evidence, not adjectives -->
+  <g font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif">
+    <g transform="translate(96 430)">
+      <text font-family="Iowan Old Style, Palatino, Georgia, serif" font-size="46" fill="#b03a2e">30</text>
+      <text y="32" font-size="18" fill="#101625" font-weight="600">verbs &#215; 3 platforms</text>
+      <text y="58" font-size="15" fill="#5c6679">Windows, Linux, macOS &#8212; real commands</text>
+    </g>
+    <g transform="translate(456 430)">
+      <text font-family="Iowan Old Style, Palatino, Georgia, serif" font-size="46" fill="#2e5f8a">138M</text>
+      <text y="32" font-size="18" fill="#101625" font-weight="600">tokens, 13 sources</text>
+      <text y="58" font-size="15" fill="#5c6679">every licence declared and checked</text>
+    </g>
+    <g transform="translate(816 430)">
+      <text font-family="Iowan Old Style, Palatino, Georgia, serif" font-size="46" fill="#6d4c8c">+29%</text>
+      <text y="32" font-size="18" fill="#101625" font-weight="600">tokenizer vs gpt2</text>
+      <text y="58" font-size="15" fill="#5c6679">held-out text, every register winning</text>
+    </g>
+  </g>
+
+  <text x="96" y="572" font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+        font-size="19" fill="#6d4c8c">every attack names the detection that should catch it</text>
+  <text x="1184" y="572" text-anchor="end"
+        font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+        font-size="17" fill="#8a8578">github.com/at0m-b0mb/Whetstone</text>
+</svg>

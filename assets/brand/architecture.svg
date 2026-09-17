@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 980 560" width="980" height="560"
+     role="img" aria-label="Whetstone architecture: model proposes an action, the gate rules on it, an adapter runs it, the detection check turns silence into a finding, and the audit log feeds training">
+  <style>
+    .t  { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .m  { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .s  { font-family: "Iowan Old Style", Palatino, Georgia, serif; }
+    .ink   { fill: #101625; }
+    .muted { fill: #5c6679; }
+    .box   { fill: #ffffff; stroke: #dcd7cc; stroke-width: 1.5; }
+    .flow  { stroke: #5c6679; stroke-width: 1.8; fill: none; }
+    .redln { stroke: #b03a2e; stroke-width: 2.2; fill: none; }
+    .bluln { stroke: #2e5f8a; stroke-width: 2.2; fill: none; }
+    @media (prefers-color-scheme: dark) {
+      .ink { fill: #f2efe9; } .muted { fill: #9aa3b2; }
+      .box { fill: #131316; stroke: #2a2a2e; }
+      .flow { stroke: #9aa3b2; }
+    }
+  </style>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 z" fill="#5c6679"/>
+    </marker>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 z" fill="#b03a2e"/>
+    </marker>
+    <marker id="ab" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 z" fill="#2e5f8a"/>
+    </marker>
+  </defs>
+
+  <rect width="980" height="560" fill="none"/>
+
+  <!-- 1. model -->
+  <rect class="box" x="30" y="40" width="190" height="96" rx="10"/>
+  <text class="s ink" x="46" y="70" font-size="17" font-weight="600">The model</text>
+  <text class="t muted" x="46" y="93" font-size="12.5">emits a verb id + params,</text>
+  <text class="t muted" x="46" y="110" font-size="12.5">never a shell command</text>
+  <text class="m" x="46" y="129" font-size="11" fill="#6d4c8c">{"verb":"enum.persistence"}</text>
+
+  <!-- 2. gate -->
+  <rect class="box" x="290" y="40" width="200" height="96" rx="10"/>
+  <text class="s ink" x="306" y="70" font-size="17" font-weight="600">The gate</text>
+  <text class="t muted" x="306" y="93" font-size="12.5">engagement scope · intent</text>
+  <text class="t muted" x="306" y="110" font-size="12.5">ceiling · technique list</text>
+  <text class="m" x="306" y="129" font-size="11" fill="#b03a2e">a DENY has no override</text>
+
+  <!-- 3. adapters -->
+  <rect class="box" x="560" y="40" width="200" height="96" rx="10"/>
+  <text class="s ink" x="576" y="70" font-size="17" font-weight="600">The adapter</text>
+  <text class="t muted" x="576" y="93" font-size="12.5">one verb, three dialects</text>
+  <text class="t muted" x="576" y="110" font-size="12.5">argv lists — never a shell</text>
+  <text class="m" x="576" y="129" font-size="11" fill="#2e5f8a">windows · linux · macos</text>
+
+  <!-- 4. target -->
+  <rect class="box" x="820" y="40" width="130" height="96" rx="10"/>
+  <text class="s ink" x="836" y="70" font-size="17" font-weight="600">Target</text>
+  <text class="t muted" x="836" y="93" font-size="12.5">in scope, or</text>
+  <text class="t muted" x="836" y="110" font-size="12.5">not reached at all</text>
+
+  <path class="flow" marker-end="url(#a)" d="M220 88 H286"/>
+  <path class="flow" marker-end="url(#a)" d="M490 88 H556"/>
+  <path class="flow" marker-end="url(#a)" d="M760 88 H816"/>
+
+  <!-- the pairing -->
+  <rect x="290" y="204" width="470" height="150" rx="12" fill="none"
+        stroke="#6d4c8c" stroke-width="1.6" stroke-dasharray="5 4"/>
+  <text class="s" x="306" y="230" font-size="16" font-weight="600" fill="#6d4c8c">The one idea</text>
+
+  <rect class="box" x="312" y="248" width="196" height="84" rx="9"/>
+  <text class="s" x="328" y="274" font-size="15" font-weight="600" fill="#b03a2e">exploit.*  postex.*</text>
+  <text class="t muted" x="328" y="296" font-size="12">runs the technique</text>
+  <text class="m" x="328" y="316" font-size="11" fill="#b03a2e">detected_by = (...)</text>
+
+  <rect class="box" x="544" y="248" width="196" height="84" rx="9"/>
+  <text class="s" x="560" y="274" font-size="15" font-weight="600" fill="#2e5f8a">detect.*</text>
+  <text class="t muted" x="560" y="296" font-size="12">did anything notice?</text>
+  <text class="m" x="560" y="316" font-size="11" fill="#2e5f8a">caught · or silence</text>
+
+  <path class="redln" marker-end="url(#ar)" d="M508 290 H540"/>
+  <path class="flow" marker-end="url(#a)" d="M660 136 V244"/>
+
+  <!-- finding -->
+  <rect class="box" x="290" y="400" width="470" height="76" rx="10"/>
+  <text class="s ink" x="306" y="428" font-size="16" font-weight="600">report.detection_gap</text>
+  <text class="t muted" x="306" y="450" font-size="12.5">Silence is the finding. The exploit proves a hole exists;</text>
+  <text class="t muted" x="306" y="467" font-size="12.5">the silence proves nobody would have known.</text>
+  <path class="bluln" marker-end="url(#ab)" d="M642 332 V396"/>
+
+  <!-- audit -->
+  <rect class="box" x="30" y="400" width="210" height="76" rx="10"/>
+  <text class="s ink" x="46" y="428" font-size="16" font-weight="600">Audit log</text>
+  <text class="t muted" x="46" y="450" font-size="12.5">hash-chained, every ruling</text>
+  <text class="t muted" x="46" y="467" font-size="12.5">including every refusal</text>
+
+  <!-- training loop -->
+  <rect class="box" x="810" y="400" width="140" height="76" rx="10"/>
+  <text class="s ink" x="826" y="428" font-size="16" font-weight="600">Training</text>
+  <text class="t muted" x="826" y="450" font-size="12.5">verified runs</text>
+  <text class="t muted" x="826" y="467" font-size="12.5">become data</text>
+
+  <path class="flow" marker-end="url(#a)" d="M290 438 H246"/>
+  <path class="flow" marker-end="url(#a)" d="M760 438 H806"/>
+  <path class="flow" marker-end="url(#a)" d="M880 400 V186 Q880 172 866 172 H126 Q112 172 112 158 V140"
+        stroke-dasharray="5 4"/>
+  <text class="t muted" x="300" y="166" font-size="11.5" font-style="italic">
+    verified trajectories become training data
+  </text>
+  <text class="t muted" x="300" y="560" font-size="0"> </text>
+
+  <text class="s muted" x="30" y="520" font-size="13" font-style="italic">
+    The model learns the question once. The adapters know the three answers.
+  </text>
+</svg>
