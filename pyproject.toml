@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "whetstone-purple"
+dynamic = ["version"]
+description = "A purple-team agent runtime, and a small cybersecurity model trained from scratch to drive it"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [{ name = "at0m-b0mb" }]
+keywords = [
+    "security", "purple-team", "red-team", "blue-team", "attck",
+    "detection-engineering", "llm", "ai-agent", "pretraining", "mlx",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+]
+
+# The runtime core is standard library only, so the gate and the catalogue
+# import in a locked-down environment with no wheel allowlist. PyYAML is pulled
+# in lazily, and only when someone hands us a YAML engagement rather than JSON.
+dependencies = []
+
+[project.optional-dependencies]
+yaml = ["PyYAML>=5.4"]
+# Training is a separate install on purpose: the runtime must stay usable on a
+# machine that will never train anything, which is most machines it runs on.
+train = ["mlx>=0.18", "mlx-lm>=0.18", "numpy>=1.24", "tokenizers>=0.20"]
+dev = ["pytest>=7.0", "pytest-cov>=4.0", "PyYAML>=5.4"]
+
+[project.scripts]
+whet = "whetstone.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/at0m-b0mb/Whetstone"
+Source = "https://github.com/at0m-b0mb/Whetstone"
+Issues = "https://github.com/at0m-b0mb/Whetstone/issues"
+
+[tool.hatch.version]
+path = "whetstone/version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["whetstone"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

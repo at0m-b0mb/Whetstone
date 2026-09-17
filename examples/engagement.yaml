@@ -1,0 +1,68 @@
+# An example engagement. Copy it, edit it, and keep it in version control —
+# the whole point of putting authorisation in a file is that changes to it leave
+# a diff with an author and a date on it.
+#
+# Whetstone reads this and refuses everything outside it. There is no flag that
+# overrides a refusal; if the scope is wrong, the fix is to change this document.
+
+engagement:
+  name: Q3 internal purple exercise — workstation segment
+  # Quoted back in every audit record and every report. Name the ticket, the
+  # human who approved it, and the date. "who said you could do this" is the
+  # first question asked afterwards, and this string is the answer.
+  authorization: SEC-4417, approved 2026-09-14 by J. Rivera (Head of Security)
+  operator: at0m-b0mb
+  # Timezone is mandatory. An authorisation window without one is not an
+  # authorisation window.
+  starts:  2026-09-16T09:00:00Z
+  expires: 2026-09-20T18:00:00Z
+
+scope:
+  hosts:
+    - 10.20.4.0/24                 # the workstation VLAN
+    - "*.lab.internal"             # hostname globs work too
+  exclude_hosts:
+    # Exclusions beat inclusions, always. 10.20.4.1 is inside the /24 above and
+    # is still out of scope, because the narrower, more explicit statement wins.
+    - 10.20.4.1                    # default gateway
+    - 10.20.4.50                   # finance workstation — explicitly carved out
+  paths:
+    - /opt/lab
+  exclude_paths:
+    - /opt/lab/.credentials
+    # Paths are compared after resolution, so a symlink out of /opt/lab does not
+    # bring its destination back into scope.
+
+authorize:
+  # Red verbs run at all? Without this, every exploit.* and postex.* verb is
+  # denied by the rule `red.unauthorized` regardless of anything else here.
+  red_team: true
+
+  # The ceiling. `observe` reads only; `modify` changes durable state;
+  # `execute` runs code of our choosing on the target.
+  max_intent: execute
+
+  # Opt-in, and required — red_team: true with an empty list authorises nothing,
+  # which is deliberate. Every technique a verb touches must appear here, not
+  # just one of them: a verb mapped to T1547.001 *and* T1053.005 needs both.
+  # A bare T1547 covers all of its sub-techniques.
+  techniques:
+    - T1547        # boot or logon autostart execution
+    - T1053        # scheduled task / job
+    - T1003        # OS credential dumping
+    - T1574.010    # service file permissions weakness
+
+  # Which intents run without a human approving each one.
+  #
+  # This is the autonomy dial, and it is the *only* one. Listing `execute` here
+  # means the agent enumerates, finds the weakness, exploits it, escalates and
+  # reports without stopping to ask — fully autonomous inside this scope. It
+  # still cannot touch 10.20.4.1, because autonomy and authorisation are
+  # separate axes and only the first one is set here.
+  #
+  # Start with [observe] on a new engagement. Widen it here, in a file that gets
+  # reviewed, rather than by clicking through prompts during the exercise.
+  unattended:
+    - observe
+    - modify
+    - execute

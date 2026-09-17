@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+.DS_Store
+
+
+# The NVMe data directory: model weights, corpus, checkpoints, VMs, logs.
+# Symlinked in as ./data — never committed, and far too large to be.
+data
+/data/
+
+# A real engagement names real hosts and a real approver. The example is
+# committed; yours is not.
+engagement.yaml
+!examples/engagement.yaml
+
+# Audit logs are evidence from a specific exercise, not source.
+*.jsonl
+whetstone-session.jsonl
+runs/

@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Whetstone — purple-team agent, model trained from scratch</title>
+<meta name="description" content="A purple-team agent runtime where every attack names the detection that should catch it, and a small cybersecurity model pretrained from scratch to drive it.">
+<meta property="og:title" content="Whetstone — the stone cuts nothing">
+<meta property="og:description" content="A purple-team agent runtime where every attack names the detection that should catch it, and a small cybersecurity model pretrained from scratch to drive it.">
+<meta property="og:type" content="website">
+<link rel="icon" href="assets/logo-badge.svg" type="image/svg+xml">
+<style>
+:root {
+  --ink: #101625; --ink-2: #1c2436; --muted: #5c6679; --line: #dcd7cc;
+  --surface: #f7f4ee; --surface-2: #ffffff;
+  --spark: #6d4c8c; --spark-soft: #8e6bb0;
+  --red: #b03a2e; --blue: #2e5f8a; --gold: #9a7212;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+  --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) { :root {
+  --ink: #f2efe9; --ink-2: #ddd8d0; --muted: #9aa3b2; --line: #26262a;
+  --surface: #0a0a0a; --surface-2: #131316;
+  --spark: #a884c9; --spark-soft: #6d4c8c;
+  --red: #d1503f; --blue: #4a86bd; --gold: #e0b348;
+} }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--surface); color: var(--ink); font: 16px/1.65 var(--sans); }
+a { color: var(--spark); }
+code, pre { font-family: var(--mono); }
+
+header.top { border-bottom: 1px solid var(--line); background: var(--surface-2); position: sticky; top: 0; z-index: 10; }
+.topinner { max-width: 1080px; margin: 0 auto; padding: 12px 24px; display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
+.brand { display: flex; align-items: center; gap: 11px; text-decoration: none; color: inherit; }
+.brand .name { font-family: var(--serif); font-size: 21px; letter-spacing: .18em; font-weight: 600; }
+nav.main { display: flex; gap: 16px; flex-wrap: wrap; margin-left: auto; font-size: 14px; }
+nav.main a { color: var(--muted); text-decoration: none; padding: 4px 0; border-bottom: 2px solid transparent; }
+nav.main a:hover { color: var(--ink); border-bottom-color: var(--spark); }
+
+main { max-width: 1080px; margin: 0 auto; padding: 0 24px 100px; }
+.doc { max-width: 780px; }
+h1 { font-family: var(--serif); font-size: 52px; line-height: 1.1; letter-spacing: -.02em; margin: 0 0 16px; max-width: 14ch; }
+h2 { font-family: var(--serif); font-size: 29px; margin: 58px 0 10px; letter-spacing: -.01em; }
+h3 { font-family: var(--serif); font-size: 20px; margin: 30px 0 6px; }
+p, li { color: var(--ink-2); }
+.lede { font-size: 20px; color: var(--ink-2); max-width: 60ch; }
+blockquote { margin: 22px 0; padding: 2px 20px; border-left: 4px solid var(--spark); color: var(--muted); font-style: italic; font-family: var(--serif); font-size: 18px; }
+pre { background: color-mix(in srgb, var(--ink) 6%, var(--surface)); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; overflow-x: auto; font-size: 13px; line-height: 1.55; }
+:not(pre) > code { background: color-mix(in srgb, var(--ink) 7%, var(--surface)); padding: 1.5px 5px; border-radius: 5px; font-size: .88em; }
+hr { border: 0; border-top: 1px solid var(--line); margin: 46px 0; }
+.rule { height: 4px; border: 0; border-radius: 2px; margin: 0;
+  background: linear-gradient(90deg, var(--red) 0%, #a34a52 46%, var(--gold) 52%, #7a5a86 58%, var(--blue) 100%); }
+.tablewrap { overflow-x: auto; margin: 20px 0; }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th { text-align: left; color: var(--muted); font-weight: 600; border-bottom: 2px solid var(--line); padding: 9px 14px 9px 0; }
+td { padding: 9px 14px 9px 0; border-bottom: 1px solid var(--line); vertical-align: top; color: var(--ink-2); }
+td code { white-space: nowrap; }
+
+.hero { padding: 66px 0 10px; }
+.hero .tag { font-family: var(--serif); font-style: italic; color: var(--muted); margin-top: 22px; font-size: 18px; }
+.cta { display: flex; gap: 12px; flex-wrap: wrap; margin: 32px 0 8px; }
+.btn { display: inline-block; padding: 11px 20px; border-radius: 9px; text-decoration: none; font-weight: 600; font-size: 15px; }
+.btn.primary { background: var(--spark); color: #fff; }
+.btn.ghost { border: 1px solid var(--line); color: var(--ink); }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 16px; margin: 28px 0; }
+.card { background: var(--surface-2); border: 1px solid var(--line); border-radius: 12px; padding: 20px 22px; }
+.card h3 { margin: 0 0 8px; font-size: 17px; }
+.card p { margin: 0; font-size: 14.5px; color: var(--muted); }
+.card .k { font-family: var(--serif); font-size: 34px; line-height: 1; margin-bottom: 6px; }
+.k.red { color: var(--red); } .k.blue { color: var(--blue); } .k.spark { color: var(--spark); }
+
+/* white-space: pre is load-bearing — these blocks are literal captured output
+   and a div does not preserve newlines the way a <pre> would. */
+.term { background: #0d0f14; color: #e9edf5; border-radius: 12px; padding: 18px 20px; font-family: var(--mono);
+        font-size: 12.5px; line-height: 1.65; overflow-x: auto; margin: 20px 0; white-space: pre; }
+.term .ok { color: #57b89b; } .term .no { color: #ef6a5a; } .term .m { color: #78839a; }
+.term .y { color: #e0b348; } .term .p { color: #b18ad0; }
+.pill { display: inline-block; font-size: 10.5px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase;
+        padding: 2.5px 9px; border-radius: 999px; color: #fff; }
+.pill.red { background: var(--red); } .pill.blue { background: var(--blue); }
+footer { border-top: 1px solid var(--line); margin-top: 70px; }
+.footinner { max-width: 1080px; margin: 0 auto; padding: 28px 24px 56px; color: var(--muted); font-size: 14px; }
+@media (max-width: 720px) { h1 { font-size: 38px; } nav.main { margin-left: 0; } .hero { padding-top: 38px; } }
+</style>
+</head>
+<body>
+
+<header class="top"><div class="topinner">
+  <a class="brand" href="index.html">
+    <svg viewBox="0 0 64 64" width="30" height="30" aria-label="Whetstone" xmlns="http://www.w3.org/2000/svg">
+      <rect x="4" y="46" width="56" height="12" rx="2.5" fill="var(--blue)"/>
+      <path d="M46 4.5 L54.2 10 L24.6 41.4 L20.4 37.2 Z" fill="var(--red)"/>
+      <g stroke="var(--gold)" stroke-width="2.6" stroke-linecap="round" fill="none">
+        <path d="M18.6 35.4 L13.2 30.6"/><path d="M16.4 41.0 L9.8 40.0"/><path d="M21.2 44.2 L18.4 49.6"/>
+      </g>
+    </svg>
+    <span class="name">WHETSTONE</span>
+  </a>
+  <nav class="main">
+    <a href="#idea">The idea</a>
+    <a href="#autonomy">Autonomy</a>
+    <a href="#catalogue">Catalogue</a>
+    <a href="#scratch">From scratch</a>
+    <a href="#status">Status</a>
+    <a href="https://github.com/at0m-b0mb/Whetstone">GitHub</a>
+  </nav>
+</div></header>
+
+<main>
+
+<section class="hero doc">
+  <h1>The stone cuts nothing.</h1>
+  <p class="lede">A purple-team agent runtime where every attack names the detection
+  that should catch it — and a small cybersecurity model pretrained from scratch to drive it.</p>
+  <p class="tag">A whetstone does not cut. It exists so the blade does its job better,
+  and it is useless on its own. That is the argument for the red half of this project.</p>
+  <div class="cta">
+    <a class="btn primary" href="https://github.com/at0m-b0mb/Whetstone">View on GitHub</a>
+    <a class="btn ghost" href="#idea">How it works</a>
+  </div>
+</section>
+
+<hr class="rule">
+
+<div class="grid">
+  <div class="card"><div class="k red">30</div><h3>verbs in the catalogue</h3>
+    <p>A closed action space. The model picks a verb, never writes a shell command.</p></div>
+  <div class="card"><div class="k blue">7/8</div><h3>red verbs with a detection</h3>
+    <p>The eighth is reported as a gap rather than quietly implied to be covered.</p></div>
+  <div class="card"><div class="k spark">66</div><h3>tests, 50 ms, no lab</h3>
+    <p>The gate is a pure function, so the whole safety surface tests on a laptop.</p></div>
+</div>
+
+<section class="doc" id="idea">
+  <h2>Every attack names the detection that should catch it</h2>
+  <p>This is not documentation. It is a schema field the constructor enforces — a red verb
+  that declares no <code>detected_by</code> raises at import time.</p>
+
+<pre><code>_v(
+    id="postex.credential_dump",
+    intent=Intent.EXECUTE,
+    side=Side.RED,
+    attck=("T1003",),
+    detected_by=("detect.credential_access",),   # ← this
+)</code></pre>
+
+  <p>The agent runs the attack, then runs the detection, then compares.
+  <strong>Caught</strong> is a control working. <strong>Silence</strong> is a detection gap —
+  a finding that names the technique, the host, and the telemetry that was missing.</p>
+
+  <blockquote>The exploit is not the deliverable. The gap it reveals is.</blockquote>
+
+  <p>“There is a hole” gets triaged into next quarter. “There is a hole, and nobody would
+  have known” gets fixed on Monday.</p>
+
+  <p>If the honest answer is that nothing covers a technique, you write
+  <code>detect.nothing</code> and it appears in <code>whet coverage</code> as a gap on the
+  blue backlog. Silence by omission is not available:</p>
+
+<div class="term">
+<span class="m">$</span> whet coverage
+
+  <span class="ok">covered</span>   exploit.scheduled_task
+            <span class="m">← detect.persistence_change, detect.process_creation</span>
+  <span class="ok">covered</span>   postex.credential_dump
+            <span class="m">← detect.credential_access</span>
+  <span class="no">GAP</span>       postex.exfil_probe  <span class="m">(T1041)</span>
+            <span class="m">nothing in this catalogue would notice it</span>
+
+7/8 red verbs have a detection; 1 gap(s).
+</div>
+
+  <p>It is also the cleanest training signal in the system. <em>Did rule X fire within N
+  seconds of technique Y?</em> is a mechanically checkable fact, not a judge model’s opinion —
+  so trajectories get labelled correct or incorrect with no human in the loop. Most domains
+  would kill for a verifier this good.</p>
+</section>
+
+<section class="doc" id="autonomy">
+  <h2>Autonomy and authorisation are different axes</h2>
+  <p>The usual objection to a gate is that it makes the agent stop and ask permission.
+  It does not. It defines the walls inside which it never has to.</p>
+
+<pre><code>authorize:
+  red_team: true
+  max_intent: execute
+  techniques: [T1547, T1053, T1003, T1574.010]
+  unattended: [observe, modify, execute]   # ← the autonomy dial</code></pre>
+
+  <p>With <code>execute</code> in <code>unattended</code>, the agent enumerates, finds the
+  weakness, exploits it, escalates, pivots and reports <strong>without pausing once</strong>.
+  That axis is fully open. What it still cannot do is touch a host nobody authorised —
+  and that is what makes the tool deployable at all.</p>
+
+<div class="term">
+<span class="m">$</span> whet -e engagement.yaml plan exploit.scheduled_task 10.20.4.77
+<span class="ok">ALLOW</span>   exploit.scheduled_task(as_user=SYSTEM, cleanup=True) on 10.20.4.77
+        <span class="m">rule: intent.unattended</span>
+        <span class="m">after this runs, the agent checks: detect.persistence_change, detect.process_creation</span>
+
+<span class="m">$</span> whet -e engagement.yaml plan exploit.scheduled_task 10.20.4.50
+<span class="no">DENY</span>    exploit.scheduled_task(as_user=SYSTEM, cleanup=True) on 10.20.4.50
+        <span class="m">rule: scope.host.excluded</span>
+        <span class="m">10.20.4.50 is explicitly excluded by the rule '10.20.4.50'.</span>
+        <span class="m">An exclusion beats any range that would otherwise cover it.</span>
+</div>
+
+  <h3>A denial has no override</h3>
+  <p>Nowhere in the package does a function take <code>force=</code> or
+  <code>--yes-really</code>, and a test asserts that mechanically across the public API.
+  If the scope is wrong, the fix is to edit the engagement document — a file, in git, with
+  an author and a timestamp. A flag leaves no evidence; a diff does.</p>
+  <p>Three more defaults run the restrictive way round: exclusions beat any range that would
+  cover them, the policy fallthrough is <em>confirm</em> rather than <em>allow</em>, and a
+  confirmation with no human attached resolves to a refusal.</p>
+</section>
+
+<section class="doc" id="catalogue">
+  <h2>Why there is no <code>run.shell</code></h2>
+  <p>The obvious shortcut is one verb taking an arbitrary command string. It would collapse
+  the catalogue into four lines and destroy every property that makes the project work.</p>
+  <ul>
+    <li><strong>The gate could no longer reason about what it approves</strong>, because the
+    meaning would sit inside an opaque string.</li>
+    <li><strong>The model would have to generate correct PowerShell, bash and zsh</strong>
+    instead of choosing a concept. <code>enum.persistence</code> means the same thing on all
+    three systems; the adapters hold the dialects. The model learns the question once — the
+    single largest capacity saving available at this model size.</li>
+    <li><strong>The detection pairing would be impossible</strong>, since it depends on
+    knowing which technique is being performed.</li>
+  </ul>
+  <p>The catalogue is more work and it is the entire design. A test asserts no such verb
+  ever gets added.</p>
+
+  <div class="tablewrap"><table>
+    <tr><th>Group</th><th>Side</th><th>What it does</th></tr>
+    <tr><td><code>enum.*</code></td><td>neutral</td><td>Look at the machine — the substrate both sides share.</td></tr>
+    <tr><td><code>vuln.*</code></td><td>neutral</td><td>Turn observations into findings. Still observe-only.</td></tr>
+    <tr><td><code>exploit.*</code></td><td><span class="pill red">red</span></td><td>Prove the finding is real by using it.</td></tr>
+    <tr><td><code>postex.*</code></td><td><span class="pill red">red</span></td><td>Credentials, persistence, escalation, lateral movement.</td></tr>
+    <tr><td><code>detect.*</code></td><td><span class="pill blue">blue</span></td><td>Ask whether anything noticed. The half that makes the other half worth running.</td></tr>
+    <tr><td><code>harden.*</code></td><td><span class="pill blue">blue</span></td><td>Fix what the exercise proved was broken.</td></tr>
+  </table></div>
+</section>
+
+<section class="doc" id="scratch">
+  <h2>About “from scratch”</h2>
+  <p>This is a genuine from-random-init pretrain, not a fine-tune of someone else’s weights.
+  That decision was made with the numbers in front of us, and the numbers are worth stating.</p>
+
+  <p>Training FLOPs ≈ <code>6 · N · D</code>. A 100M-parameter model on 2B tokens is
+  ~1.2×10<sup>18</sup> FLOPs — <strong>four to five days</strong> of sustained GPU on an
+  M4 Pro. Feasible. It checkpoints and resumes. We climb a staircase —
+  <strong>15M → 60M → 150M</strong> — because nobody should debug a pipeline on a four-day run.</p>
+
+  <h3>What it can and cannot do</h3>
+  <p><strong>Can:</strong> route a task, choose a verb, fill its parameters, read the result,
+  decide the next step. A narrow, closed distribution — and narrow closed distributions are
+  learnable at this scale.</p>
+  <p><strong>Cannot:</strong> discover novel vulnerability classes. Fuzzing, memory-safety
+  reasoning and logic-flaw hunting are hard for frontier models and impossible here.
+  Whetstone finds <em>known</em> weaknesses and chains them — which is what most of a real
+  engagement consists of — and it does not pretend otherwise.</p>
+
+  <h3>Four levers buy back the capacity</h3>
+  <div class="tablewrap"><table>
+    <tr><th>Lever</th><th>Why it matters</th></tr>
+    <tr><td>Domain tokenizer</td><td>A generic BPE spends 6 tokens on <code>Get-WmiObject</code>; a security BPE spends 2.</td></tr>
+    <tr><td>Closed action space</td><td>Picking one of ~200 verb ids is classification, not free generation.</td></tr>
+    <tr><td>Retrieval for facts</td><td>The model never memorises a CVE or an ATT&amp;CK description.</td></tr>
+    <tr><td>Adapters for syntax</td><td>Concepts live in weights; dialects live in code.</td></tr>
+  </table></div>
+
+  <h3>Weighted toward offence, roughly 60/40</h3>
+  <p>Not a preference — an allocation argument. Blue knowledge (Sigma rules, log schemas,
+  control catalogues) is highly retrievable. Red judgement — <em>what do I try next from this
+  foothold</em> — is sequential decision-making that retrieval cannot supply. Spend the weights
+  on what retrieval cannot do.</p>
+  <p>An attacker-strong model also produces <em>better</em> blue output here by construction:
+  you cannot write a detection for a technique you cannot perform.</p>
+</section>
+
+<section class="doc" id="status">
+  <h2>Status</h2>
+  <p>Phase 0. The spine is built and tested; the rest is scaffolded and empty.</p>
+  <div class="tablewrap"><table>
+    <tr><th></th><th>Component</th><th>Where</th></tr>
+    <tr><td>✅</td><td>Action schema, verb catalogue, detection pairing</td><td><code>whetstone/actions.py</code></td></tr>
+    <tr><td>✅</td><td>The gate — engagement, policy, hash-chained audit</td><td><code>whetstone/gate/</code></td></tr>
+    <tr><td>✅</td><td>CLI — verbs, coverage, check, plan, audit</td><td><code>whetstone/cli.py</code></td></tr>
+    <tr><td>⬜</td><td>Platform adapters (Windows / Linux / macOS)</td><td><code>whetstone/adapters/</code></td></tr>
+    <tr><td>⬜</td><td>Agent loop with self-correction</td><td><code>whetstone/kernel/</code></td></tr>
+    <tr><td>⬜</td><td>Lab, verifiers, benchmark</td><td><code>lab/</code>, <code>bench/</code></td></tr>
+    <tr><td>⬜</td><td>Tokenizer → corpus → pretrain → SFT</td><td><code>training/</code></td></tr>
+  </table></div>
+
+  <h2>Try it</h2>
+<pre><code>git clone https://github.com/at0m-b0mb/Whetstone
+cd Whetstone
+
+python3 -m whetstone.cli verbs --side red
+python3 -m whetstone.cli coverage
+python3 -m whetstone.cli -e examples/engagement.yaml check</code></pre>
+
+  <h2>Scope of use</h2>
+  <p>Whetstone runs against systems you are authorised to test, and the engagement document
+  is where that authorisation is written down. It is not covert, it does not hide itself, and
+  every decision it makes — including every refusal — lands in a hash-chained log an operator
+  can hand to whoever asks.</p>
+</section>
+
+</main>
+
+<footer><div class="footinner">
+  <strong>Whetstone</strong> — MIT licensed · built by
+  <a href="https://github.com/at0m-b0mb">at0m-b0mb</a> ·
+  <a href="https://github.com/at0m-b0mb/Whetstone">source</a><br>
+  <em>The stone cuts nothing. That is the point.</em>
+</div></footer>
+
+</body>
+</html>

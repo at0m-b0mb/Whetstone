@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 360" width="1200" height="360"
+     role="img" aria-label="Whetstone --- purple-team agent and a model trained from scratch">
+  <defs>
+    <!-- Red to blue through a gold spark: the whole thesis as a four-pixel rule. -->
+    <linearGradient id="purple" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%"   stop-color="#d1503f"/>
+      <stop offset="46%"  stop-color="#a34a52"/>
+      <stop offset="52%"  stop-color="#f0b544"/>
+      <stop offset="58%"  stop-color="#7a5a86"/>
+      <stop offset="100%" stop-color="#4a86bd"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="360" fill="#0a0a0a"/>
+  <rect x="0" y="356" width="1200" height="4" fill="url(#purple)"/>
+
+  <g transform="translate(92 104) scale(2.25)">
+    <rect x="4" y="46" width="56" height="12" rx="2.5" fill="#4a86bd"/>
+    <rect x="4" y="46" width="56" height="3.4" rx="1.7" fill="#5f9bd1"/>
+    <path d="M46 4.5 L54.2 10 L24.6 41.4 L20.4 37.2 Z" fill="#d1503f"/>
+    <path d="M46 4.5 L54.2 10 L50.6 13.8 L42.6 8.2 Z" fill="#a8392c"/>
+    <path d="M22.4 39.2 L48.4 12.0" stroke="#f2efe9" stroke-width="1.5"
+          stroke-linecap="round" opacity="0.5" fill="none"/>
+    <g stroke="#f0b544" stroke-width="2.6" stroke-linecap="round" fill="none">
+      <path d="M18.6 35.4 L13.2 30.6"/>
+      <path d="M16.4 41.0 L9.8 40.0"/>
+      <path d="M21.2 44.2 L18.4 49.6"/>
+    </g>
+  </g>
+
+  <text x="272" y="166" font-family="Iowan Old Style, Palatino, Georgia, serif"
+        font-size="76" font-weight="600" letter-spacing="17" fill="#f2efe9">WHETSTONE</text>
+  <text x="277" y="210" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif"
+        font-size="21" letter-spacing="5" fill="#9aa3b2">PURPLE-TEAM AGENT &#183; MODEL TRAINED FROM SCRATCH</text>
+  <text x="277" y="262" font-family="Iowan Old Style, Palatino, Georgia, serif"
+        font-size="27" font-style="italic" fill="#9aa3b2">&#8220;The stone cuts nothing. That is the point.&#8221;</text>
+  <g stroke="#2a2a2a" stroke-width="2">
+    <path d="M277 288 H1104"/>
+  </g>
+  <text x="277" y="322" font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+        font-size="20" fill="#a884c9">every attack names the detection that should catch it</text>
+</svg>

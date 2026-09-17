@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e ".[dev]"
+      - run: python -m pytest tests/ -q
+      # The catalogue must import cleanly and the gate must refuse by default:
+      # a smoke test that would catch a broken freeze() before anyone clones it.
+      - run: python -m whetstone.cli coverage
+      - run: python -m whetstone.cli -e examples/engagement.yaml check
