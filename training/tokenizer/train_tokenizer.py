@@ -121,13 +121,29 @@ SAMPLES: tuple[str, ...] = (
 
 
 def iter_corpus(paths: list[Path], sample_limit: int | None = None) -> Iterator[str]:
-    """Yield text from every readable file under the given roots."""
+    """Yield text from the given roots.
+
+    A root holding ``*.jsonl`` is read as a **built corpus** — the output of
+    ``training/corpus/build.py``, with register and side metadata intact.
+    Anything else is globbed as raw text files. Supporting both matters: the
+    raw path is how a new source gets smoke-tested before it has an adapter,
+    and the built path is the one that carries the register information the
+    first tokenizer attempt was missing.
+    """
     seen = 0
     for root in paths:
-        if root.is_file():
-            files = [root]
-        else:
-            files = sorted(p for p in root.rglob("*") if p.is_file())
+        if root.is_dir() and any(root.glob("*.jsonl")):
+            from ..corpus.build import read_documents
+            for row in read_documents(root):
+                yield row["text"]
+                seen += 1
+                if sample_limit and seen >= sample_limit:
+                    return
+            continue
+
+        files = [root] if root.is_file() else sorted(
+            p for p in root.rglob("*") if p.is_file()
+        )
         for path in files:
             if path.suffix.lower() in {".bin", ".npy", ".png", ".jpg", ".zip", ".gz"}:
                 continue
@@ -224,6 +240,90 @@ def compare(tok: Tokenizer | None) -> None:
           f"hour and {saved:.0f}% more log output per context window.")
 
 
+#: Every Nth document is withheld from tokenizer training and used only for the
+#: compression measurement. Deterministic by position so the split is identical
+#: on every run and across machines — a shuffled split would put near-duplicate
+#: passages on both sides and flatter the result.
+HOLDOUT_EVERY = 20
+
+
+def iter_split(clean_dir: Path, *, holdout: bool) -> Iterator[tuple[str, str]]:
+    """Yield ``(register, text)`` from the built corpus, train or holdout side."""
+    from ..corpus.build import read_documents
+
+    for i, row in enumerate(read_documents(clean_dir)):
+        is_holdout = (i % HOLDOUT_EVERY) == 0
+        if is_holdout == holdout:
+            yield row.get("register", "unknown"), row["text"]
+
+
+def compare_on_corpus(tok: Tokenizer, clean_dir: Path, *, max_chars_per_register: int = 400_000) -> None:
+    """Measure compression against gpt2 on **held-out real corpus text**, by register.
+
+    This is the measurement that actually settles the domain-tokenizer question,
+    and it replaces a weaker one. The :data:`SAMPLES` comparison uses twenty
+    strings written by hand while designing the tokenizer — which is close to
+    marking your own homework, since the samples and the pre-tokenizer were
+    chosen together. Held-out documents from the real corpus cannot be gamed
+    that way.
+
+    Per-register matters as much as the total. The first attempt's 7% hid a
+    +47%/-45% spread, and an aggregate number would have hidden it again. A
+    register that loses to gpt2 is a register the corpus is still starved of.
+    """
+    try:
+        from tokenizers import Tokenizer as T
+        gpt2 = T.from_pretrained("gpt2")
+    except Exception as exc:
+        print(f"cannot fetch the reference tokenizer ({exc}).", file=sys.stderr)
+        return
+
+    buckets: dict[str, list[str]] = {}
+    sizes: dict[str, int] = {}
+    for register, text in iter_split(clean_dir, holdout=True):
+        if sizes.get(register, 0) >= max_chars_per_register:
+            continue
+        buckets.setdefault(register, []).append(text)
+        sizes[register] = sizes.get(register, 0) + len(text)
+
+    if not buckets:
+        print(f"no held-out documents under {clean_dir}. Build the corpus first.",
+              file=sys.stderr)
+        return
+
+    print(f"\ncompression on HELD-OUT corpus text (every {HOLDOUT_EVERY}th document)")
+    print(f"{'register':<12}{'chars':>11}{'gpt2 tok':>11}{'ours':>10}{'saved':>8}")
+    print("-" * 54)
+
+    tot_c = tot_g = tot_o = 0
+    rows = []
+    for register, texts in sorted(buckets.items()):
+        chars = sum(len(t) for t in texts)
+        g = sum(len(gpt2.encode(t).ids) for t in texts)
+        o = sum(len(tok.encode(t).ids) for t in texts)
+        tot_c += chars
+        tot_g += g
+        tot_o += o
+        saved = 100 * (g - o) / g if g else 0.0
+        rows.append((register, saved))
+        print(f"{register:<12}{chars:>11,}{g:>11,}{o:>10,}{saved:>7.0f}%")
+
+    print("-" * 54)
+    overall = 100 * (tot_g - tot_o) / tot_g if tot_g else 0.0
+    print(f"{'TOTAL':<12}{tot_c:>11,}{tot_g:>11,}{tot_o:>10,}{overall:>7.0f}%")
+
+    losers = [r for r, s in rows if s < 0]
+    if losers:
+        print(f"\nLosing to gpt2 on: {', '.join(losers)}. Those registers are still "
+              "under-represented in the corpus — collect more source for them "
+              "rather than adjusting the tokenizer.")
+    if overall < 15:
+        print(f"\n{overall:.0f}% overall. The argument for a domain vocabulary "
+              "predicts 25-30%. Below ~15% a general-purpose tokenizer is the "
+              "better answer and the from-scratch case weakens accordingly — "
+              "that is a real possible outcome, not a bug to tune away.")
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Train the Whetstone security BPE.")
     p.add_argument("--corpus", type=Path, nargs="*", default=[],
@@ -232,11 +332,41 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--vocab-size", type=int, default=16384)
     p.add_argument("--compare", action="store_true",
                    help="measure compression against gpt2 and exit")
+    p.add_argument("--clean", type=Path,
+                   help="built corpus directory (*.jsonl) — enables the "
+                        "per-register held-out measurement, which is the one "
+                        "that actually settles the domain-tokenizer question")
     args = p.parse_args(argv)
 
     existing = args.out / "tokenizer.json"
     if args.compare and existing.is_file():
-        compare(Tokenizer.from_file(str(existing)))
+        tok = Tokenizer.from_file(str(existing))
+        compare(tok)
+        if args.clean:
+            compare_on_corpus(tok, args.clean)
+        return 0
+
+    # Train on the training side of the split only, so the held-out measurement
+    # below is genuinely held out rather than a memorisation check.
+    if args.clean:
+        tok, trainer = build_tokenizer(args.vocab_size)
+        texts = [t for _reg, t in iter_split(args.clean, holdout=False)]
+        if not texts:
+            raise SystemExit(f"no documents under {args.clean}")
+        print(f"training on {len(texts):,} documents "
+              f"(every {HOLDOUT_EVERY}th held out for measurement)")
+        tok.train_from_iterator(texts, trainer=trainer)
+        args.out.mkdir(parents=True, exist_ok=True)
+        tok.save(str(args.out / "tokenizer.json"))
+        (args.out / "meta.json").write_text(json.dumps({
+            "vocab_size": tok.get_vocab_size(),
+            "special_tokens": list(SPECIAL_TOKENS),
+            "documents": len(texts),
+            "holdout_every": HOLDOUT_EVERY,
+        }, indent=2), encoding="utf-8")
+        print(f"wrote {args.out/'tokenizer.json'} ({tok.get_vocab_size()} tokens)")
+        compare(tok)
+        compare_on_corpus(tok, args.clean)
         return 0
 
     tok = train(args.corpus, args.out, args.vocab_size)

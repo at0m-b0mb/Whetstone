@@ -148,19 +148,34 @@ Four things buy back the capacity a from-scratch model gives up:
 
 | Lever | Why it matters |
 |---|---|
-| Domain tokenizer | **Measured: 7% over gpt2 so far** — see the caveat below |
+| Domain tokenizer | **Measured: 29% over gpt2**, on held-out corpus text, every register winning |
 | Closed action space | Picking one of ~200 verb ids is classification, not free generation |
 | Retrieval for facts | The model never memorises a CVE or an ATT&CK description |
 | Adapters for syntax | Concepts live in weights, dialects live in code |
 
-The tokenizer lever is the one to watch, because it is the only one of the four
-that is currently *unproven*. Fitted to ~10 MB of this author's own repositories
-it beats gpt2 by 7% — well short of what the argument predicts. The breakdown
-says why: netstat output +47% and registry paths +36% where the corpus had the
-register, but ATT&CK ids -45% and CVE ids -26% where it did not, because gpt2 has
-met those on the web and this tokenizer has not. 7% is a floor measured against
-the wrong corpus, not a verdict. It gets re-measured once the real corpus exists,
-and if it does not move, a general-purpose tokenizer is the better answer.
+The tokenizer lever was the one in doubt, and it has now been settled by
+measurement. Fitted to ~10 MB of this author's own repositories it beat gpt2 by
+only **7%** — well short of the argument's prediction — and the per-sample
+breakdown said why: netstat output +47% and registry paths +36% where the corpus
+had the register, but ATT&CK ids **-45%** and CVE ids **-26%** where it did not.
+A tokenizer can only learn merges for text it has met.
+
+So the corpus was rebuilt from seven licensed sources across all six registers.
+Refitted and re-measured on **held-out** corpus text rather than hand-written
+samples:
+
+| register | chars | vs gpt2 |
+|---|---:|---:|
+| system | 211,545 | **+40%** |
+| prose | 74,607 | +33% |
+| advisory | 114,626 | **+30%** |
+| detection | 186,835 | +30% |
+| shell | 384,678 | +22% |
+| adversary | 129,950 | **+13%** |
+| **total** | **1,102,241** | **+29%** |
+
+Every register now beats gpt2, including the two that previously lost to it.
+7% was a floor measured against the wrong corpus, not a verdict on the approach.
 
 The corpus is weighted toward offence, roughly 60/40. This is not a preference, it is
 an allocation argument: blue knowledge — Sigma rules, log schemas, control catalogues
