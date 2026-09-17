@@ -267,7 +267,7 @@ footer { border-top: 1px solid var(--line); margin-top: 70px; }
   <h3>Four levers buy back the capacity</h3>
   <div class="tablewrap"><table>
     <tr><th>Lever</th><th>Why it matters</th></tr>
-    <tr><td>Domain tokenizer</td><td>A generic BPE spends 6 tokens on <code>Get-WmiObject</code>; a security BPE spends 2.</td></tr>
+    <tr><td>Domain tokenizer</td><td><strong>Measured at 7% over gpt2 so far</strong> — short of what the argument predicts, because it was fitted to the wrong corpus. Re-measured when the real one exists.</td></tr>
     <tr><td>Closed action space</td><td>Picking one of ~200 verb ids is classification, not free generation.</td></tr>
     <tr><td>Retrieval for facts</td><td>The model never memorises a CVE or an ATT&amp;CK description.</td></tr>
     <tr><td>Adapters for syntax</td><td>Concepts live in weights; dialects live in code.</td></tr>
