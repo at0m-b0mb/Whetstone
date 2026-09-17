@@ -386,3 +386,43 @@ class TestBoilerplate:
         bp = find_boilerplate(docs)
         # Distinct lines, each in few docs -> nothing qualifies.
         assert bp.n_lines == 0
+
+
+class TestTldrParser:
+    """tldr pages are intent-to-invocation pairs, the densest SHELL form we have."""
+
+    PAGE = """# ss
+
+> Utility to investigate sockets.
+> More information: <https://example.invalid>.
+
+- Show all TCP sockets with service name:
+
+`ss --tcp --all --processes`
+
+- Filter by port:
+
+`ss {{[-a|--all]}} sport = :{{22}}`
+"""
+
+    def test_extracts_intent_command_pairs(self):
+        from training.corpus.sources.tldr import parse_page
+        out = parse_page(self.PAGE, platform="linux", name="ss")
+        assert "Show all TCP sockets with service name:" in out
+        assert "ss --tcp --all --processes" in out
+        assert "Platform: linux" in out
+
+    def test_placeholder_braces_are_preserved(self):
+        """The braces mark which span is a parameter — that is the lesson."""
+        from training.corpus.sources.tldr import parse_page
+        out = parse_page(self.PAGE, platform="linux", name="ss")
+        assert "{{[-a|--all]}}" in out and "{{22}}" in out
+
+    def test_page_with_no_commands_yields_nothing(self):
+        from training.corpus.sources.tldr import parse_page
+        assert parse_page("# empty\n\n> Just prose.\n", platform="linux", name="e") is None
+
+    def test_malformed_page_does_not_crash(self):
+        from training.corpus.sources.tldr import parse_page
+        for junk in ("", "```", "- dangling intent:", "`unclosed", "#\n>\n-\n`x`"):
+            parse_page(junk, platform="linux", name="j")
