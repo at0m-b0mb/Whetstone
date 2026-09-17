@@ -129,7 +129,7 @@ class OneShot:
     def __init__(self, *verb_ids: str):
         self.queue = list(verb_ids)
 
-    def choose(self, task, history, permitted, *, exclude, target):
+    def choose(self, episode, permitted, *, exclude, target):
         while self.queue:
             verb_id = self.queue.pop(0)
             if verb_id in exclude:

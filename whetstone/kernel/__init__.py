@@ -133,10 +133,17 @@ class Turn:
 # --------------------------------------------------------------------------
 
 class Chooser(Protocol):
-    """Picks the next action. The only thing the kernel needs from a model."""
+    """Picks the next action. The only thing the kernel needs from a model.
+
+    Receives the whole :class:`Episode` so far, not just the history list,
+    because a model chooser needs the task, the host, the scope and the
+    catalogue to reconstruct the exact prompt prefix it was trained on — and
+    those live on the episode. A rule-based chooser is free to ignore all but
+    ``episode.turns``.
+    """
 
     def choose(
-        self, task: str, history: Sequence[Turn], permitted: Sequence[Verb],
+        self, episode: "Episode", permitted: Sequence[Verb],
         *, exclude: Sequence[str], target: str | None,
     ) -> Action | None:
         """Return the next action, or None to stop."""
@@ -165,10 +172,10 @@ class HeuristicChooser:
                   "detect.telemetry")
 
     def choose(
-        self, task: str, history: Sequence[Turn], permitted: Sequence[Verb],
+        self, episode: "Episode", permitted: Sequence[Verb],
         *, exclude: Sequence[str], target: str | None,
     ) -> Action | None:
-        done = {t.action.verb_id for t in history} | set(exclude)
+        done = {t.action.verb_id for t in episode.turns} | set(exclude)
         by_id = {v.id: v for v in permitted}
         for verb_id in self.PREFERENCE:
             if verb_id in done or verb_id not in by_id:
@@ -261,7 +268,18 @@ class Kernel:
 
     def run(self, task: str, *, target: str | None = "127.0.0.1",
             host: str = "") -> Episode:
+        # What the engagement allows, intersected with what this executor can
+        # actually carry out. Offering a verb the adapter does not implement
+        # wastes a turn on a guaranteed "unsupported", and — worse for a model
+        # chooser — puts a choice in front of the model that can only fail. An
+        # executor that does not report its coverage (a bare stub in a test) is
+        # trusted to run anything, which keeps the old behaviour for callers
+        # that never had adapter-aware filtering.
         permitted = list(self.gate.catalogue())
+        implemented = getattr(self.executor, "implemented", None)
+        if callable(implemented):
+            runnable = set(implemented())
+            permitted = [v for v in permitted if v.id in runnable]
         catalogue = "; ".join(
             f"{v.id}({', '.join(p.name for p in v.params)})" for v in permitted
         )[:400]
@@ -275,7 +293,7 @@ class Kernel:
         exclude: list[str] = []
         while len(episode.turns) < self.max_turns:
             action = self.chooser.choose(
-                task, episode.turns, permitted, exclude=exclude, target=target)
+                episode, permitted, exclude=exclude, target=target)
             if action is None:
                 break
 

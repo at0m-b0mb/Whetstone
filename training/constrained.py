@@ -160,6 +160,15 @@ def _fill_param(
         return param.default
     if param.type == "integer":
         return 1
+    # A required free-string parameter — a service name, a path — is the one
+    # thing this scheme does not solve. Its value is not a closed set to rank
+    # and not a default to copy; it has to be *read from an observation the
+    # model already saw*, which is open generation conditioned on context and a
+    # genuinely harder problem than verb choice. Returned as a visible
+    # placeholder rather than a plausible guess, because a plausible-but-wrong
+    # service name looks deliberate in a report and a labelled "unset" does not.
+    # The lab adapters key off the target rather than this field, so the loop
+    # still runs; a real arbitrary target would need the model to fill it.
     return "unset"
 
 

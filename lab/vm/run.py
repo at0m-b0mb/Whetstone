@@ -21,6 +21,7 @@ import argparse
 import os
 import subprocess
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import whetstone.verbs  # noqa: F401  (registers the catalogue)
 from whetstone.actions import REGISTRY, Intent
@@ -42,9 +43,9 @@ class Sweep:
     def __init__(self, plan=_PLAN):
         self.plan = list(plan)
 
-    def choose(self, task, history, permitted, *, exclude, target):
+    def choose(self, episode, permitted, *, exclude, target):
         from whetstone.actions import TargetKind
-        done = {t.action.verb_id for t in history} | set(exclude)
+        done = {t.action.verb_id for t in episode.turns} | set(exclude)
         by_id = {v.id: v for v in permitted}
         for verb_id, extra in self.plan:
             if verb_id in done or verb_id not in by_id:
@@ -93,8 +94,18 @@ def _engagement() -> Engagement:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Purple loop against the real VM.")
     p.add_argument("--arm", action="store_true",
-                   help="load an auditd execve rule before running")
+                   help="load an auditd file-watch rule before running")
+    p.add_argument("--model", type=Path,
+                   help="drive with a trained checkpoint (constrained decoding)")
+    p.add_argument("--tokenizer", type=Path,
+                   default=Path("/Volumes/at0m_b0mb/whetstone/models/tokenizer-v1/tokenizer.json"))
     args = p.parse_args(argv)
+
+    chooser = Sweep()
+    if args.model:
+        from training.agent import load_chooser
+        print(f"driving the real VM with the trained model at {args.model}\n")
+        chooser = load_chooser(args.model, args.tokenizer, verbose=True)
 
     adapter = VMAdapter()          # raises with instructions if the VM is down
     disarm_auditd()
@@ -107,7 +118,7 @@ def main(argv: list[str] | None = None) -> int:
         arm_auditd()
 
     gate = Gate(_engagement(), registry=REGISTRY, confirmer=always_confirm)
-    episode = Kernel(gate, adapter, Sweep(), max_turns=16).run(
+    episode = Kernel(gate, adapter, chooser, max_turns=16).run(
         "Assess this Ubuntu host, prove the writable-service finding, and tell "
         "me whether auditd saw it.", target="127.0.0.1")
 

@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from . import Episode
 
-__all__ = ["render_episode", "shrink_payload"]
+__all__ = ["render_episode", "render_prompt", "shrink_payload"]
 
 #: Records kept from a list-shaped payload before eliding.
 MAX_ITEMS = 4
@@ -61,8 +61,16 @@ def _compact(payload: dict[str, Any]) -> str:
     return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
 
 
-def render_episode(episode: Episode) -> str:
-    """One trajectory document from a completed episode."""
+def _render_context(episode: Episode) -> list[str]:
+    """Everything up to but not including the next action.
+
+    Shared by :func:`render_episode` and :func:`render_prompt` so that the text
+    a model is trained on and the text it is prompted with are produced by one
+    function. Train/serve skew is fatal at this model size — a 14.6M network has
+    no spare capacity to absorb a serving format that differs from its training
+    format by even a marker — and the cheapest guarantee against it is to never
+    write the format twice.
+    """
     parts: list[str] = [BOS, f"{TASK}{episode.task.strip()}",
                         f"{HOST}{episode.host}", f"{SCOPE}{episode.scope}",
                         f"{VERBS}{episode.catalogue}"]
@@ -92,6 +100,25 @@ def render_episode(episode: Episode) -> str:
         if obs.unsupported:
             payload["unsupported"] = True
         parts.append(f"{OBS}{_compact(payload)}")
+    return parts
+
+
+def render_prompt(episode: Episode) -> str:
+    """The episode-so-far as a prompt, ending exactly where the model must act.
+
+    The trailing ``<|act|>`` is the point: at training time the token after that
+    marker was the first character of the action JSON, so at serving time the
+    model continues from there and the constrained decoder reads its verb
+    preference. The prompt is the identical prefix of the trajectory the loop
+    would render if it stopped here, which is the whole reason both go through
+    :func:`_render_context`.
+    """
+    return "".join(_render_context(episode)) + ACT
+
+
+def render_episode(episode: Episode) -> str:
+    """One trajectory document from a completed episode."""
+    parts = _render_context(episode)
 
     for finding in episode.findings:
         parts.append(f"{FIND}{_compact(finding.to_dict())}")

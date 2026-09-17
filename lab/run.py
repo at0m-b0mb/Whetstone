@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import whetstone.verbs  # noqa: F401  (registers the catalogue)
 from whetstone.actions import REGISTRY
@@ -58,9 +59,9 @@ class ScriptedSweep:
     def __init__(self, plan=_PLAN):
         self.plan = list(plan)
 
-    def choose(self, task, history, permitted, *, exclude, target):
+    def choose(self, episode, permitted, *, exclude, target):
         from whetstone.actions import TargetKind
-        done = {t.action.verb_id for t in history} | set(exclude)
+        done = {t.action.verb_id for t in episode.turns} | set(exclude)
         by_id = {v.id: v for v in permitted}
         for verb_id, extra in self.plan:
             if verb_id in done or verb_id not in by_id:
@@ -92,7 +93,7 @@ def _engagement(root: str) -> Engagement:
     )
 
 
-def run_once(telemetry: bool) -> None:
+def run_once(telemetry: bool, chooser=None) -> None:
     with SandboxTarget(telemetry=telemetry) as target:
         print("=" * 74)
         print(target.summary())
@@ -102,7 +103,7 @@ def run_once(telemetry: bool) -> None:
                     confirmer=always_confirm)
         # The sandbox adapter is scope-locked by target confinement, and the
         # engagement authorises the techniques the plan uses.
-        kernel = Kernel(gate, SandboxAdapter(target), ScriptedSweep(),
+        kernel = Kernel(gate, SandboxAdapter(target), chooser or ScriptedSweep(),
                         max_turns=20)
         episode = kernel.run(
             "Assess this host, prove what you find, and tell me what nobody saw.",
@@ -129,15 +130,26 @@ def main(argv: list[str] | None = None) -> int:
                    help="enable the sandbox event log (gaps close)")
     p.add_argument("--both", action="store_true",
                    help="run with telemetry off, then on, to compare")
+    p.add_argument("--model", type=Path,
+                   help="drive the loop with a trained checkpoint instead of "
+                        "the scripted sweep (constrained decoding)")
+    p.add_argument("--tokenizer", type=Path,
+                   default=Path("/Volumes/at0m_b0mb/whetstone/models/tokenizer-v1/tokenizer.json"))
     args = p.parse_args(argv)
+
+    chooser = None
+    if args.model:
+        from training.agent import load_chooser
+        print(f"driving with the trained model at {args.model}\n")
+        chooser = load_chooser(args.model, args.tokenizer, verbose=True)
 
     if args.both:
         print("\n### TELEMETRY OFF — the attack nobody logged\n")
-        run_once(False)
+        run_once(False, chooser)
         print("\n\n### TELEMETRY ON — the same attack, this time seen\n")
-        run_once(True)
+        run_once(True, chooser)
     else:
-        run_once(args.telemetry)
+        run_once(args.telemetry, chooser)
     return 0
 
 
