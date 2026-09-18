@@ -250,7 +250,15 @@ class Dataset:
         self.index = ShardIndex.load(root)
         self.seq_len = seq_len
         self.split = split
-        self._rng = np.random.default_rng(seed)
+        # Sampling is a pure function of (seed, draw index) rather than of a
+        # long-lived RNG's accumulated state. A stateful generator cannot be
+        # restored on resume without replaying every draw, so a run resumed at
+        # step 1,000 silently re-served the batches steps 0-1,000 had already
+        # seen and never reached the tail of the stream — the loss curve looks
+        # healthy the whole time, because re-learning old data does lower loss.
+        # Deriving the generator per draw makes `seek` exact from any step.
+        self._seed = seed
+        self._draw = 0
 
         self._maps: list[np.memmap] = []
         self._starts: list[int] = []
@@ -315,10 +323,28 @@ class Dataset:
             out[written:] = self._maps[0][:length - written]
         return out
 
+    def seek(self, draw: int) -> None:
+        """Position the sampler at draw ``draw``, so a resumed run continues.
+
+        Call with the number of batches already consumed. Because sampling is a
+        pure function of the draw index, this is exact: the stream from here on
+        is byte-identical to what an uninterrupted run would have served.
+        """
+        if draw < 0:
+            raise ValueError(f"draw must be non-negative, got {draw}")
+        self._draw = draw
+
+    @property
+    def draw(self) -> int:
+        """Batches served so far — the position to persist for resume."""
+        return self._draw
+
     def batch(self, batch_size: int) -> tuple[np.ndarray, np.ndarray]:
         """One batch of ``(inputs, targets)``, each ``(batch_size, seq_len)``."""
         span = self.hi - self.lo - self.seq_len - 1
-        starts = self._rng.integers(self.lo, self.lo + span, size=batch_size)
+        rng = np.random.default_rng((self._seed, self._draw))
+        self._draw += 1
+        starts = rng.integers(self.lo, self.lo + span, size=batch_size)
         window = np.stack([self._read(int(s), self.seq_len + 1) for s in starts])
         return window[:, :-1], window[:, 1:]
 

@@ -65,6 +65,7 @@ def cosine_lr(step: int, total: int, cfg: TrainConfig) -> float:
 def save_checkpoint(
     out: Path, model: Whetstone, opt: optim.Optimizer, step: int,
     model_cfg: ModelConfig, train_cfg: TrainConfig,
+    *, val_loss: float | None = None, history: list[dict] | None = None,
 ) -> None:
     """Weights, optimizer state and step — all three, atomically.
 
@@ -83,11 +84,19 @@ def save_checkpoint(
     mx.save_safetensors(str(tmp), dict(tree_flatten(opt.state)))
     tmp.replace(out / "optimizer.safetensors")
 
-    (out / "state.json").write_text(json.dumps({
+    state: dict = {
         "step": step,
         "model": asdict(model_cfg),
         "train": asdict(train_cfg),
-    }, indent=2), encoding="utf-8")
+    }
+    if val_loss is not None:
+        state["val_loss"] = val_loss
+        state["val_ppl"] = round(math.exp(min(val_loss, 20)), 2)
+    if history is not None:
+        # The whole curve, so the run can be judged after the fact without
+        # having to still have the log.
+        state["val_history"] = history
+    (out / "state.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
 def load_checkpoint(out: Path, model: Whetstone, opt: optim.Optimizer) -> int:
@@ -149,9 +158,23 @@ def train(
     micro = tcfg.micro_batch
 
     start = 0
+    best_val = float("inf")
+    history: list[dict] = []
     if resume and (out / "state.json").is_file():
+        prior = json.loads((out / "state.json").read_text(encoding="utf-8"))
+        history = list(prior.get("val_history", []))
+        # Carry the best across the interruption, or a resumed run would call
+        # its first eval "best" and overwrite a genuinely better checkpoint.
+        if (best := out / "best" / "state.json").is_file():
+            best_val = json.loads(best.read_text(encoding="utf-8")).get(
+                "val_loss", float("inf"))
         start = load_checkpoint(out, model, opt)
-        print(f"resumed from step {start:,}")
+        # Restore the data position too. Weights and optimizer alone are not a
+        # resumable run: without this the sampler restarts and re-serves the
+        # batches the first `start` steps already consumed.
+        train_data.seek(start * accum)
+        print(f"resumed from step {start:,} "
+              f"(data position {start * accum:,} batches)")
 
     print(f"\n{cfg.summary()}")
     print(f"  {train_data}\n  {val_data}")
@@ -206,15 +229,41 @@ def train(
 
         if step and step % tcfg.eval_every == 0:
             vl = evaluate(model, val_data, micro)
-            print(f"  ── val loss {vl:.4f}  (ppl {math.exp(min(vl, 20)):.1f})", flush=True)
+            history.append({"step": step, "val_loss": vl})
+            flag = ""
+            if vl < best_val:
+                # Keep the best model, not merely the most recent one. Val loss
+                # on a small corpus is noisy and eventually rises: `tiny`
+                # reached ppl 11.0 and was saved at 13.9, because the run kept
+                # whatever happened to be in memory when the step counter ran
+                # out. An overnight run that discards its best checkpoint has
+                # wasted the night.
+                best_val = vl
+                save_checkpoint(out / "best", model, opt, step, cfg, tcfg,
+                                val_loss=vl, history=history)
+                flag = "  ← best"
+            print(f"  ── val loss {vl:.4f}  (ppl {math.exp(min(vl, 20)):.1f})"
+                  f"{flag}", flush=True)
 
         if step and step % tcfg.checkpoint_every == 0:
-            save_checkpoint(out, model, opt, step, cfg, tcfg)
+            save_checkpoint(out, model, opt, step, cfg, tcfg, history=history)
 
-    save_checkpoint(out, model, opt, total_steps, cfg, tcfg)
     final = evaluate(model, val_data, micro)
+    history.append({"step": total_steps, "val_loss": final})
+    if final < best_val:
+        best_val = final
+        save_checkpoint(out / "best", model, opt, total_steps, cfg, tcfg,
+                        val_loss=final, history=history)
+    save_checkpoint(out, model, opt, total_steps, cfg, tcfg,
+                    val_loss=final, history=history)
+
     print(f"\ndone. final val loss {final:.4f} "
           f"(ppl {math.exp(min(final, 20)):.1f}) → {out}")
+    if best_val < final:
+        print(f"      best val loss {best_val:.4f} "
+              f"(ppl {math.exp(min(best_val, 20)):.1f}) → {out / 'best'}"
+              f"\n      the final model is worse than the best one. Use "
+              f"{out.name}/best unless you have a reason not to.")
     return out
 
 
