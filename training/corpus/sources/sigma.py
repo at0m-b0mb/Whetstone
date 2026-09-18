@@ -40,6 +40,7 @@ register is the first place it will show up as damage.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import shutil
 import ssl
@@ -150,7 +151,12 @@ def _download(url: str, dest: Path) -> str:
                 while chunk := response.read(1 << 20):
                     digest.update(chunk)
                     handle.write(chunk)
-    except (urllib.error.URLError, OSError) as exc:
+    # http.client.HTTPException is in the tuple for IncompleteRead, which a body
+    # that ends early raises and which is NOT an OSError — its MRO is
+    # HTTPException -> Exception. Without it, the single most ordinary network
+    # failure there is escapes this wrapper as something no caller catches, and
+    # the hash recorded for the cache would never have been the point anyway.
+    except (urllib.error.URLError, http.client.HTTPException, OSError) as exc:
         raise SourceError(f"sigma: download failed from {url}: {exc}") from exc
     return digest.hexdigest()
 

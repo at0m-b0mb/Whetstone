@@ -84,9 +84,13 @@ matter about how that is done:
    holds the same object; reordering its ciphers as a side effect of importing
    this module would be an invisible action at a distance.
 3. Verification is not weakened. ``check_hostname`` stays on, ``verify_mode``
-   stays ``CERT_REQUIRED``, the minimum version stays TLS 1.2. The cipher list
-   is all ECDHE-forward-secret AEAD suites plus the CBC suites a browser still
-   offers. This changes the shape of the handshake, not its security.
+   stays ``CERT_REQUIRED``, the minimum version stays TLS 1.2, and
+   ``verify_flags`` is copied across as well — that last one is named here
+   because it was the one nobody looked at, and a bare ``SSLContext`` does not
+   carry the ``VERIFY_X509_STRICT`` that ``create_default_context`` does. The
+   cipher list is all ECDHE-forward-secret AEAD suites plus the CBC suites a
+   browser still offers. This changes the shape of the handshake, not its
+   security.
 
 If the edge ever refuses this too, :data:`_FORBIDDEN` says all of the above in
 the exception rather than leaving the next reader to rediscover it.
@@ -143,6 +147,7 @@ Universal, per the LICENSE file in ``cisagov/ScubaGear``.
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
@@ -350,6 +355,17 @@ def _context() -> ssl.SSLContext:
     context.verify_mode = ssl.CERT_REQUIRED
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_verify_locations(cadata=b"".join(anchors))
+    # The flags travel with the anchors, and they are not the same thing. A bare
+    # SSLContext(PROTOCOL_TLS_CLIENT) is not equivalent to
+    # create_default_context(): measured on this interpreter, the default
+    # carries TRUSTED_FIRST | PARTIAL_CHAIN | X509_STRICT (557088) and a bare
+    # one carries TRUSTED_FIRST alone (32768). Copying only the store and the
+    # three properties named in the docstring quietly dropped X509_STRICT — the
+    # RFC 5280 conformance checking every other source in the corpus applies —
+    # so a certificate with a duplicate extension or an out-of-range serial
+    # would have been rejected everywhere else and accepted here, while this
+    # module asserted the two contexts differ only in offered ciphers.
+    context.verify_flags = base.verify_flags
     try:
         context.set_ciphers(_CLIENT_HELLO_CIPHERS)
     except ssl.SSLError:
@@ -403,7 +419,12 @@ def _get(url: str, *, timeout: int = 60, fatal_404: bool = True) -> bytes:
                         _MOVED.format(url=url, code=404)) from None
                 raise NetworkError(f"{url}: HTTP 404 Not Found") from None
             last = f"HTTP {exc.code} {exc.reason}"
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        # http.client.HTTPException covers IncompleteRead, which a body that
+        # ends early raises and which is NOT an OSError — uncaught it would
+        # escape this retry loop entirely and reach the caller as something no
+        # adapter in this package catches.
+        except (urllib.error.URLError, http.client.HTTPException,
+                TimeoutError, OSError) as exc:
             last = str(exc)
         if attempt < _ATTEMPTS:
             time.sleep(_BACKOFF * attempt)
@@ -427,7 +448,11 @@ def _plain_get(url: str, *, timeout: int = 90) -> bytes:
             raise SourceError(
                 _MOVED.format(url=url, code=exc.code)) from None
         raise NetworkError(f"{url}: HTTP {exc.code} {exc.reason}") from None
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+    # http.client.HTTPException for IncompleteRead: see _get above. The
+    # contract this module owes its callers is that a failed fetch is a
+    # NetworkError, and a truncated body is the most ordinary failure there is.
+    except (urllib.error.URLError, http.client.HTTPException,
+            TimeoutError, OSError) as exc:
         raise NetworkError(f"{url}: {exc}") from None
 
 

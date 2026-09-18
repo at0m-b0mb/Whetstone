@@ -19,6 +19,19 @@ exist — it would learn to predict what tool output *looks like* rather than wh
 this tool *returns*, and the difference only shows up when something is wired to
 a live host and answers confidently about a machine it misread.
 
+**One thing is edited, and it is named here so the paragraph above stays
+true.** Before a document leaves :func:`generate_trajectories` it passes through
+:func:`redact_identity`, which substitutes this machine's account name, home
+directory, host name, per-user temp directory and the account's display name for
+fixed placeholders — ``operator``, ``/Users/operator``, ``operator-host``,
+``/tmp``. Nothing else is touched: the service list, the package versions, the
+sudo rules and the permissions are what the adapter returned. The reason is that
+this corpus is what the model memorises, and a username in a text file can be
+grepped out while a username in a checkpoint can only be trained out. The
+substitution keeps the *shape* of every value it rewrites, because the model has
+to learn that a home directory is a path with an account name in it; a redaction
+that left holes would teach it that observations contain holes.
+
 **The loop renders the trajectory, not this file.** Earlier versions of this
 module assembled protocol segments by hand and appended a hand-written
 ``<|find|>`` dict from the scenario definition. Two things were wrong with that.
@@ -81,13 +94,19 @@ armed; failing that, the ``<|host|>`` diversity in this corpus is ``macos`` and
 from __future__ import annotations
 
 import argparse
+import getpass
 import hashlib
 import json
+import os
+import platform
 import random
+import re
 import shutil
+import socket
 import tempfile
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
@@ -99,7 +118,8 @@ from whetstone.gate.engagement import Authorization, Engagement, Scope
 from whetstone.kernel import Kernel
 from whetstone.kernel.render import MAX_ITEMS, MAX_VALUE, shrink_payload
 
-__all__ = ["Scenario", "Step", "SCENARIOS", "generate_trajectories"]
+__all__ = ["Scenario", "Step", "SCENARIOS", "generate_trajectories",
+           "redact_identity", "identity_leaks"]
 
 
 #: Kept as module constants because callers and tests have referred to them, but
@@ -1517,6 +1537,304 @@ def build_scenarios(rng: random.Random, *, include_lab: bool = True,
     return scenarios
 
 
+# ---------------------------------------------------------------------------
+# redaction: what this machine is called must not reach the weights
+#
+# Every ``<|obs|>`` in this corpus is a real read of a real machine, and that is
+# the point of the module — but a real read of *this* machine returns the
+# operator's account name, home directory, host name and per-user temp
+# directory, and this corpus is the thing the model memorises. A username in a
+# text file can be grepped out an hour later. A username in a checkpoint can
+# only be trained out, which means throwing away the run. So the substitution
+# happens here, on the document, before it is fingerprinted, counted or handed
+# to a caller — not in a cleanup pass somebody has to remember to run, and not
+# in the writer, because the writer is not the only exit.
+#
+# Two rules shape what follows.
+#
+# **Substitute, never delete.** ``/Users/<name>/Public`` becomes
+# ``/Users/operator/Public``, not ``<home>/Public``. The model has to learn that
+# a home directory is a path with an account name in it; a corpus full of
+# angle-bracket holes teaches it that observations contain angle-bracket holes,
+# and at serving time it will meet a real path it has no shape for.
+#
+# **Never substitute a name that is not identity.** The table is built from
+# whatever this machine happens to be called, so a corpus built as ``root``, or
+# on CI where the account is ``runner``, would rewrite every
+# ``"runs_as":"root"`` in thirteen thousand documents and teach the model a
+# world in which nothing runs as root. A redactor that quietly corrupts the
+# corpus is worse than the leak it was added to fix, so generic names are left
+# exactly as observed and the reason is written down below.
+# ---------------------------------------------------------------------------
+
+#: What an identifying account name is replaced by. ``operator`` is not an
+#: arbitrary choice: the sandbox worlds in this module already call their
+#: synthetic unprivileged user ``operator``, so a redacted host observation and
+#: a sandbox observation agree on what a non-root account looks like instead of
+#: introducing a second convention the model has to reconcile.
+_OPERATOR = "operator"
+
+#: What an identifying host name is replaced by. Deliberately not ``operator``:
+#: a host name and an account name are different kinds of thing and a corpus
+#: that spells them the same way teaches the model they are interchangeable.
+_OPERATOR_HOST = "operator-host"
+
+#: Names that are *not* identity and must never be substituted. Every one of
+#: these is a name thousands of machines share, so it discloses nothing about
+#: anybody — while substituting it would rewrite unrelated, load-bearing text.
+#: ``root`` is the dangerous one (see the section comment), ``runner`` and
+#: ``ubuntu`` are what CI and cloud images call their accounts, and ``operator``
+#: is this module's own placeholder.
+_NOT_IDENTITY = frozenset({
+    "root", "admin", "administrator", "user", "users", "guest", "nobody",
+    "system", "daemon", "operator", "runner", "ubuntu", "debian", "fedora",
+    "ec2-user", "vagrant", "docker", "localhost", "host", "hostname",
+    "home", "var", "tmp", "temp", "private", "build", "test", "ci",
+    "jenkins", "whetstone",
+})
+
+#: Below this length a literal substitution does more damage than the leak it
+#: repairs: a three-character account name occurs inside unrelated package
+#: names, service names and paths, and every one of those occurrences would be
+#: rewritten with no way to tell afterwards which were which.
+_MIN_IDENTIFYING = 4
+
+
+def _is_identifying(name: str) -> bool:
+    """True when ``name`` is specific enough that substituting it is worth it.
+
+    The predicate is deliberately conservative in *both* directions: a name it
+    rejects stays in the corpus, and a name it accepts is rewritten everywhere
+    it appears. Getting it wrong in the first direction leaks; getting it wrong
+    in the second corrupts. The length floor and the generic-name set are what
+    keep the second kind of mistake out.
+    """
+    return len(name) >= _MIN_IDENTIFYING and name.lower() not in _NOT_IDENTITY
+
+
+def _spellings(secret: str, replacement: str) -> list[tuple[str, str]]:
+    """The spellings one value can take in a rendered document, each paired
+    with a replacement spelled the same way.
+
+    ``render_episode`` serialises payloads with ``json.dumps``, which leaves a
+    POSIX path alone but doubles the separators in a Windows one: ``Path.home()``
+    returns ``C:\\Users\\alice`` and the document carries ``C:\\\\Users\\\\alice``.
+    A table holding only the value Python handed us substitutes neither that nor
+    the forward-slash spelling some tools report for the same directory.
+
+    The replacement has to carry the same transform, and this is the part that
+    bites: substituting a single-backslash ``C:\\Users\\operator`` into a JSON
+    string produces ``\\U``, which is not a valid escape, and the document stops
+    parsing. Pairing the transforms here means a caller cannot get that wrong by
+    reaching for the literal.
+    """
+    forms = [(secret, replacement)]
+    if "\\" in secret:
+        forms.append((secret.replace("\\", "\\\\"),
+                      replacement.replace("\\", "\\\\")))
+        forms.append((secret.replace("\\", "/"),
+                      replacement.replace("\\", "/")))
+    return forms
+
+
+@lru_cache(maxsize=1)
+def _identity_table() -> tuple[tuple[str, str], ...]:
+    """Every literal this machine can leak, paired with what replaces it.
+
+    Read from the operating system rather than configured, because a configured
+    list is a list of the leaks somebody already noticed. The four sources below
+    are the ones an adapter can put into an observation without being asked:
+    ``enum.privileges`` returns the account name, ``enum.persistence`` and
+    ``vuln.credential_exposure`` return paths under the home directory,
+    ``enum.host`` returns the host name, and every sandbox world is built under
+    the per-user temp directory — which on macOS is
+    ``/var/folders/<two>/<28 characters>/T``, a stable per-user identifier for
+    one machine and, incidentally, proof that a host labelled ``sandbox-linux``
+    is really a Mac.
+
+    **What it cannot reach, stated rather than hidden.** A *derived* display
+    string is only caught when it contains one of these literals. macOS
+    ``ComputerName`` is usually ``<account>'s MacBook Pro``, so it goes with the
+    account name — but a machine renamed by hand, and the ``real_name`` of any
+    *other* local account ``enum.users`` enumerates, are names this table was
+    never told and cannot invent. The corpus that feeds a training run should be
+    read once with :func:`identity_leaks` and once with human eyes, and anything
+    found that way belongs in this function rather than in a scrub script,
+    because a scrub script only ever cleans the file somebody remembered.
+
+    The second thing it cannot reach is a literal cut in half by
+    :data:`~whetstone.kernel.render.MAX_VALUE`. Redaction runs on the rendered
+    document, so a value longer than 220 characters has already been truncated
+    and ``/Users/<name>`` can survive as ``/Users/<na…`` — which is a partial
+    account name that no table entry matches. It is not fixable at the other end
+    either: truncation lives in ``whetstone/kernel/render.py`` and the runtime
+    deliberately does not import anything under ``training/``. What makes it
+    tolerable is the arithmetic and a measurement: the longest literal here is
+    56 characters, so a straddle needs a value with 164 characters of prefix
+    before the path, and a scan of all 13,206 documents in the current cache
+    found none. If that ever stops being true the answer is to substitute the
+    truncated spellings too, not to widen what counts as clean.
+
+    Ordered longest first, and the order is load-bearing: the alternation
+    compiled from this table is matched leftmost-first by :mod:`re`, not
+    longest-first, so ``/Users/alice`` has to precede ``alice`` or the home path
+    is half-substituted into ``/Users/operator`` by the shorter rule and the
+    longer one never fires. Ties are broken on the text so that two machines
+    with equally long names still build the table in one order.
+    """
+    pairs: list[tuple[str, str]] = []
+
+    def add(secret: str | None, replacement: str) -> None:
+        if not secret:
+            return
+        for form, repl in _spellings(secret, replacement):
+            if form.lower() in repl.lower():
+                # Substituting would be a no-op *and* the verification in
+                # redact_identity would then fire on every document forever,
+                # because the literal is still there afterwards. A machine
+                # genuinely called ``operator-host`` is not leaking anything.
+                continue
+            pairs.append((form, repl))
+
+    user = getpass.getuser()
+    if _is_identifying(user):
+        add(user, _OPERATOR)
+
+    # The account's display name, which is a *person's* name on most machines
+    # even though it happens to repeat the account name on this one.
+    # ``enum.users`` puts it in ``real_name`` and it is the one value in an
+    # observation that identifies a human rather than a machine. Read from
+    # ``pwd`` rather than by shelling out to ``dscl``: this module must be able
+    # to build its table without running a command, and ``pwd`` is absent on
+    # Windows, where there is no GECOS field to read.
+    try:
+        import pwd
+
+        gecos = pwd.getpwuid(os.getuid()).pw_gecos.split(",")[0].strip()
+    except (ImportError, KeyError):
+        gecos = ""
+    if _is_identifying(gecos):
+        add(gecos, _OPERATOR)
+
+    home = Path.home()
+    # Keyed on the basename rather than on ``user``: the two usually agree, and
+    # when they do not it is the directory name that is written into paths.
+    if _is_identifying(home.name):
+        add(str(home), str(home.parent / _OPERATOR))
+
+    tmp = tempfile.gettempdir()
+    generic_tmp = "C:\\Temp" if os.name == "nt" else "/tmp"
+    if tmp != generic_tmp:
+        add(tmp, generic_tmp)
+        # macOS reports the same directory both with and without the /private
+        # prefix depending on whether anything resolved it, and the sandbox
+        # observations in this corpus contain both.
+        resolved = str(Path(tmp).resolve())
+        if resolved != tmp:
+            add(resolved, generic_tmp)
+
+    # ``socket.getfqdn()`` is deliberately not consulted: it can block on a
+    # reverse lookup, and the name the adapters actually report is the one
+    # ``hostname`` prints, which is what these two return.
+    for name in sorted({socket.gethostname(), platform.node()}):
+        if not name:
+            continue
+        short, dot, domain = name.partition(".")
+        if _is_identifying(name):
+            add(name, f"{_OPERATOR_HOST}{dot}{domain}")
+        # A fully-qualified name and its bare short form are two different
+        # literals and both appear: ``hostname`` prints the qualified one on
+        # macOS, while ``hostname -s``, syslog lines and most tools carry the
+        # short one, so substituting only what Python handed us would leave
+        # every short spelling standing.
+        if dot and _is_identifying(short):
+            add(short, _OPERATOR_HOST)
+
+    # One entry per distinct literal, first writer wins, so a name that is both
+    # the account and the short host name resolves to exactly one replacement
+    # and the substitution below cannot pick a different one than the
+    # verification does.
+    seen: dict[str, tuple[str, str]] = {}
+    for form, repl in pairs:
+        seen.setdefault(form.lower(), (form, repl))
+
+    # Drop any literal that occurs inside a replacement this module chose. The
+    # per-pair guard above only catches a value that replaces itself; this
+    # catches the cross-pair case, and that case deadlocks rather than degrades:
+    # an account named ``host`` would be rewritten to ``operator``, the host
+    # name rewritten to ``operator-host``, and then the verification in
+    # redact_identity would find ``host`` inside ``operator-host`` and refuse
+    # every document forever. The replacement vocabulary is a handful of short
+    # strings, so the only names this can drop are ones that are a substring of
+    # ``operator``, ``operator-host``, ``/tmp`` or the redacted home — names
+    # that identify nobody and that substituting would have shredded the corpus
+    # to remove.
+    replacements = " ".join(repl for _form, repl in seen.values()).lower()
+    kept = [pair for pair in seen.values() if pair[0].lower() not in replacements]
+    return tuple(sorted(kept, key=lambda kv: (-len(kv[0]), kv[0])))
+
+
+@lru_cache(maxsize=1)
+def _identity_pattern() -> re.Pattern[str] | None:
+    """One alternation over the whole table, or ``None`` on a machine with
+    nothing identifying to hide.
+
+    Case-insensitive because Windows reports the same account as ``alice`` in a
+    path and ``ALICE`` in a SAM query, and a case-sensitive pass would leave the
+    second spelling in the corpus. Matching case-insensitively and *replacing*
+    rather than refusing means the differently-cased spelling is fixed instead
+    of aborting a forty-minute generation run over something the table already
+    knows about.
+    """
+    table = _identity_table()
+    if not table:
+        return None
+    return re.compile("|".join(re.escape(form) for form, _ in table),
+                      re.IGNORECASE)
+
+
+def identity_leaks(text: str) -> list[str]:
+    """The identifying literals still present in ``text``, longest first.
+
+    Exported so that anything else which writes this machine's observations to a
+    file — the corpus builder in ``training/corpus/sources/trajectories.py``,
+    the run capture in ``lab/capture.py`` — can refuse the write rather than
+    trust that redaction happened upstream. It answers only about the literals
+    this machine can be asked for; it cannot certify that text from some other
+    machine is clean, and nothing should read it as saying so.
+    """
+    low = text.lower()
+    return [form for form, _ in _identity_table() if form.lower() in low]
+
+
+def redact_identity(text: str) -> str:
+    """Replace this machine's identity in a rendered document, or refuse.
+
+    The refusal is the point. A redactor that silently passes text through when
+    its substitution did not take is worse than no redactor at all, because
+    everything downstream now believes the corpus is clean — and the place that
+    belief is cashed in is a checkpoint nobody can grep. So the substitution is
+    followed by a scan for survivors and a survivor raises, loudly, naming what
+    it found, at generation time rather than after a training run.
+    """
+    pattern = _identity_pattern()
+    if pattern is None:
+        return text
+    table = {form.lower(): repl for form, repl in _identity_table()}
+    out = pattern.sub(lambda m: table[m.group(0).lower()], text)
+
+    survivors = identity_leaks(out)
+    if survivors:
+        raise RuntimeError(
+            "identity survived redaction and this document must not be "
+            f"written: {survivors!r}. The substitution table and the check "
+            "read the same entries, so a survivor means a replacement "
+            "re-introduced a literal — fix _identity_table rather than "
+            "loosening this check, because what it guards is the corpus that "
+            "becomes the weights.")
+    return out
+
+
 def generate_trajectories(
     *, repeats: int = 6, seed: int = 1337, verbose: bool = False,
     include_lab: bool = True, lab_root: Path | None = None,
@@ -1624,7 +1942,15 @@ def generate_trajectories(
             finally:
                 world.close(executor)
 
-            text = episode.render()
+            # Redacted here rather than in the writers, and before the
+            # fingerprint rather than after. Before the fingerprint because two
+            # episodes that differ only in a host name are the *same* training
+            # document once the host name is gone, and hashing the unredacted
+            # text would let that duplicate through. Here rather than in
+            # ``_write_dir`` because the writers are not the only exit: the SFT
+            # builder and the tests consume this generator directly, and a
+            # redaction each caller has to remember is one a caller will forget.
+            text = redact_identity(episode.render())
             # blake2b rather than hash(): str hashing is salted per process, so
             # which duplicates got dropped would depend on the interpreter's
             # startup rather than on the seed.

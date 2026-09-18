@@ -2,6 +2,10 @@
 
 > A real run, captured verbatim. The observations are what the adapter
 > returned from the actual target; nothing here is illustrative.
+>
+> **Host identity is substituted.** The account name reads `operator` and the
+> per-user temp directory reads `/tmp`, because this repository is public.
+> Nothing else is edited — see [`README.md`](README.md).
 
 | | |
 |---|---|
@@ -73,7 +77,7 @@
   "groups": [
     {
       "id": 1000,
-      "name": "b0mba_at0mica"
+      "name": "operator"
     },
     {
       "id": 999,
@@ -82,11 +86,11 @@
   ],
   "uid": {
     "id": 501,
-    "name": "b0mba_at0mica"
+    "name": "operator"
   },
   "gid": {
     "id": 1000,
-    "name": "b0mba_at0mica"
+    "name": "operator"
   }
 }
 ```

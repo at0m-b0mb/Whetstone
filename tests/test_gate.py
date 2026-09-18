@@ -99,8 +99,12 @@ def _engagement(**kw) -> Engagement:
         authorization="TICKET-1 approved by nobody, this is a test",
         starts=NOW - timedelta(hours=1),
         expires=NOW + timedelta(hours=1),
+        # The exclusion is written in both naming forms on purpose, and an
+        # Engagement whose exclusions miss a form its hosts admit no longer
+        # loads: with only `10.0.0.1` here, the same gateway was fully in scope
+        # as gw.lab.internal, because scope never resolves a name.
         scope=Scope(hosts=("10.0.0.0/24", "*.lab.internal"),
-                    exclude_hosts=("10.0.0.1",),
+                    exclude_hosts=("10.0.0.1", "gw.lab.internal"),
                     paths=("/tmp/lab",),
                     exclude_paths=("/tmp/lab/secrets",)),
         authorize=Authorization(red_team=True, max_intent=Intent.EXECUTE,
@@ -622,36 +626,141 @@ class TestCatalogue:
 # --------------------------------------------------------------------------
 
 
+#: Every command that prints, including the one that prints the U+2190 arrow.
+_CLI_COMMANDS = (
+    ["verbs"],
+    ["verbs", "--side", "red"],
+    ["coverage"],
+    ["-e", "examples/engagement.yaml", "check"],
+    ["plan", "enum.host", "127.0.0.1"],
+)
+
+
+class _Cp1252:
+    """A strict cp1252 text stream, in one of three shapes a console can take.
+
+    ``kind`` picks which: ``"reconfigurable"`` is an ordinary wrapper that
+    ``_force_utf8_output`` can convert to UTF-8, ``"refuses"`` raises from
+    ``reconfigure`` the way a redirected or wrapped console can, and ``"absent"``
+    has no ``reconfigure`` attribute at all, which is what a stdout replaced by
+    a third-party wrapper looks like. The last two are the shapes in which the
+    cp1252 encoding is still in force when the command prints — the only shapes
+    in which the name "survives a legacy codepage" means anything.
+    """
+
+    def __init__(self, kind: str):
+        import io
+
+        self.raw = io.BytesIO()
+        self.text = io.TextIOWrapper(self.raw, encoding="cp1252",
+                                     errors="strict")
+        self.kind = kind
+        if kind == "reconfigurable":
+            self.reconfigure = self.text.reconfigure
+        elif kind == "refuses":
+            self.reconfigure = self._refuse
+
+    @staticmethod
+    def _refuse(**_kw):
+        raise ValueError("this console will not be reconfigured")
+
+    def write(self, s: str) -> int:
+        return self.text.write(s)
+
+    def flush(self) -> None:
+        self.text.flush()
+
+    @property
+    def encoding(self) -> str:
+        return self.text.encoding
+
+
 class TestCliEncoding:
     """Windows defaults its console to a legacy code page. CI caught this the
     hard way: `whet coverage` prints an arrow, cp1252 cannot encode it, and the
-    command died with a UnicodeEncodeError on the happy path."""
+    command died with a UnicodeEncodeError on the happy path.
 
-    def test_every_command_survives_a_legacy_codepage(self, capsys, tmp_path):
-        import io
+    The original test here installed a strict cp1252 stdout and ran five
+    commands under it, and it was disarmed by the code it was testing: `main`
+    calls `_force_utf8_output` as its first statement, so by the time anything
+    printed the stream was UTF-8 with `errors="replace"` and an encoding failure
+    had become impossible by construction. The condition the test was named for
+    held for none of its five cases. What is left below is split in two: what
+    that arrangement can honestly assert, and a separate test of the arrangement
+    where cp1252 is still in force when the output is written.
+    """
+
+    def _run(self, argv, stream):
         import sys as _sys
 
         from whetstone.cli import main
 
-        commands = [
-            ["verbs"],
-            ["verbs", "--side", "red"],
-            ["coverage"],
-            ["-e", "examples/engagement.yaml", "check"],
-            ["plan", "enum.host", "127.0.0.1"],
-        ]
-        for argv in commands:
-            buf = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
-            real_out, real_err = _sys.stdout, _sys.stderr
-            _sys.stdout = _sys.stderr = buf
-            try:
-                main(argv)
-                buf.flush()
-            finally:
-                _sys.stdout, _sys.stderr = real_out, real_err
+        real_out, real_err = _sys.stdout, _sys.stderr
+        _sys.stdout = _sys.stderr = stream
+        try:
+            main(argv)
+            stream.flush()
+        finally:
+            _sys.stdout, _sys.stderr = real_out, real_err
+
+    def test_every_command_forces_utf8_before_it_prints(self):
+        """`_force_utf8_output` runs ahead of every command, not just some.
+
+        This is what the old test was actually exercising, so it is stated as
+        the property rather than left implicit: each command is entered with a
+        cp1252 stream and must leave it UTF-8, which can only happen if `main`
+        reached the guard before dispatching. Moving the call below the dispatch,
+        or into individual subcommands, breaks this.
+        """
+        for argv in _CLI_COMMANDS:
+            stream = _Cp1252("reconfigurable")
+            self._run(argv, stream)
+            assert stream.encoding == "utf-8", argv
+            assert stream.raw.getvalue(), f"{argv} printed nothing"
+
+    @pytest.mark.xfail(strict=True, reason=(
+        "_force_utf8_output swallows a refusal, so a console that cannot be "
+        "reconfigured keeps cp1252 and `whet coverage` dies on U+2190 while "
+        "`whet check` dies on U+2192 — the CI failure in this class's docstring, "
+        "in the one arrangement where it is still reachable. Live bug in "
+        "whetstone/cli.py; remove this marker when the fallback lands."))
+    @pytest.mark.parametrize("kind", ["refuses", "absent"])
+    def test_every_command_survives_a_legacy_codepage(self, kind):
+        """The arrangement the fix does not cover, written to fail while it does
+        not cover it.
+
+        `_force_utf8_output` treats both of these as best-effort: a `reconfigure`
+        that raises is caught and passed over, and a stream without the attribute
+        is skipped. Both leave cp1252 in force, and the commands then print into
+        it. `test_reconfigure_failure_is_survivable` only establishes that
+        `_force_utf8_output` itself does not raise, which is a different and much
+        weaker claim than the one this class is named for.
+
+        Two commands fail here, not one, and that is the argument for where the
+        fix goes: `coverage` dies on the `←` in cli.py, and `check` dies on the
+        `→` in `gate/engagement.py`'s window line. Spelling arrows out of the
+        source would be chasing them — `adapters/linux.py` carries `→` and `●`
+        as well, and anything that reaches stdout can add more. The fallback
+        belongs on the stream: when it could not be converted, wrap it so every
+        write is encoded with `errors="replace"`, which is the guarantee
+        `reconfigure` was being asked for in the first place.
+
+        Marked xfail rather than deleted because the bug is in
+        `whetstone/cli.py` and not in this test. `strict=True`, so the moment
+        that fallback lands this becomes a loud failure asking for the marker to
+        come off, rather than sitting here green and forgotten.
+        """
+        for argv in _CLI_COMMANDS:
+            self._run(argv, _Cp1252(kind))
 
     def test_reconfigure_failure_is_survivable(self):
-        """A stream that refuses to reconfigure must not take the command down."""
+        """A stream that refuses to reconfigure must not take the command down.
+
+        Narrow on purpose, and narrower than it looks: it says
+        `_force_utf8_output` returns rather than raising. It says nothing about
+        whether the command's own output then survives, which is the question
+        the test above asks and currently answers no.
+        """
         import sys as _sys
 
         from whetstone.cli import _force_utf8_output
@@ -811,3 +920,286 @@ class TestScopedParameters:
             assert not missing, (
                 f"{verb.id} declares {missing} as host/path but the scope "
                 "rules would never check them")
+
+
+# --------------------------------------------------------------------------
+# host naming: one form for a value, both forms for a carve-out
+#
+# Three bypasses in the same seam, fixed as one change: an exclusion that
+# cannot match the naming form the scope admits, an exclusion glob that was
+# never compared against an address, and a host value that the gate and the
+# adapter read as two different machines.
+# --------------------------------------------------------------------------
+
+
+def _open_window() -> dict:
+    return {"starts": NOW - timedelta(hours=1), "expires": NOW + timedelta(hours=1)}
+
+
+class TestExclusionsCannotBeInert:
+    """An exclusion that cannot match is fail-open, and nothing reports it.
+
+    The two directions of a scope fail in opposite ways. A pattern in ``hosts``
+    that can never match denies everything and the operator notices within a
+    minute; the same pattern in ``exclude_hosts`` denies nothing, and
+    ``host_excluded`` returning None is indistinguishable from there being no
+    exclusion at all. So the inert shapes are removed rather than documented:
+    two of them by matching more in the exclusion direction, and the one that is
+    genuinely undecidable without DNS by refusing the document at load.
+    """
+
+    def test_an_address_exclusion_alone_does_not_load_when_names_are_in_scope(self):
+        """The shape the shipped example had: the gateway reachable by name."""
+        with pytest.raises(EngagementError, match="by name"):
+            Engagement(name="x", authorization="TICKET-1", **_open_window(),
+                       scope=Scope(hosts=("10.20.4.0/24", "*.lab.internal"),
+                                   exclude_hosts=("10.20.4.1",)))
+
+    def test_a_name_exclusion_alone_does_not_load_when_addresses_are_in_scope(self):
+        """The same hole mirrored: the carve-out misses the machine's IP."""
+        with pytest.raises(EngagementError, match="by address"):
+            Engagement(name="x", authorization="TICKET-1", **_open_window(),
+                       scope=Scope(hosts=("10.20.4.0/24", "*.lab.internal"),
+                                   exclude_hosts=("gw.lab.internal",)))
+
+    def test_writing_the_carve_out_in_both_forms_loads(self):
+        e = Engagement(name="x", authorization="TICKET-1", **_open_window(),
+                       scope=Scope(hosts=("10.20.4.0/24", "*.lab.internal"),
+                                   exclude_hosts=("10.20.4.1", "gw.lab.internal")))
+        assert e.scope.host_excluded("10.20.4.1")
+        assert e.scope.host_excluded("gw.lab.internal")
+
+    def test_the_shipped_example_excludes_its_carve_outs_under_both_names(self):
+        """The audit's failure case, run against the real document.
+
+        A credential dump on the default gateway was DENY as ``10.20.4.1`` and
+        ALLOW as ``gw.lab.internal`` — same machine, no human in the loop.
+        """
+        import whetstone.verbs  # noqa: F401
+        from whetstone.actions import REGISTRY
+        from whetstone.gate import load_engagement
+
+        e = load_engagement("examples/engagement.yaml")
+        verb = REGISTRY.get("postex.credential_dump")
+        when = datetime(2026, 9, 17, 12, 0, tzinfo=timezone.utc)
+        for target in ("10.20.4.1", "gw.lab.internal",
+                       "10.20.4.50", "finance.lab.internal"):
+            d = decide(e, verb, REGISTRY.bind(verb.id, {}, target=target), now=when)
+            assert d.rule == "scope.host.excluded", (
+                f"{target} is carved out of the engagement and got {d}")
+
+    def test_a_glob_exclusion_covers_addresses_too(self):
+        """``exclude_hosts: ["10.0.0.*"]`` used to exclude nothing whatsoever."""
+        s = Scope(hosts=("10.0.0.0/24",), exclude_hosts=("10.0.0.*",))
+        assert s.host_excluded("10.0.0.5") == "10.0.0.*"
+
+    def test_an_inclusion_glob_still_refuses_to_match_an_address(self):
+        """The asymmetry is deliberate and only leans one way.
+
+        Matching more is safe in an exclusion and is a wider authorisation than
+        anybody signed in an inclusion, so the glob relaxation applies to
+        ``exclude_hosts`` alone.
+        """
+        assert not Scope(hosts=("10.0.0.*",)).host_included("10.0.0.5")
+
+    def test_a_loopback_exclusion_covers_the_other_spelling(self):
+        """Loopback is the one cross-form case decidable without asking DNS."""
+        assert Scope(allow_loopback=True,
+                     exclude_hosts=("127.0.0.1",)).host_excluded("localhost")
+        assert Scope(allow_loopback=True,
+                     exclude_hosts=("localhost",)).host_excluded("127.0.0.1")
+        assert Scope(allow_loopback=True,
+                     exclude_hosts=("127.0.0.0/8",)).host_excluded("localhost")
+
+
+class TestCidrHostBits:
+    """``strict=False`` turned one workstation into a whole subnet, silently.
+
+    ``ip_network("192.168.1.50/24", strict=False)`` does not fail — it drops the
+    host bits and returns 192.168.1.0/24. The document still said
+    ``192.168.1.50/24`` and so did ``summary()``, so the 256-fold widening of a
+    signed authorisation appeared nowhere. ``ip addr show`` prints exactly that
+    shape, which is where an operator copies it from.
+    """
+
+    def test_an_address_with_host_bits_does_not_load(self):
+        with pytest.raises(EngagementError, match="host bits"):
+            Engagement(name="x", authorization="TICKET-1", **_open_window(),
+                       scope=Scope(hosts=("192.168.1.50/24",)))
+
+    def test_the_refusal_names_both_readings(self):
+        """The operator has to say which one they signed for."""
+        with pytest.raises(EngagementError) as exc:
+            Engagement(name="x", authorization="TICKET-1", **_open_window(),
+                       scope=Scope(hosts=("192.168.1.50/24",)))
+        assert "192.168.1.0/24" in str(exc.value)
+        assert "192.168.1.50/32" in str(exc.value)
+
+    def test_a_raw_scope_with_host_bits_fails_closed(self):
+        """Scope takes no document, so it cannot refuse — it must deny instead.
+
+        Strict parsing leaves the pattern unparseable as a network, so it falls
+        through to the glob branch and matches no address at all. Denying every
+        host is the correct failure for an inclusion: it is loud within a minute
+        and it widens nothing.
+        """
+        s = Scope(hosts=("192.168.1.50/24",))
+        assert not s.host_included("192.168.1.200")
+        assert not s.host_included("192.168.1.50")
+
+
+class TestHostValueHasOneForm:
+    """The gate has to rule on the exact string the adapter will dial.
+
+    Every adapter re-parses a host before it opens a socket: all three strip a
+    leading ``host:``, then cut a port off at a colon — macOS and Windows at the
+    first colon, Linux at the last. So the gate matched
+    ``evil.example.com:443.lab.internal`` against ``*.lab.internal``, said
+    ALLOW, and the probe streamed to evil.example.com:443; and
+    ``host:dc01.lab.internal`` walked past an exclusion on dc01, which the
+    adapter then stripped back off. Authorising one string and dialling another
+    is a parser differential, and the answer is not a fourth parser here but one
+    legal form on which all of that re-parsing is the identity.
+    """
+
+    LAUNDERED: tuple[str, ...] = (
+        "host:dc01.lab.internal",             # prefix the adapters strip
+        "evil.example.com:443.lab.internal",  # the audit's sink
+        "dc01.lab.internal:22",               # ordinary host:port
+        "http://dc01.lab.internal",           # a URL is not a host
+        "root@dc01.lab.internal",             # credentials do not belong here
+        "[fe80::1]",                          # nothing unbrackets this
+        "dc01.lab.internal ",                 # one adapter strips, one does not
+        "*.lab.internal",                     # a pattern is not a value
+    )
+
+    def _engagement(self) -> Engagement:
+        return Engagement(
+            name="host-form", authorization="TICKET-1", **_open_window(),
+            scope=Scope(hosts=("*.lab.internal", "10.20.4.0/24"),
+                        paths=("/tmp/lab",)),
+            authorize=Authorization(red_team=True, max_intent=Intent.EXECUTE,
+                                    techniques=("T1003", "T1041", "T1547",
+                                                "T1053", "T1021", "T1068",
+                                                "T1574", "T1222"),
+                                    unattended=frozenset(Intent)),
+        )
+
+    def test_a_sink_cannot_smuggle_a_second_host_past_the_scope(self):
+        import whetstone.verbs  # noqa: F401
+        from whetstone.actions import REGISTRY
+
+        sink = "evil.example.com:443.lab.internal"
+        # What the macOS and Windows adapters would have dialled, and the whole
+        # reason the glob match on the full string meant nothing.
+        assert sink.partition(":")[0] == "evil.example.com"
+
+        verb = REGISTRY.get("postex.exfil_probe")
+        action = REGISTRY.bind(verb.id, {"sink": sink}, target="ws01.lab.internal")
+        d = decide(self._engagement(), verb, action, now=NOW)
+        assert d.rule == "scope.host.malformed", d
+        assert "sink" in d.reason
+
+    def test_a_host_prefix_cannot_walk_past_an_exclusion(self):
+        import whetstone.verbs  # noqa: F401
+        from whetstone.actions import REGISTRY
+
+        e = Engagement(
+            name="prefix", authorization="TICKET-1", **_open_window(),
+            scope=Scope(hosts=("*.lab.internal",),
+                        exclude_hosts=("dc01.lab.internal",)),
+            authorize=Authorization(red_team=True, max_intent=Intent.EXECUTE,
+                                    techniques=("T1003",),
+                                    unattended=frozenset(Intent)),
+        )
+        verb = REGISTRY.get("postex.credential_dump")
+        action = REGISTRY.bind(verb.id, {}, target="host:dc01.lab.internal")
+        d = decide(e, verb, action, now=NOW)
+        assert d.verdict is Verdict.DENY, d
+        assert d.rule in ("scope.host.malformed", "scope.host.excluded"), d
+
+    def test_no_verb_accepts_a_laundered_host_in_any_host_slot(self):
+        """Walk the registry: the class, not the one case.
+
+        In the spirit of the general test in TestScopedParameters — a specific
+        test fixes ``postex.exfil_probe``, this one holds for the verb somebody
+        adds next year, whichever slot the host arrives in.
+        """
+        import whetstone.verbs  # noqa: F401
+        from whetstone.actions import REGISTRY, TargetKind
+
+        engagement = self._engagement()
+        in_scope = {"host": "ws01.lab.internal", "path": "/tmp/lab/file"}
+        checked = 0
+
+        for verb_id in REGISTRY.ids():
+            verb = REGISTRY.get(verb_id)
+            slots = [p.name for p in verb.params if p.type == "host"]
+            if verb.target is TargetKind.HOST:
+                slots.append("target")
+            if not slots:
+                continue
+
+            base = {p.name: (p.choices[0] if p.type == "enum"
+                             else 1 if p.type == "integer"
+                             else False if p.type == "boolean"
+                             else in_scope.get(p.type, "placeholder"))
+                    for p in verb.params if p.required}
+            target = {TargetKind.HOST: in_scope["host"],
+                      TargetKind.PATH: in_scope["path"]}.get(verb.target)
+
+            for slot in slots:
+                for bad in self.LAUNDERED:
+                    params = dict(base)
+                    this_target = target
+                    if slot == "target":
+                        this_target = bad
+                    else:
+                        params[slot] = bad
+                    action = REGISTRY.bind(verb.id, params, target=this_target)
+                    d = decide(engagement, verb, action, now=NOW)
+                    assert d.rule == "scope.host.malformed", (
+                        f"{verb.id} accepted {bad!r} in {slot}: {d}")
+                    checked += 1
+
+        assert checked, "the registry declared no host slots at all"
+
+    def test_every_admitted_host_is_the_string_the_adapters_dial(self):
+        """The property the form rule buys, stated as the adapters read it.
+
+        These three re-parses are copied from whetstone/adapters/macos.py,
+        windows.py and linux.py. If an adapter learns another way to chop a host
+        up, this is where it has to be declared, because the gate's promise is
+        that the string it authorised is the string that reaches the socket.
+        """
+        from whetstone.gate.engagement import host_form_error
+
+        def strip_prefix(v: str) -> str:            # lateral_move, macos+windows
+            return v.split(":", 1)[1] if v.startswith("host:") else v
+
+        def first_colon(v: str) -> str:             # exfil sink, macos+windows
+            return strip_prefix(v).partition(":")[0]
+
+        def last_colon(v: str) -> str:              # exfil sink, linux
+            return v.rpartition(":")[0] if ":" in v else v
+
+        for value in ("dc01.lab.internal", "10.20.4.7", "sandbox-collector",
+                      "localhost", "WS01.lab.internal", "printer-3f.office.internal"):
+            assert host_form_error(value) is None, value
+            for reparse in (strip_prefix, first_colon, last_colon):
+                assert reparse(value) == value, (
+                    f"an adapter would dial {reparse(value)!r}, not {value!r}")
+
+        for bad in self.LAUNDERED:
+            assert host_form_error(bad) is not None, bad
+
+        # The one admitted form the colon splitters still cut in half. It is a
+        # real host and the corpus uses IPv6 literals as ordinary out-of-scope
+        # targets, so refusing them here would be an over-reach; the target path
+        # handles them, and the splitters mangle rather than redirect. Closing
+        # it properly means giving postex.exfil_probe its own integer `port`
+        # parameter and deleting the splits, which is a change in verbs.py and
+        # the three adapters, not in the gate.
+        assert host_form_error("2001:db8::42") is None
+        assert strip_prefix("2001:db8::42") == "2001:db8::42"
+        assert first_colon("2001:db8::42") != "2001:db8::42"

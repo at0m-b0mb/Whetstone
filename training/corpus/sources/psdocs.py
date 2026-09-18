@@ -59,6 +59,7 @@ claim stays checkable next to the text it covers.
 
 from __future__ import annotations
 
+import http.client
 import re
 import shutil
 import ssl
@@ -197,7 +198,12 @@ def _download(url: str, dest: Path) -> None:
                                     context=_ssl_context()) as response, \
                 dest.open("wb") as handle:
             shutil.copyfileobj(response, handle, length=1 << 20)
-    except (urllib.error.URLError, OSError) as exc:
+    # http.client.HTTPException is in the tuple for IncompleteRead, which a body
+    # that ends early raises and which is NOT an OSError — its MRO is
+    # HTTPException -> Exception. Without it, the single most ordinary network
+    # failure there is escapes this wrapper as something no caller catches, and
+    # takes the half-written dest file with it.
+    except (urllib.error.URLError, http.client.HTTPException, OSError) as exc:
         dest.unlink(missing_ok=True)
         raise SourceError(f"psdocs: could not download {url}: {exc}") from exc
 

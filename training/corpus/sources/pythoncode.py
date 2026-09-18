@@ -103,8 +103,16 @@ _NAME = "pythoncode"
 #: is part of it: when the gates below change, a cache built under the old rules
 #: is stale, and silently reusing it is how an adapter's fixes fail to take
 #: effect on the machine that already ran it once.
+#:
+#: 3 because the sdist is now checked against the digest PyPI publishes for it.
+#: A cache written under 2 holds an archive that was never compared with
+#: anything, and its marker records an ``archive_sha256`` that reads like a
+#: verified checksum and is not one. That cache has to be refetched rather than
+#: trusted, which is exactly what this number is for — the short-circuit on
+#: ``cache_version`` would otherwise mean the machines that already built the
+#: corpus are the ones the fix never reaches.
 _MARKER = ".fetched.json"
-_CACHE_VERSION = 2
+_CACHE_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -274,24 +282,44 @@ _MAX_BYTES = 100_000
 _MIN_PROSE_CHARS = 200
 _MIN_PROSE_RATIO = 0.05
 
-#: Downloads are held in memory by :func:`~training.corpus.net.download`, so
-#: this is also the practical ceiling on an archive. The largest here is well
-#: under it; the check exists so a repository that grows a binary tree fails
-#: loudly rather than by memory exhaustion on someone's laptop.
+#: The ceiling on an archive, passed to :func:`~training.corpus.net.download`
+#: as ``max_bytes`` so it is enforced against bytes as they arrive. It used to
+#: be checked with ``archive.stat().st_size`` *after* the download returned,
+#: back when ``download`` buffered the whole response in memory and then wrote
+#: it out — which meant a 20 GB body exhausted memory and filled the disk three
+#: statements before the guard that was supposed to stop it ever ran. The check
+#: read as protection and provided none. A ceiling belongs where the bytes
+#: arrive, not where they are counted afterwards.
 _MAX_ARCHIVE_BYTES = 300 * 1024 * 1024
 
 
-def _archive_url(project: _Project) -> tuple[str, str]:
-    """Resolve ``project.archive`` to a concrete URL and a version label.
+def _archive_url(project: _Project) -> tuple[str, str, str]:
+    """Resolve ``project.archive`` to a URL, a version label and an expected digest.
 
     GitHub codeload tarballs are used for five of the six: one request, no git
     binary, no history, and nothing on disk that a later ``git pull`` could
     mutate underneath a reproducible build. The sixth is resolved through the
     PyPI JSON API because its repository is two orders of magnitude larger than
     its source distribution — the reason is recorded on the project entry.
+
+    The digest is the third return value and it is empty for the codeload five,
+    because GitHub publishes no hash for a branch tarball and an empty string
+    says that honestly. PyPI does publish one, in the same response that gives
+    the URL, and the only reason this function used to return two values is
+    that nobody read it. The URL was taken on truthiness alone and handed
+    straight to ``download``, while ``digests.sha256`` — the authoritative hash
+    for exactly those bytes — sat unused in the same ``entry`` dict; the marker
+    then recorded a hash of whatever had arrived, which looks like a verified
+    checksum and proves nothing at all about the bytes you were supposed to get.
+
+    The scheme check is here for the same reason. This URL is the one in the
+    adapter that comes out of a remote response rather than a constant, and
+    validating it where it is read is cheaper to reason about than trusting
+    that every layer underneath will keep refusing ``ftp:``, ``file:`` and
+    ``data:`` forever.
     """
     if not project.archive.startswith("pypi:"):
-        return project.archive, project.archive.rsplit("/", 1)[-1]
+        return project.archive, project.archive.rsplit("/", 1)[-1], ""
 
     distribution = project.archive.split(":", 1)[1]
     api = f"https://pypi.org/pypi/{distribution}/json"
@@ -302,16 +330,46 @@ def _archive_url(project: _Project) -> tuple[str, str]:
 
     version = str(payload.get("info", {}).get("version", "unknown"))
     for entry in payload.get("urls", []):
-        if entry.get("packagetype") == "sdist":
-            url = entry.get("url", "")
-            if url:
-                return url, version
+        if entry.get("packagetype") != "sdist":
+            continue
+        url = str(entry.get("url", ""))
+        if not url:
+            continue
+        if not url.startswith("https://"):
+            raise SourceError(
+                f"{_NAME}: {api} offers its sdist at {url!r}, which is not "
+                "https. PyPI does not do that; something between here and it "
+                "does. Refusing rather than fetching."
+            )
+        digest = str(entry.get("digests", {}).get("sha256", ""))
+        if not digest:
+            raise SourceError(
+                f"{_NAME}: {api} gives no digests.sha256 for {url}. That field "
+                "is what makes this download checkable, and a source "
+                "distribution fetched with nothing to compare it against is "
+                "not worth training on."
+            )
+        return url, version, digest
     raise SourceError(
         f"{_NAME}: {distribution} publishes no source distribution on PyPI. "
         "It was chosen precisely because its sdist is 74x smaller than its "
         "repository tarball; if that is no longer true, point the project at "
         "codeload instead of quietly losing the source."
     )
+
+
+def _sha256(path: Path) -> str:
+    """Digest of a file, read a megabyte at a time.
+
+    Chunked rather than ``hashlib.sha256(path.read_bytes())``: the ceiling on
+    these archives is 300 MB and there is no reason for any of it to be
+    resident at once, least of all on a machine that may be training.
+    """
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1 << 20):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _is_generated(head: bytes) -> bool:
@@ -561,24 +619,37 @@ def _fetch(cache_dir: Path) -> Path:
     manifest: list[dict[str, object]] = []
     try:
         for project in _PROJECTS:
-            url, version = _archive_url(project)
+            url, version, expected = _archive_url(project)
             archive = root / f".{project.name}.tar.gz.part"
             try:
-                download(url, archive, timeout=600)
+                # The ceiling goes to the transport, which enforces it against
+                # bytes as they arrive and refuses an oversized Content-Length
+                # before reading any of them. See _MAX_ARCHIVE_BYTES for the
+                # version of this that ran after the download had finished.
+                download(url, archive, timeout=600,
+                         max_bytes=_MAX_ARCHIVE_BYTES)
             except NetworkError as exc:
                 raise SourceError(f"{_NAME}: {project.name}: {exc}") from None
             try:
-                size = archive.stat().st_size
-                if size > _MAX_ARCHIVE_BYTES:
+                # Hashing costs one read and buys provenance: a bare branch
+                # name cannot tell you afterwards which snapshot of a moving
+                # target this cache actually contains.
+                digest = _sha256(archive)
+                # And where the upstream published a digest of its own, the
+                # hash is compared rather than merely recorded. Observing a
+                # hash of the bytes that arrived says nothing about whether
+                # they are the bytes PyPI meant to serve; a poisoned CDN entry
+                # or a rewritten mirror object passes every other gate here,
+                # since the size ceiling only catches a large file, min_files
+                # only catches a restructured tree and the LICENSE check only
+                # catches a missing licence.
+                if expected and digest != expected:
                     raise SourceError(
-                        f"{_NAME}: {project.name} archive is {size:,} bytes, "
-                        f"over the {_MAX_ARCHIVE_BYTES:,} ceiling — check what "
-                        "the repository started shipping before raising it."
+                        f"{_NAME}: {project.name}: {url} hashed to {digest}, "
+                        f"but the index that supplied the URL says the file's "
+                        f"sha256 is {expected}. These are not the bytes the "
+                        "upstream published. Refusing to unpack them."
                     )
-                # Hashing after the fact costs one read and buys provenance: a
-                # bare branch name cannot tell you afterwards which snapshot of
-                # a moving target this cache actually contains.
-                digest = hashlib.sha256(archive.read_bytes()).hexdigest()
                 seen, kept = _extract(project, archive, staging)
             finally:
                 archive.unlink(missing_ok=True)
@@ -590,6 +661,13 @@ def _fetch(cache_dir: Path) -> Path:
                 "version": version,
                 "license": project.license,
                 "archive_sha256": digest,
+                # Spelled out rather than left implied: "observed" is what the
+                # bytes hashed to, "verified" is whether that was compared with
+                # an upstream claim. The codeload five have nothing to compare
+                # against, and a marker that did not say so would read as if
+                # they had been checked.
+                "expected_sha256": expected,
+                "sha256_verified": bool(expected),
                 "candidates": seen,
                 "kept": kept,
             })
@@ -704,8 +782,9 @@ SPEC = SourceSpec(
              "licenses/ so the declaration can be checked against the download."),
     # SourceSpec takes one url and this source has six. The most relevant of
     # them stands here; all six, with the exact archive fetched, the resolved
-    # version and the sha256 of what arrived, are written into the cache marker
-    # by _fetch, and each project's url is on _PROJECTS above.
+    # version, the sha256 of what arrived and whether that hash was checked
+    # against one the upstream published, are written into the cache marker by
+    # _fetch, and each project's url is on _PROJECTS above.
     url="https://github.com/fortra/impacket",
     register=Register.SYSTEM,
     side=Side.NEUTRAL,

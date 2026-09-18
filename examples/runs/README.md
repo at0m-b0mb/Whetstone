@@ -1,9 +1,29 @@
 # Example runs — the model, on the record
 
-These are **real, captured runs**. Nothing here is illustrative, edited, or
+These are **real, captured runs**. Nothing here is illustrative or
 hand-written. The observations are what the adapters actually returned from the
 actual targets, at the timestamp in each file's header. Regenerate them on a
 different machine and the observations change, because they are observations.
+
+**One thing is edited, and naming it is the whole point of this paragraph.**
+Before these files were committed, the machine's identity was substituted out of
+them: the operator's account name became `operator`, and the macOS per-user temp
+directory the sandbox was built under — `/var/folders/<two>/<28 characters>/T`,
+which is a stable identifier for one particular Mac and incidentally gives away
+that a host labelled `sandbox-linux` is not Linux — became `/tmp`. Nothing else
+was touched. The services, the permissions, the package versions, the auditd
+state, the model's rankings and every finding are exactly what the run produced.
+This repository is public, and a proof of work that also publishes the
+maintainer's local account name is proof of something else as well.
+
+The substitution is `redact_identity()` in
+[`training/trajectories.py`](../../training/trajectories.py) — the same function
+that strips identity out of the training corpus, so there is one definition of
+what counts as identity rather than one per artifact. A re-capture has to run
+its three files through it before they are committed, and `identity_leaks()` in
+the same module is the check that says whether it did. The uid is left alone on
+purpose: `501` on a Linux VM says the VM is Lima on a Mac, which the target line
+at the top of the transcript already says in words, and it names nobody.
 
 Each run produces three files:
 
@@ -80,10 +100,15 @@ current state, captured so the progress is measurable.
 
 ## Reproduce
 
+`data/` is the symlink at the repository root that points at wherever this
+project's weights, corpus and VM images live — an NVMe volume here, whatever you
+set up there. Written that way rather than as the absolute path this run used,
+because the absolute path is one more machine identifier and it is not yours.
+
 ```bash
-export LIMA_HOME=/Volumes/at0m_b0mb/whetstone/lab/lima
-CK=/Volumes/at0m_b0mb/whetstone/models/checkpoints-v3/tiny-sft2
-TOK=/Volumes/at0m_b0mb/whetstone/models/tokenizer-v1/tokenizer.json
+export LIMA_HOME="$PWD/data/lab/lima"
+CK=data/models/checkpoints-v3/tiny-sft2
+TOK=data/models/tokenizer-v1/tokenizer.json
 
 python3 -m lab.record_run --checkpoint "$CK" --tokenizer "$TOK" \
     --out examples/runs --name sandbox-tiny-sft2

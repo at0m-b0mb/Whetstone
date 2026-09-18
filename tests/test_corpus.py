@@ -8,7 +8,9 @@ the properties that matter here are pinned down rather than assumed.
 
 from __future__ import annotations
 
+import hashlib
 import importlib
+import io
 import itertools
 import json
 import os
@@ -309,6 +311,689 @@ class TestNet:
                             offenders.append(f"{path.name}:{node.lineno} check_hostname=False")
         assert not offenders, f"unverified TLS in code: {offenders}"
 
+
+class _FakeResponse:
+    """Stand-in for an ``http.client.HTTPResponse``, delivered chunk by chunk.
+
+    An entry in ``chunks`` that is an exception is raised instead of returned,
+    which is how a truncated body is expressed here: the read that should have
+    delivered the rest raises instead. ``reads`` is counted so a test can assert
+    that a refusal happened *before* the body was touched.
+    """
+
+    def __init__(self, chunks, headers=None):
+        self._chunks = list(chunks)
+        self.headers = headers or {}
+        self.reads = 0
+
+    def read(self, amount=-1):
+        self.reads += 1
+        if not self._chunks:
+            return b""
+        item = self._chunks.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeOpener:
+    """Hands back one prepared response, whatever is asked for."""
+
+    def __init__(self, response):
+        self.response = response
+        self.requests = []
+
+    def open(self, request, timeout=None):
+        self.requests.append(request)
+        return self.response
+
+
+def _serve(monkeypatch, response):
+    """Point net's cached opener at ``response`` for the duration of a test."""
+    from training.corpus import net
+
+    opener = _FakeOpener(response)
+    monkeypatch.setattr(net, "_opener_cached", opener)
+    return opener
+
+
+class TestNetFailureContract:
+    """A failed fetch is a NetworkError. No exceptions, and one in particular.
+
+    Twenty-three adapters are written as ``except NetworkError`` and the
+    contract is only worth something if it has no holes. A body that ends early
+    raises ``http.client.IncompleteRead``, whose MRO is ``HTTPException ->
+    Exception`` — it is not an ``OSError``, so the obvious except tuple lets the
+    most ordinary network failure there is walk straight past every adapter.
+    The shape it took: one flaky connection near the end of rfc.py's 9,825-file
+    fetch aborted the whole source, and the build reported ``IncompleteRead``
+    rather than a network error.
+    """
+
+    def test_incomplete_read_is_not_an_oserror(self):
+        """The premise, pinned. If this ever changes the clauses can shrink."""
+        import http.client
+
+        assert not issubclass(http.client.IncompleteRead, OSError)
+        assert issubclass(http.client.IncompleteRead, http.client.HTTPException)
+
+    def test_truncated_body_raises_network_error(self, monkeypatch):
+        import http.client
+
+        from training.corpus import net
+
+        _serve(monkeypatch, _FakeResponse(
+            [b"half a body", http.client.IncompleteRead(b"half a body", 4000)]))
+        with pytest.raises(net.NetworkError):
+            net.fetch("https://example.invalid/page")
+
+    def test_truncated_download_raises_network_error(self, monkeypatch, tmp_path):
+        import http.client
+
+        from training.corpus import net
+
+        _serve(monkeypatch, _FakeResponse(
+            [b"x" * 16, http.client.IncompleteRead(b"", 4000)]))
+        with pytest.raises(net.NetworkError):
+            net.download("https://example.invalid/a.tar.gz", tmp_path / "a.tar.gz")
+
+    def test_a_failed_download_leaves_no_part_file(self, monkeypatch, tmp_path):
+        """A ``.part`` left behind is a truncated cache entry waiting to happen."""
+        import http.client
+
+        from training.corpus import net
+
+        _serve(monkeypatch, _FakeResponse(
+            [b"x" * 16, http.client.IncompleteRead(b"", 4000)]))
+        target = tmp_path / "cache" / "a.tar.gz"
+        with pytest.raises(net.NetworkError):
+            net.download("https://example.invalid/a.tar.gz", target)
+        assert list(target.parent.iterdir()) == []
+
+
+class TestNetRedirectPolicy:
+    """Verification covers hop two as well, and secrets do not travel.
+
+    ``context=`` protects the first request only. urllib's stock redirect
+    handler allows ``http`` and ``ftp`` targets and copies every caller header
+    onto the new request, so one ``302`` was enough to send nvd.py's
+    ``NVD_API_KEY`` in clear text to a host this project never chose — and to do
+    it silently, because from fetch()'s point of view the request succeeded and
+    the body it returned was written into the corpus.
+    """
+
+    def _redirect(self, req, newurl, code=302):
+        import email.message
+        import io
+
+        from training.corpus import net
+
+        return net._HttpsOnlyRedirectHandler().redirect_request(
+            req, io.BytesIO(b""), code, "Found", email.message.Message(), newurl)
+
+    def _keyed_request(self):
+        import urllib.request
+
+        return urllib.request.Request(
+            "https://services.nvd.nist.gov/rest/json/cves/2.0",
+            headers={"User-Agent": "whetstone-corpus", "apiKey": "SECRET-KEY"})
+
+    def test_redirect_to_http_is_refused(self):
+        import urllib.error
+
+        with pytest.raises(urllib.error.HTTPError):
+            self._redirect(self._keyed_request(), "http://collector.example/")
+
+    def test_redirect_to_ftp_is_refused(self):
+        import urllib.error
+
+        with pytest.raises(urllib.error.HTTPError):
+            self._redirect(self._keyed_request(), "ftp://collector.example/x")
+
+    def test_cross_host_redirect_drops_the_caller_header(self):
+        new = self._redirect(self._keyed_request(), "https://collector.example/x")
+        assert "SECRET-KEY" not in str(new.headers)
+        # The crawler still identifies itself; that is not a credential.
+        assert new.headers.get("User-agent") == "whetstone-corpus"
+
+    def test_a_different_port_is_a_different_origin(self):
+        new = self._redirect(self._keyed_request(),
+                             "https://services.nvd.nist.gov:8443/rest/")
+        assert "SECRET-KEY" not in str(new.headers)
+
+    def test_an_unparseable_port_strips_rather_than_keeps(self):
+        """``SplitResult.port`` raises on a bad port. Unsure must mean strip."""
+        new = self._redirect(self._keyed_request(),
+                             "https://services.nvd.nist.gov:notaport/rest/")
+        assert "SECRET-KEY" not in str(new.headers)
+
+    def test_same_origin_redirect_keeps_the_caller_header(self):
+        """Otherwise the NVD key would be dropped on NVD's own pagination."""
+        new = self._redirect(self._keyed_request(),
+                             "https://services.nvd.nist.gov/rest/json/cves/2.0?p=2")
+        assert new.headers.get("Apikey") == "SECRET-KEY"
+
+    def test_the_opener_speaks_only_https(self):
+        """No FTP, file or data handler is reachable — by construction.
+
+        urllib's default opener registers all three, and on any of them the
+        ``context=`` argument is simply unused, so the trust store this module
+        exists to establish is never consulted.
+        """
+        from training.corpus import net
+
+        names = {type(h).__name__ for h in net._opener().handlers}
+        assert not names & {"FTPHandler", "FileHandler", "DataHandler",
+                            "HTTPHandler", "CacheFTPHandler"}
+        assert "HTTPSHandler" in names
+
+    def test_a_plaintext_url_is_refused_at_the_door(self, monkeypatch):
+        from training.corpus import net
+
+        opener = _serve(monkeypatch, _FakeResponse([b"body"]))
+        with pytest.raises(net.NetworkError):
+            net.fetch("http://example.invalid/page")
+        assert opener.requests == []   # refused before any request was made
+
+
+class TestNetCeilings:
+    """A response has a size limit, enforced where the bytes arrive.
+
+    ``fetch`` was ``return response.read()`` and ``download`` was
+    ``tmp.write_bytes(fetch(...))``, so the complete body was resident before a
+    byte reached disk. pythoncode's 300 MB archive ceiling — the one thing in
+    the package that looked like it bounded this — was evaluated with
+    ``stat()`` after the download had already finished, three statements too
+    late to fire. An endless body took the machine's memory with it, which on
+    this host means the training run's memory.
+    """
+
+    def test_fetch_refuses_a_body_over_the_ceiling(self, monkeypatch):
+        from training.corpus import net
+
+        _serve(monkeypatch, _FakeResponse([b"x" * 1024] * 64))
+        with pytest.raises(net.NetworkError):
+            net.fetch("https://example.invalid/big", max_bytes=4096)
+
+    def test_a_body_with_no_content_length_is_still_bounded(self, monkeypatch):
+        """Chunked encoding sends no length. The running total is what holds."""
+        from training.corpus import net
+
+        response = _FakeResponse([b"x" * 4096] * 1000)
+        _serve(monkeypatch, response)
+        with pytest.raises(net.NetworkError):
+            net.fetch("https://example.invalid/endless", max_bytes=8192)
+        assert response.reads < 10   # stopped early, did not drain the stream
+
+    def test_an_oversize_content_length_is_refused_before_reading(self, monkeypatch):
+        from training.corpus import net
+
+        response = _FakeResponse([b"x" * 16],
+                                 headers={"Content-Length": "20000000000"})
+        _serve(monkeypatch, response)
+        with pytest.raises(net.NetworkError):
+            net.fetch("https://example.invalid/huge", max_bytes=1024)
+        assert response.reads == 0
+
+    def test_an_unparseable_content_length_does_not_disable_the_ceiling(self, monkeypatch):
+        from training.corpus import net
+
+        _serve(monkeypatch, _FakeResponse([b"x" * 1024] * 64,
+                                          headers={"Content-Length": "banana"}))
+        with pytest.raises(net.NetworkError):
+            net.fetch("https://example.invalid/liar", max_bytes=4096)
+
+    def test_download_enforces_the_ceiling_and_keeps_nothing(self, monkeypatch, tmp_path):
+        from training.corpus import net
+
+        _serve(monkeypatch, _FakeResponse([b"x" * 1024] * 64))
+        target = tmp_path / "cache" / "big.tar.gz"
+        with pytest.raises(net.NetworkError):
+            net.download("https://example.invalid/big.tar.gz", target,
+                         max_bytes=4096)
+        assert list(target.parent.iterdir()) == []
+
+    def test_a_download_within_the_ceiling_lands_whole(self, monkeypatch, tmp_path):
+        from training.corpus import net
+
+        _serve(monkeypatch, _FakeResponse([b"abc", b"def"]))
+        target = tmp_path / "cache" / "ok.tar.gz"
+        assert net.download("https://example.invalid/ok.tar.gz", target) == target
+        assert target.read_bytes() == b"abcdef"
+        assert list(target.parent.iterdir()) == [target]
+
+
+class TestMetasploitSymlinks:
+    """The one adapter whose transport materialises symlinks.
+
+    Every tarball source here is protected for free by ``if not
+    member.isfile(): continue``, which drops link members before they reach the
+    filesystem. A symlink stored in a git tree is checked out as a real symlink,
+    and this module walked the result with ``Path.rglob``, which scandirs the
+    glob's own starting path — one of four fixed names under ``modules/``. A
+    tree entry checking ``modules/post`` out as a link to ``$HOME`` would have
+    enumerated every ``.rb`` under the user's home directory, counted them
+    toward the file floor, and read them into the corpus.
+    """
+
+    def _tree(self, tmp_path):
+        outside = tmp_path / "outside"
+        (outside / "nested").mkdir(parents=True)
+        (outside / "nested" / "stolen.rb").write_text("# not ours\n", encoding="utf-8")
+        (outside / "id_rsa").write_text("-----BEGIN PRIVATE KEY-----\n", encoding="utf-8")
+
+        checkout = tmp_path / "metasploit-framework"
+        real = checkout / "modules" / "exploits" / "linux" / "local"
+        real.mkdir(parents=True)
+        (real / "real.rb").write_text("# a real module\n", encoding="utf-8")
+        return checkout, outside
+
+    def test_a_symlinked_tree_root_is_not_walked(self, tmp_path):
+        from training.corpus.sources import metasploit
+
+        checkout, outside = self._tree(tmp_path)
+        (checkout / "modules" / "post").symlink_to(outside, target_is_directory=True)
+        assert metasploit._module_files(checkout / "modules", "post") == []
+
+    def test_a_symlinked_subdirectory_is_not_descended(self, tmp_path):
+        from training.corpus.sources import metasploit
+
+        checkout, outside = self._tree(tmp_path)
+        (checkout / "modules" / "exploits" / "elsewhere").symlink_to(
+            outside, target_is_directory=True)
+        found = metasploit._module_files(checkout / "modules", "exploits")
+        assert [p.name for p in found] == ["real.rb"]
+
+    def test_a_symlinked_module_file_is_not_read(self, tmp_path):
+        """``Path.is_file()`` follows a link, so the leaf needs its own check."""
+        from training.corpus.sources import metasploit
+
+        checkout, outside = self._tree(tmp_path)
+        (checkout / "modules" / "exploits" / "linux" / "local" / "key.rb"
+         ).symlink_to(outside / "id_rsa")
+        found = metasploit._module_files(checkout / "modules", "exploits")
+        assert [p.name for p in found] == ["real.rb"]
+
+    def test_pruning_removes_links_and_leaves_the_tree(self, tmp_path):
+        from training.corpus.sources import metasploit
+
+        checkout, outside = self._tree(tmp_path)
+        (checkout / "modules" / "post").symlink_to(outside, target_is_directory=True)
+        (checkout / "modules" / "exploits" / "linux" / "local" / "key.rb"
+         ).symlink_to(outside / "id_rsa")
+
+        assert metasploit._prune_symlinks(checkout) == 2
+        assert not (checkout / "modules" / "post").exists()
+        assert (checkout / "modules" / "exploits" / "linux" / "local" / "real.rb").is_file()
+        # The link was removed, not the file it pointed at.
+        assert (outside / "id_rsa").is_file()
+
+
+class TestGhsaSymlinkedAdvisories:
+    """``followlinks=False`` covers the descent, not the file it lands on.
+
+    ``os.walk`` puts symlinks-to-files in ``files`` like any other entry, and
+    this is a git clone, so a link stored upstream exists on disk. An advisory
+    name pointing at an ``.npmrc`` or a credentials file was matched by the
+    name pattern, counted toward the floor, and opened and parsed on every
+    build. The count and the read are both checked so they cannot disagree.
+    """
+
+    def _tree(self, tmp_path):
+        from training.corpus.sources import ghsa
+
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "creds.json").write_text('{"token": "hunter2"}', encoding="utf-8")
+
+        root = tmp_path / "advisory-database"
+        month = root / "advisories" / "reviewed" / "2026" / "09"
+        (month / "GHSA-aaaa-bbbb-cccc").mkdir(parents=True)
+        (month / "GHSA-aaaa-bbbb-cccc" / "GHSA-aaaa-bbbb-cccc.json").write_text(
+            "{}", encoding="utf-8")
+        (month / "GHSA-dddd-eeee-ffff").mkdir(parents=True)
+        (month / "GHSA-dddd-eeee-ffff" / "GHSA-dddd-eeee-ffff.json").symlink_to(
+            outside / "creds.json")
+        return ghsa, root
+
+    def test_a_symlinked_advisory_is_not_collected(self, tmp_path):
+        ghsa, root = self._tree(tmp_path)
+        names = [p.name for p in ghsa._advisory_paths(root)]
+        assert names == ["GHSA-aaaa-bbbb-cccc.json"]
+
+    def test_the_floor_counts_what_the_reader_will_read(self, tmp_path):
+        ghsa, root = self._tree(tmp_path)
+        assert ghsa._count_advisories(root) == len(ghsa._advisory_paths(root)) == 1
+
+
+def _tar_gz(path, members):
+    """Write a gzipped tar of ``{name: bytes}`` at ``path``."""
+    import tarfile as _tarfile
+
+    with _tarfile.open(path, "w:gz") as tar:
+        for name, payload in members.items():
+            info = _tarfile.TarInfo(name)
+            info.size = len(payload)
+            tar.addfile(info, io.BytesIO(payload))
+
+
+class TestArchiveMemberCeiling:
+    """One tar member may not be read into memory unbounded.
+
+    ``target.write_bytes(stream.read())`` asks for a single allocation of
+    whatever the member declares, and NUL bytes gzip at roughly 1000:1 — so an
+    8 GiB member leaves the archive looking entirely ordinary on the wire and
+    then asks for 8 GiB of RAM. On this machine that is a MemoryError that kills
+    the build or an OOM kill that picks the training run instead.
+
+    tldr stands in for the five adapters that shared the shape (elastic,
+    splunk, atomic, lolbas, tldr) because it is the one whose fetch is a plain
+    download-then-unpack with nothing else in the way. The ceiling is checked
+    against ``member.size`` before extraction, which is sound rather than
+    trusting: tarfile bounds the reader it hands back to exactly the declared
+    length, so a member cannot deliver more than its header claims.
+    """
+
+    def _fetch_from(self, monkeypatch, tmp_path, members, ceiling):
+        from training.corpus.sources import tldr
+
+        archive = tmp_path / "prepared.tar.gz"
+        _tar_gz(archive, members)
+
+        def fake_download(url, target, **kwargs):
+            target.write_bytes(archive.read_bytes())
+            return target
+
+        monkeypatch.setattr(tldr, "download", fake_download)
+        monkeypatch.setattr(tldr, "_MAX_MEMBER_BYTES", ceiling)
+        cache = tmp_path / "cache"
+        tldr._fetch(cache)
+        return cache
+
+    def test_an_oversize_member_is_skipped_and_the_rest_arrive(self, monkeypatch, tmp_path):
+        cache = self._fetch_from(monkeypatch, tmp_path, {
+            "tldr-main/pages/linux/small.md": b"# small\n",
+            "tldr-main/pages/linux/huge.md": b"\0" * 5000,
+        }, ceiling=1000)
+        assert (cache / "pages" / "linux" / "small.md").is_file()
+        assert not (cache / "pages" / "linux" / "huge.md").exists()
+
+    def test_a_member_under_the_ceiling_is_written_whole(self, monkeypatch, tmp_path):
+        body = b"# a page\n" + b"x" * 500
+        cache = self._fetch_from(monkeypatch, tmp_path, {
+            "tldr-main/pages/linux/page.md": body,
+        }, ceiling=1000)
+        assert (cache / "pages" / "linux" / "page.md").read_bytes() == body
+
+    def test_the_five_adapters_still_carry_the_guard(self):
+        """Structural: ceiling present, and the unbounded read gone.
+
+        A regression here is one edit away — ``target.write_bytes(stream.read())``
+        is the shorter line and it looks harmless — so the shape is pinned as
+        well as the constant.
+
+        Parsed with ast rather than grepped, for the reason the unverified-TLS
+        test above gives: the comments explaining why this shape was removed
+        quote the shape, and a text search flags exactly the modules that were
+        most careful to explain themselves. What matters is executable code, so
+        that is what this reads.
+
+        Named modules rather than a sweep of the package, because ast cannot
+        tell a bounded read from an unbounded one and one bounded read is
+        legitimate: pythoncode reads a licence member whole after proving it is
+        under 128 KB. These five are the ones that had no bound at all, and
+        listing them is the carve-out written down instead of implied.
+        """
+        import ast
+        from pathlib import Path as _P
+
+        root = _P(__file__).resolve().parents[1] / "training/corpus/sources"
+        for name in ("elastic", "splunk", "atomic", "lolbas", "tldr"):
+            path = root / f"{name}.py"
+            body = path.read_text(encoding="utf-8")
+            assert "_MAX_MEMBER_BYTES" in body, f"{name} lost its member ceiling"
+            tree = ast.parse(body, filename=str(path))
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "write_bytes"
+                        and len(node.args) == 1):
+                    continue
+                arg = node.args[0]
+                assert not (isinstance(arg, ast.Call)
+                            and isinstance(arg.func, ast.Attribute)
+                            and arg.func.attr == "read" and not arg.args), (
+                    f"{name}.py:{node.lineno} reads a whole archive member into "
+                    "one allocation again")
+
+
+class TestPrivateFetchWrappersHonourTheContract:
+    """The four adapters that do not go through net still owe the same contract.
+
+    Closing the IncompleteRead hole in the shared door does not reach the
+    modules that hand-rolled their own ``urlopen``, and three of them had the
+    identical except tuple: URLError, TimeoutError, OSError, and nothing for
+    ``http.client.HTTPException``. A truncated body escaped each of them as an
+    exception their callers do not catch.
+    """
+
+    def _truncating_urlopen(self, monkeypatch, module):
+        """Make the module's urlopen raise IncompleteRead the way a peer would."""
+        import http.client
+
+        def boom(*args, **kwargs):
+            raise http.client.IncompleteRead(b"half", 9000)
+
+        monkeypatch.setattr(module.urllib.request, "urlopen", boom)
+
+    def test_psdocs_download_reports_a_source_error(self, monkeypatch, tmp_path):
+        from training.corpus.source import SourceError
+        from training.corpus.sources import psdocs
+
+        self._truncating_urlopen(monkeypatch, psdocs)
+        with pytest.raises(SourceError):
+            psdocs._download("https://example.invalid/a.tar.gz", tmp_path / "a.tar.gz")
+
+    def test_sigma_download_reports_a_source_error(self, monkeypatch, tmp_path):
+        from training.corpus.source import SourceError
+        from training.corpus.sources import sigma
+
+        self._truncating_urlopen(monkeypatch, sigma)
+        with pytest.raises(SourceError):
+            sigma._download("https://example.invalid/a.tar.gz", tmp_path / "a.tar.gz")
+
+    def test_cisa_plain_get_reports_a_network_error(self, monkeypatch):
+        from training.corpus.net import NetworkError
+        from training.corpus.sources import cisa
+
+        self._truncating_urlopen(monkeypatch, cisa)
+        with pytest.raises(NetworkError):
+            cisa._plain_get("https://example.invalid/kev.json")
+
+    def test_cisa_derives_a_context_that_verifies_as_strictly(self):
+        """The CA store was copied and ``verify_flags`` was not.
+
+        A bare ``SSLContext(PROTOCOL_TLS_CLIENT)`` carries TRUSTED_FIRST alone;
+        ``create_default_context`` adds PARTIAL_CHAIN and X509_STRICT. Dropping
+        the last of those meant this one source accepted certificates every
+        other source in the corpus rejects, while the module asserted the two
+        contexts differ only in offered ciphers.
+        """
+        from training.corpus.net import ssl_context
+        from training.corpus.sources import cisa
+
+        derived = cisa._context()
+        assert derived.verify_flags == ssl_context().verify_flags
+        assert derived.verify_mode == ssl_context().verify_mode
+        assert derived.check_hostname is True
+
+    def test_atomic_keeps_no_second_copy_of_the_door(self):
+        """atomic's private streaming loop is gone, not merely unused.
+
+        It existed because ``net.download`` buffered the whole response and this
+        tarball is 167 MB. ``download`` streams now, and a second copy of the
+        door does not get the door's later fixes — that loop was still following
+        redirects with the stock opener, which downgrades to plaintext http.
+        """
+        import ast
+        from pathlib import Path as _P
+
+        path = (_P(__file__).resolve().parents[1]
+                / "training/corpus/sources/atomic.py")
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        calls = [n.lineno for n in ast.walk(tree)
+                 if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Attribute)
+                 and n.func.attr == "urlopen"]
+        assert not calls, f"atomic opens its own connection again at {calls}"
+
+
+class TestMetasploitGitEnvironment:
+    """A build that hangs silently is worse than one that fails.
+
+    ``capture_output`` redirects the pipes but not the controlling tty, and
+    git's credential prompt reads /dev/tty. Without GIT_TERMINAL_PROMPT=0 a
+    clone that meets a 401 blocks on a username prompt for the full 900s
+    timeout and then reports a timeout — a message that points at the network
+    rather than at the prompt that actually happened.
+    """
+
+    def test_git_runs_with_prompting_disabled(self, monkeypatch):
+        import subprocess as _subprocess
+
+        from training.corpus.sources import metasploit
+
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen.update(kwargs)
+            return _subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        monkeypatch.setattr(metasploit.subprocess, "run", fake_run)
+        metasploit._git("clone", "https://example.invalid/x.git", "/tmp/x")
+        assert seen["env"]["GIT_TERMINAL_PROMPT"] == "0"
+        assert seen["env"]["GIT_LFS_SKIP_SMUDGE"] == "1"
+        # The ambient environment is carried, not replaced: git needs PATH and
+        # the proxy variables an operator set.
+        assert "PATH" in seen["env"]
+
+
+class TestPythoncodeArchiveProvenance:
+    """A hash of the bytes you already have proves nothing about the right ones.
+
+    The plaso sdist URL comes out of the PyPI JSON response, and it was taken on
+    truthiness alone: no scheme check, and ``digests.sha256`` — PyPI's
+    authoritative hash for exactly that artefact, in the same ``entry`` dict —
+    ignored. The marker then recorded a sha256 of whatever had arrived, which
+    reads like a verified checksum and is not one. Nothing else in the adapter
+    covers it: the size ceiling only catches a large file, ``min_files`` only
+    catches a restructured tree, and the LICENSE check only catches a missing
+    licence.
+    """
+
+    def _payload(self, url, digest):
+        return json.dumps({
+            "info": {"version": "20260720"},
+            "urls": [{"packagetype": "sdist", "url": url,
+                      "digests": {"sha256": digest}}],
+        }).encode("utf-8")
+
+    def _project(self):
+        from training.corpus.sources import pythoncode
+
+        return pythoncode._Project(
+            name="demo", url="https://example.invalid/demo",
+            license="Apache-2.0", archive="pypi:demo", keep=("demo/",))
+
+    def test_a_non_https_sdist_url_is_refused(self, monkeypatch):
+        from training.corpus.source import SourceError
+        from training.corpus.sources import pythoncode
+
+        monkeypatch.setattr(pythoncode, "http_get", lambda *a, **k: self._payload(
+            "ftp://files.example/demo.tar.gz", "a" * 64))
+        with pytest.raises(SourceError, match="not"):
+            pythoncode._archive_url(self._project())
+
+    def test_the_published_digest_is_carried_back(self, monkeypatch):
+        from training.corpus.sources import pythoncode
+
+        monkeypatch.setattr(pythoncode, "http_get", lambda *a, **k: self._payload(
+            "https://files.pythonhosted.org/demo.tar.gz", "b" * 64))
+        url, version, digest = pythoncode._archive_url(self._project())
+        assert url.startswith("https://")
+        assert version == "20260720"
+        assert digest == "b" * 64
+
+    def test_an_sdist_with_no_digest_is_refused(self, monkeypatch):
+        from training.corpus.source import SourceError
+        from training.corpus.sources import pythoncode
+
+        monkeypatch.setattr(pythoncode, "http_get", lambda *a, **k: self._payload(
+            "https://files.pythonhosted.org/demo.tar.gz", ""))
+        with pytest.raises(SourceError, match="digests.sha256"):
+            pythoncode._archive_url(self._project())
+
+    def test_a_codeload_archive_declares_no_digest_rather_than_faking_one(self):
+        from training.corpus.sources import pythoncode
+
+        project = pythoncode._Project(
+            name="demo", url="https://example.invalid/demo", license="MIT",
+            archive="https://codeload.github.com/x/y/tar.gz/refs/heads/main",
+            keep=("y/",))
+        _, _, digest = pythoncode._archive_url(project)
+        assert digest == ""
+
+    def test_a_mismatched_download_is_refused_before_it_is_unpacked(
+            self, monkeypatch, tmp_path):
+        """The whole point: the bytes that arrived are compared, not just hashed."""
+        from training.corpus.source import SourceError
+        from training.corpus.sources import pythoncode
+
+        monkeypatch.setattr(pythoncode, "http_get", lambda *a, **k: self._payload(
+            "https://files.pythonhosted.org/demo.tar.gz",
+            hashlib.sha256(b"what pypi published").hexdigest()))
+        monkeypatch.setattr(pythoncode, "_PROJECTS", (self._project(),))
+
+        def fake_download(url, target, **kwargs):
+            target.write_bytes(b"what the CDN served")
+            return target
+
+        monkeypatch.setattr(pythoncode, "download", fake_download)
+        monkeypatch.setattr(pythoncode, "_extract", lambda *a, **k: pytest.fail(
+            "unpacked an archive whose hash did not match"))
+
+        with pytest.raises(SourceError, match="hashed to"):
+            pythoncode._fetch(tmp_path / "pythoncode")
+
+    def test_a_matching_download_is_accepted(self, monkeypatch, tmp_path):
+        """The mismatch guard must not fire on the ordinary path."""
+        from training.corpus.sources import pythoncode
+
+        body = b"what pypi published"
+        monkeypatch.setattr(pythoncode, "http_get", lambda *a, **k: self._payload(
+            "https://files.pythonhosted.org/demo.tar.gz",
+            hashlib.sha256(body).hexdigest()))
+        monkeypatch.setattr(pythoncode, "_PROJECTS", (self._project(),))
+        monkeypatch.setattr(pythoncode, "download",
+                            lambda url, target, **k: target.write_bytes(body))
+
+        def fake_extract(project, archive, staging):
+            (staging / "files").mkdir(parents=True, exist_ok=True)
+            return 10, 10
+
+        monkeypatch.setattr(pythoncode, "_extract", fake_extract)
+
+        root = pythoncode._fetch(tmp_path / "pythoncode")
+        marker = json.loads((root / pythoncode._MARKER).read_text(encoding="utf-8"))
+        entry = marker["projects"][0]
+        assert entry["sha256_verified"] is True
+        assert entry["archive_sha256"] == entry["expected_sha256"]
 
 class TestShardInterleaving:
     """The validation split must be representative of the corpus.
@@ -1045,3 +1730,375 @@ class TestSourceWatchdog:
         healthy source silently removes a register and the report cannot tell
         you which of the two happened."""
         assert DEFAULT_SOURCE_TIMEOUT >= 3 * 8 * 60
+
+
+#: Fails in fetch, immediately and cleanly — the ordinary way an upstream goes
+#: away: a 404, a DNS failure, an expired certificate. The build has always
+#: survived this; what it did not survive is what the *previous* build left on
+#: disk underneath it.
+_FAILING_FETCH = """
+def _fetch(cache_dir: Path) -> Path:
+    raise RuntimeError("upstream is gone")
+
+
+def _documents(path: Path):
+    yield Document(text="never reached, but long enough to clear min_chars",
+                   source=__name__.rsplit(".", 1)[-1],
+                   register=Register.PROSE, side=Side.NEUTRAL, ident="0")
+"""
+
+#: Three documents carrying the adapter's own module name, so that two
+#: instances of it in one build are not collapsed into one by the fingerprint
+#: dedup — which is what happens with _HEALTHY and would quietly turn a
+#: two-source test into a one-source test.
+_DISTINCT = """
+def _fetch(cache_dir: Path) -> Path:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def _documents(path: Path):
+    me = __name__.rsplit(".", 1)[-1]
+    for i in range(3):
+        yield Document(text="%s document %d, long enough to clear min_chars" % (me, i),
+                       source=me, register=Register.PROSE, side=Side.NEUTRAL,
+                       ident=str(i))
+"""
+
+
+def _docs(name: str, count: int, size: int, register=Register.PROSE) -> list[Document]:
+    """``count`` documents of ``size`` characters each, attributed to ``name``."""
+    return [Document(text="x" * size, source=name, register=register,
+                     side=Side.NEUTRAL, ident=f"{name}-{i}") for i in range(count)]
+
+
+def _stats_for(collected: dict[str, list[Document]]) -> list[BuildStats]:
+    """The BuildStats build() would be holding at the point the caps run."""
+    return [BuildStats(name=name, register=docs[0].register, side=docs[0].side,
+                       license="throwaway", docs=len(docs),
+                       chars=sum(d.n_chars for d in docs))
+            for name, docs in collected.items()]
+
+
+class TestSourceCapReachesTheShareItPrints:
+    """A cap that reports success without capping is worse than no cap.
+
+    The ceiling was computed once, from the total as it stood *before* any
+    trimming. Trimming shrinks the corpus, so every surviving source's share
+    rises afterwards — and the print then quoted the number that had been asked
+    for rather than the one the corpus ended up at. With rfc at 64% of 789k
+    chars under a 30% cap, the build discarded 40% of the corpus, left rfc at
+    50% of what remained, and reported that it had "trimmed to the 30%
+    ceiling". _cap_register_share had already found this exact defect and
+    answered it with a fixed point; this cap, the one that is on by default,
+    kept the single pass.
+    """
+
+    def test_the_largest_source_ends_at_the_requested_share(self):
+        collected = {
+            "rfc": _docs("rfc", 5050, 100),
+            "a": _docs("a", 800, 100), "b": _docs("b", 900, 100),
+            "c": _docs("c", 700, 100), "d": _docs("d", 600, 100),
+            "e": _docs("e", 500, 100),
+        }
+        stats = _stats_for(collected)
+        build_mod._cap_source_share(collected, stats, 0.30)
+
+        total = sum(s.chars for s in stats if s.docs)
+        share = {s.name: s.chars / total for s in stats}
+        # The single pass left this at 42%, not 30%.
+        assert share["rfc"] == pytest.approx(0.30, abs=0.005), share
+        # And it is a cap, not a haircut for everyone: nothing under the ceiling
+        # is touched.
+        assert [len(collected[n]) for n in "abcde"] == [800, 900, 700, 600, 500]
+
+    def test_several_sources_over_the_cap_all_land_on_it(self):
+        """Three over the ceiling at once was the order-dependent case.
+
+        Each was trimmed to the same absolute ceiling derived from a total that
+        no longer existed, so they came out at 32% apiece — over the cap, by an
+        amount that grew with the number of sources exceeding it.
+        """
+        collected = {
+            "big1": _docs("big1", 4000, 100), "big2": _docs("big2", 3800, 100),
+            "big3": _docs("big3", 3600, 100), "small": _docs("small", 400, 100),
+            "tiny": _docs("tiny", 100, 100),
+        }
+        stats = _stats_for(collected)
+        build_mod._cap_source_share(collected, stats, 0.30)
+
+        total = sum(s.chars for s in stats if s.docs)
+        for name in ("big1", "big2", "big3"):
+            st = next(s for s in stats if s.name == name)
+            assert st.chars / total == pytest.approx(0.30, abs=0.005), name
+
+    def test_an_unreachable_cap_trims_nothing_and_says_so(self, capsys):
+        """Two sources cannot both sit under 30% of one corpus.
+
+        The single pass did not know that and answered anyway: it trimmed both
+        to a ceiling derived from a total that the trim itself destroyed, threw
+        away 40% of the corpus, and left the largest source at 50% — further
+        from the cap than doing nothing, while printing that it had capped.
+        """
+        collected = {"rfc": _docs("rfc", 505, 1000), "other": _docs("other", 284, 1000)}
+        stats = _stats_for(collected)
+        build_mod._cap_source_share(collected, stats, 0.30)
+
+        assert [s.docs for s in stats] == [505, 284], "it trimmed toward a ceiling of zero"
+        out = capsys.readouterr().out
+        assert "SOURCE CAP NOT APPLIED" in out
+        assert "64%" in out, "it must say where the largest source actually stands"
+
+    def test_build_refuses_a_cap_it_cannot_meet_before_it_fetches(self, tmp_path, monkeypatch):
+        """`--only sigma` against the default 30% is arithmetic with no answer.
+
+        It used to be answered anyway, by deleting 70% of the one source it had
+        been asked to build. The condition is knowable from the flags alone, so
+        it is refused before the first byte is downloaded rather than after an
+        hour of them.
+        """
+        spec = _adapter(tmp_path, monkeypatch, _HEALTHY)
+        monkeypatch.setattr(build_mod, "discover_sources", lambda: [spec])
+        with pytest.raises(SystemExit, match="cannot be met"):
+            build(tmp_path / "out", tmp_path / "cache", min_chars=1,
+                  max_source_share=0.30)
+        assert not (tmp_path / "cache" / spec.name).exists(), "it fetched first"
+
+
+class TestRegisterCapSharesTheCeiling:
+    """A register's ceiling is divided between its sources, not raced for.
+
+    The trim ran off one shared per-register counter, walking `collected` in
+    discover_sources()' name order, so whichever source sorted first consumed
+    the entire ceiling and the ones behind it were dropped document by document
+    until nothing was left. Measured against the real corpus at
+    `--max-register-multiple 1.0`, that removed manpages and capec from the
+    build outright — and a source reduced to zero carries docs=0, chars=0 and
+    error="", so balance_report's register table (`[s for s in stats if
+    s.docs]`) skipped it and the failure list (`[s for s in stats if s.error]`)
+    skipped it too. Two whole upstreams left the corpus and nothing said so.
+    """
+
+    def _corpus(self):
+        # Both SYSTEM, in the proportion the defect was found at: kerneldocs
+        # sorts first and is five times the size of manpages (34.8M against
+        # 7.0M in the corpus this came out of).
+        return {
+            "kerneldocs": _docs("kerneldocs", 350, 1000, Register.SYSTEM),
+            "manpages": _docs("manpages", 70, 1000, Register.SYSTEM),
+            "sigma": _docs("sigma", 100, 1000, Register.DETECTION),
+        }
+
+    #: Only two registers are present here, covering 0.37 of the target mix, so
+    #: the multiple has to clear 1/0.37 for the cap to be reachable at all —
+    #: below that every register is over its ceiling at every size and the
+    #: ceiling solves to zero. 3.0 puts SYSTEM over and leaves DETECTION whole,
+    #: which is the shape the starvation needs.
+    MULTIPLE = 3.0
+
+    def test_the_smaller_source_is_not_starved_by_the_one_that_sorts_first(self):
+        collected = self._corpus()
+        stats = _stats_for(collected)
+        build_mod._cap_register_share(collected, stats, self.MULTIPLE)
+
+        by = {s.name: s for s in stats}
+        assert by["manpages"].docs == 70, "the smaller SYSTEM source paid for the larger one"
+        assert by["kerneldocs"].docs < 350, "the cap did not bite at all"
+        assert by["sigma"].docs == 100, "an uncapped register was trimmed"
+
+    def test_a_source_a_cap_empties_is_named(self):
+        """Loudness is the second half of the fix, and it outlives the first.
+
+        Sharing the ceiling makes starvation unlikely rather than impossible —
+        a ceiling small enough still zeroes a source. The report only ever looks
+        at `docs` and `error`, so the source has to appear in one of them or it
+        appears nowhere.
+        """
+        collected = {"kerneldocs": _docs("kerneldocs", 350, 1000, Register.SYSTEM),
+                     "manpages": _docs("manpages", 70, 1000, Register.SYSTEM)}
+        stats = _stats_for(collected)
+        build_mod._note_if_emptied(stats[1], 70, [], "--max-register-multiple 1.0")
+        assert "0 documents" in stats[1].error
+        assert "manpages" in balance_report(stats)
+
+    def test_per_source_drops_are_printed_not_only_register_totals(self, capsys):
+        """_apply_balance already reports who paid; this did not.
+
+        A register's before/after totals cannot tell you which source lost,
+        and which source lost is the thing that goes wrong here.
+        """
+        collected = self._corpus()
+        build_mod._cap_register_share(collected, _stats_for(collected), self.MULTIPLE)
+        out = capsys.readouterr().out
+        assert "kerneldocs" in out.split("register cap at", 1)[1]
+
+    def test_a_cap_that_solves_to_zero_is_refused(self, capsys):
+        """The same reachability trap the source cap has, one level up.
+
+        With only DETECTION present, `--max-register-multiple 1.6` gives a
+        ceiling of 0.13 x 1.6 of a total that the cap itself keeps shrinking:
+        the iteration is a contraction onto zero, and ten passes of it leave a
+        ceiling that deletes the corpus.
+        """
+        collected = {"sigma": _docs("sigma", 100, 1000, Register.DETECTION)}
+        stats = _stats_for(collected)
+        build_mod._cap_register_share(collected, stats, 1.6)
+
+        assert stats[0].docs == 100, "the cap solved to zero and deleted the corpus"
+        assert "REGISTER CAP NOT APPLIED" in capsys.readouterr().out
+
+
+class TestTheDirectoryAndTheReportDescribeOneCorpus:
+    """What is on disk after a build is what the balance report just described.
+
+    Nothing removed anything from out_dir, and read_documents() globs *.jsonl
+    unconditionally. So a source that timed out, failed its fetch or was emptied
+    by a cap kept its *previous* build's documents in the corpus, while the
+    report — built from this run's stats — recorded it as contributing nothing.
+    The watchdog's guarantee, "skipped and named is honest; truncated and
+    counted is not", held in memory and not on disk: the shards, the tokenizer
+    and every measurement downstream follow the directory, not the report.
+    """
+
+    def _build(self, tmp_path, monkeypatch, specs, **kw):
+        monkeypatch.setattr(build_mod, "discover_sources", lambda: list(specs))
+        kw.setdefault("min_chars", 1)
+        kw.setdefault("max_source_share", 0.0)
+        return build(tmp_path / "out", tmp_path / "cache", **kw)
+
+    def test_a_failed_source_loses_its_previous_build(self, tmp_path, monkeypatch, capsys):
+        good = _adapter(tmp_path, monkeypatch, _DISTINCT)
+        self._build(tmp_path, monkeypatch, [good])
+        path = tmp_path / "out" / f"{good.name}.jsonl"
+        assert path.is_file(), "the first build wrote nothing to fail over"
+
+        broken = _adapter(tmp_path, monkeypatch, _FAILING_FETCH, name=good.name)
+        stats = self._build(tmp_path, monkeypatch, [broken])
+
+        assert stats[0].docs == 0 and "fetch failed" in stats[0].error
+        assert not path.exists(), "yesterday's documents are still in today's corpus"
+        assert list(read_documents(tmp_path / "out")) == []
+        out = capsys.readouterr().out
+        assert "REMOVED" in out and good.name in out
+
+    def test_only_keeps_the_other_sources_in_the_provenance_record(self, tmp_path, monkeypatch):
+        """`--only` rebuilds one file and leaves the rest; the record must say so.
+
+        _write_provenance was handed the *filtered* spec list, so `--only sigma`
+        rewrote PROVENANCE.md down to a one-row table while fourteen other
+        sources' JSONL sat in the same directory, still read by every consumer
+        and now with no licence recorded anywhere. source.py names a corpus
+        whose licensing cannot be reconstructed as the thing this project must
+        not become.
+        """
+        a = _adapter(tmp_path, monkeypatch, _DISTINCT)
+        b = _adapter(tmp_path, monkeypatch, _DISTINCT)
+        self._build(tmp_path, monkeypatch, [a, b])
+        self._build(tmp_path, monkeypatch, [a, b], only=[a.name])
+
+        assert (tmp_path / "out" / f"{b.name}.jsonl").is_file(), \
+            "--only deleted a file it was not asked to rebuild"
+        prov = (tmp_path / "out" / "PROVENANCE.md").read_text(encoding="utf-8")
+        assert a.name in prov and b.name in prov
+        assert "Carried over" in prov, "a mixed directory has to be stated, not hidden"
+
+    def test_a_file_no_source_claims_is_named_and_left_alone(self, tmp_path, monkeypatch, capsys):
+        """A renamed or deleted adapter leaves data nothing can attribute.
+
+        Deleting it would be guessing; staying quiet about it is worse, because
+        read_documents() still reads it into the shards and no licence can be
+        stated for it.
+        """
+        a = _adapter(tmp_path, monkeypatch, _DISTINCT)
+        (tmp_path / "out").mkdir(parents=True, exist_ok=True)
+        orphan = tmp_path / "out" / "byhand.jsonl"
+        orphan.write_text(json.dumps({"text": "hand placed", "source": "?",
+                                      "register": "prose", "side": "neutral",
+                                      "ident": "0"}) + "\n", encoding="utf-8")
+        self._build(tmp_path, monkeypatch, [a])
+
+        assert orphan.is_file(), "it deleted data it could not identify"
+        out = capsys.readouterr().out
+        assert "byhand.jsonl" in out and "no provenance" in out.lower()
+        prov = (tmp_path / "out" / "PROVENANCE.md").read_text(encoding="utf-8")
+        assert "byhand.jsonl" in prov
+
+
+class TestChildOutcomeIsVerified:
+    """A child that died without saying so must not read as an empty source.
+
+    _child_main's inner ``except BaseException`` sits *inside* the
+    ``with docs_path.open(...)`` block, so it covers neither opening the file nor
+    the implicit flush-and-close when the block exits — which is exactly where an
+    ENOSPC or EIO on the external volume this corpus is built on lands. The
+    status left behind is then indistinguishable from a clean run that yielded
+    nothing, and the parent read it as one: docs=0, chars=0, error="". A dead
+    child and an empty upstream became the same event in the report, with
+    nothing in common as fixes.
+    """
+
+    def test_the_status_a_dead_child_leaves_is_the_one_this_guards(self, tmp_path):
+        """Pin the premise in a real child, so the class is not theoretical.
+
+        Out of process on purpose: _child_main's first act is os.setsid(), and
+        detaching the pytest process from its own session to save a fork is not
+        a trade worth making.
+        """
+        root = Path(__file__).resolve().parents[1]
+        script = (
+            "import sys\n"
+            "from pathlib import Path\n"
+            f"sys.path.insert(0, {str(root)!r})\n"
+            "from training.corpus.build import _child_main\n"
+            "from training.corpus.source import Register, Side, SourceSpec\n"
+            "spec = SourceSpec(name='probe', license='throwaway',\n"
+            "                  url='https://example.invalid', register=Register.PROSE,\n"
+            "                  side=Side.NEUTRAL, fetch=lambda p: p,\n"
+            "                  documents=lambda p: iter(()))\n"
+            f"here = Path({str(tmp_path)!r})\n"
+            "_child_main(spec, here, here / 'gone' / 'documents.jsonl',\n"
+            "            here / 'status.json')\n"
+        )
+        # check=False and meant: the child is expected to die here.
+        proc = subprocess.run([sys.executable, "-c", script], check=False,
+                              capture_output=True, text=True)
+        assert "FileNotFoundError" in proc.stderr, proc.stderr
+        assert json.loads((tmp_path / "status.json").read_text(encoding="utf-8")) == {
+            "phase": "documents", "error": "", "emitted": 0}
+
+    def test_a_child_that_stopped_without_an_error_is_fatal(self, tmp_path):
+        fatal = build_mod._child_fatal(
+            {"phase": "documents", "error": "", "emitted": 0},
+            tmp_path / "documents.jsonl", 12.0)
+        assert "cannot be trusted" in fatal, fatal
+
+    def test_a_clean_child_is_accepted(self, tmp_path):
+        docs = tmp_path / "documents.jsonl"
+        docs.write_text('{"a": 1}\n{"a": 2}\n', encoding="utf-8")
+        assert build_mod._child_fatal(
+            {"phase": "ok", "error": "", "emitted": 2}, docs, 1.0) == ""
+
+    def test_a_source_that_raised_part_way_still_hands_over_what_it_wrote(self, tmp_path):
+        """documents() raising mid-stream is the legitimate partial yield.
+
+        It is what the in-process path does too, and the prefix is a real prefix
+        of a real source that the child recorded honestly. Only an *unreported*
+        ending is untrustworthy.
+        """
+        docs = tmp_path / "documents.jsonl"
+        docs.write_text('{"a": 1}\n', encoding="utf-8")
+        assert build_mod._child_fatal(
+            {"phase": "documents", "error": "ValueError: bad row", "emitted": 1},
+            docs, 1.0) == ""
+
+    def test_a_jsonl_shorter_than_the_child_claims_is_refused_whole(self, tmp_path):
+        """Second line of defence, for a truncation that raised nowhere.
+
+        A truncation landing on a line boundary parses perfectly, and a short
+        source counted as whole is the exact outcome the timeout path refuses.
+        """
+        docs = tmp_path / "documents.jsonl"
+        docs.write_text('{"a": 1}\n{"a": 2}\n', encoding="utf-8")
+        fatal = build_mod._child_fatal(
+            {"phase": "ok", "error": "", "emitted": 5}, docs, 1.0)
+        assert "truncated" in fatal, fatal

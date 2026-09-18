@@ -97,6 +97,7 @@ the build, on their own machine; this project ships the adapter, not the corpus.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -358,7 +359,13 @@ def _extract(staging: Path) -> tuple[int, int, str]:
                         shutil.copyfileobj(handle, out)
                     if relative.startswith(f"{_SUBTREE}/"):
                         written += 1
-    except (urllib.error.URLError, tarfile.TarError, TimeoutError, OSError) as exc:
+    # http.client.HTTPException is in the tuple for IncompleteRead, which a body
+    # that ends early raises and which is NOT an OSError — its MRO is
+    # HTTPException -> Exception. Uncaught, a truncated transfer partway through
+    # a 1.5 GB stream escapes as something no caller in this package catches,
+    # instead of the "could not fetch" this source is supposed to report.
+    except (urllib.error.URLError, http.client.HTTPException, tarfile.TarError,
+            TimeoutError, OSError) as exc:
         raise SourceError(f"kerneldocs: could not fetch {_TARBALL_URL}: {exc}") from exc
 
     if written < _MIN_FILES:

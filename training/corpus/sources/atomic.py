@@ -33,8 +33,8 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import tarfile
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
@@ -63,6 +63,29 @@ _REPO = "https://github.com/redcanaryco/atomic-red-team"
 _MEMBER = re.compile(r"^[^/]+/atomics/(T\d{4}(?:\.\d{3})?)/(T\d{4}(?:\.\d{3})?\.yaml)$")
 _LICENSE_MEMBER = re.compile(r"^[^/]+/LICENSE\.txt$")
 
+#: A ceiling on one archive member. Extraction below used to be
+#: ``write_bytes(stream.read())``, one allocation of whatever the member
+#: declared, and NUL bytes gzip at roughly 1000:1 — so a single ``atomics/
+#: T1234/T1234.yaml`` holding 8 GiB of them leaves this 167 MB tarball looking
+#: entirely ordinary on the wire and then asks for an 8 GiB allocation. On this
+#: machine that is a MemoryError that kills the build, or an OOM kill that picks
+#: whatever else is running.
+#:
+#: Checked against ``member.size`` *before* extracting, which is sound rather
+#: than trusting: tarfile bounds the reader it returns to exactly the declared
+#: length, so a member cannot deliver more than its header claims. The largest
+#: real atomic is 94 KB, so this leaves a hundred and seventy times the room it
+#: needs and still refuses a bomb.
+_MAX_MEMBER_BYTES = 16 * 1024 * 1024
+
+#: A ceiling on the whole tarball, passed to :func:`training.corpus.net.download`
+#: so it is enforced as the bytes arrive rather than measured afterwards. The
+#: archive was 167 MB when this was written — it is mostly documentation images
+#: none of which is kept — so this leaves three times the room it needs. Stated
+#: here rather than left to net's default because the size this source expects
+#: is a fact about this source.
+_MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
+
 #: Written only after extraction finishes, so an interrupted fetch is retried
 #: rather than mistaken for a populated cache.
 _MARKER = ".fetched.json"
@@ -87,13 +110,19 @@ def _fetch(cache_dir: Path) -> Path:
     ourselves from two validated ``T####`` components makes path traversal
     unrepresentable without depending on ``filter="data"`` (3.12+ only).
 
-    TLS goes through :func:`training.corpus.net.ssl_context` rather than
-    ``urlopen``'s default, because the python.org macOS interpreter this project
-    runs on has an empty CA store and would otherwise fail on a working network.
-    That helper is shared on purpose: three private copies of trust-store logic
-    is how one of them quietly drifts into ``CERT_NONE``. The body is still
-    streamed here rather than going through ``net.download``, which buffers the
-    whole response in memory — this tarball is 167 MB.
+    The transfer goes through :func:`training.corpus.net.download`, which is the
+    project's one door to the network: verified TLS from the shared trust store
+    (the python.org macOS interpreter this project runs on has an empty CA store
+    and would otherwise fail on a working network), redirects that may not leave
+    HTTPS, and a ceiling enforced against bytes as they arrive.
+
+    This function used to hand-roll its own ``urlopen`` streaming loop, with a
+    comment saying ``net.download`` could not be used because it buffered the
+    whole response in memory and this tarball is 167 MB. That was true and it is
+    no longer: ``download`` streams. The private loop is gone rather than left
+    working, because a second copy of the door does not get the door's later
+    fixes — this one was still following redirects with the stock opener, which
+    happily downgrades to plaintext ``http`` on hop two.
     """
     cache_dir.mkdir(parents=True, exist_ok=True)
     marker = cache_dir / _MARKER
@@ -102,26 +131,19 @@ def _fetch(cache_dir: Path) -> Path:
         return cache_dir
 
     archive = cache_dir / ".download.tar.gz"
-    request = urllib.request.Request(_TARBALL, headers={"User-Agent": net.USER_AGENT})
     written = 0
     # One finally for both stages: whatever goes wrong — a dead trust store, a
     # truncated body, a KeyboardInterrupt mid-stream — the partial archive is
     # removed rather than left in the cache for a later run to trip over.
     try:
         try:
-            with urllib.request.urlopen(
-                request, timeout=300, context=net.ssl_context()
-            ) as response:
-                if response.status != 200:
-                    raise SourceError(
-                        f"atomic: {_TARBALL} returned HTTP {response.status}"
-                    )
-                with archive.open("wb") as out:
-                    while chunk := response.read(1 << 20):
-                        out.write(chunk)
-        except net.NetworkError as exc:  # no CA anywhere; the message says how to fix it
-            raise SourceError(f"atomic: {exc}") from exc
-        except OSError as exc:  # URLError and friends are all OSError subclasses
+            net.download(_TARBALL, archive, timeout=300,
+                         max_bytes=_MAX_ARCHIVE_BYTES)
+        # One clause: net.download's contract is that every failure arrives as
+        # NetworkError — a dead trust store (whose message says how to fix it),
+        # a non-200, a truncated body, a refused redirect, a body over the
+        # ceiling.
+        except net.NetworkError as exc:
             raise SourceError(f"atomic: could not download {_TARBALL}: {exc}") from exc
 
         try:
@@ -129,10 +151,16 @@ def _fetch(cache_dir: Path) -> Path:
                 for member in tar:
                     if not member.isfile():
                         continue
+                    # Before extracting anything, including the licence: see
+                    # _MAX_MEMBER_BYTES for why the tarball's own size is no
+                    # evidence about a member's.
+                    if member.size > _MAX_MEMBER_BYTES:
+                        continue
                     if _LICENSE_MEMBER.match(member.name):
                         stream = tar.extractfile(member)
                         if stream is not None:
-                            (cache_dir / "LICENSE.txt").write_bytes(stream.read())
+                            with stream, (cache_dir / "LICENSE.txt").open("wb") as out:
+                                shutil.copyfileobj(stream, out, 1 << 20)
                         continue
                     match = _MEMBER.match(member.name)
                     if match is None:
@@ -143,7 +171,13 @@ def _fetch(cache_dir: Path) -> Path:
                     technique, filename = match.group(1), match.group(2)
                     destination = atomics / technique
                     destination.mkdir(parents=True, exist_ok=True)
-                    (destination / filename).write_bytes(stream.read())
+                    # Copied a megabyte at a time rather than read() into one
+                    # buffer, so peak memory is a chunk and not the file. The
+                    # ceiling above makes this belt and braces; the shape is
+                    # here so a later edit that raises the ceiling does not
+                    # silently reintroduce the allocation.
+                    with stream, (destination / filename).open("wb") as out:
+                        shutil.copyfileobj(stream, out, 1 << 20)
                     written += 1
         except tarfile.TarError as exc:
             raise SourceError(

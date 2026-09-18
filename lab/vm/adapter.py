@@ -52,6 +52,35 @@ def _run_on_vm(argv: list[str], *, timeout: int = 30) -> tuple[int, str, str]:
     return proc.returncode, proc.stdout, proc.stderr
 
 
+def _run_on_vm_stdin(argv: list[str], payload: str, *,
+                     timeout: int = 30) -> tuple[int, str, str]:
+    """Run one argv list on the VM feeding *payload* on stdin, bounded.
+
+    The sibling of ``_run_on_vm`` for the two commands that must hand the VM a
+    payload without it ever appearing on a command line the VM shell parses
+    (``tee`` reads it from stdin). It is a separate function purely so the
+    timeout cannot be forgotten: base.run() states the rule for the whole runtime
+    — "A timeout is mandatory and finite" — because a blocked ``subprocess.run``
+    never *raises*, so ``Adapter.execute``'s except-to-Observation net cannot
+    catch it and the kernel's turn loop wedges forever with no observation and no
+    diagnostic. A half-open Lima SSH control connection on macOS wake is the
+    ordinary way that happens mid-run. On expiry we return the same
+    ``(-1, "", msg)`` tuple ``_run_on_vm`` uses, so a stall is just another failed
+    command to the caller rather than a hang.
+    """
+    full = ["limactl", "shell", "--workdir", "/", _VM, "--", *argv]
+    env = {**os.environ, "LIMA_HOME": _LIMA_HOME}
+    try:
+        proc = subprocess.run(full, input=payload, capture_output=True,
+                              text=True, timeout=timeout, env=env,
+                              errors="replace")
+    except FileNotFoundError:
+        raise AdapterError("limactl not found; is Lima installed?") from None
+    except subprocess.TimeoutExpired:
+        return -1, "", f"timed out after {timeout}s"
+    return proc.returncode, proc.stdout, proc.stderr
+
+
 def vm_available() -> bool:
     """Whether the lab VM is running and reachable."""
     rc, out, _ = _run_on_vm(["true"], timeout=10)
@@ -165,23 +194,28 @@ def _exploit_service(self: VMAdapter, verb: Verb, action: Action) -> Any:
         raise AdapterError(f"{path} not present on the VM")
 
     marker = "#!/bin/sh\n# whetstone marker\n"
-    # tee reads the payload from stdin, so the payload is never on a command
-    # line the VM shell parses.
-    write = subprocess.run(
-        ["limactl", "shell", "--workdir", "/", _VM, "--",
-         "sudo", "tee", path],
-        input=marker, capture_output=True, text=True,
-        env={**os.environ, "LIMA_HOME": _LIMA_HOME})
-    changed = write.returncode == 0
-
+    changed = False
     cleaned = None
-    if restore and changed:
-        restore_proc = subprocess.run(
-            ["limactl", "shell", "--workdir", "/", _VM, "--", "sudo", "tee", path],
-            input=original, capture_output=True, text=True,
-            env={**os.environ, "LIMA_HOME": _LIMA_HOME})
-        rc2, now, _ = _run_on_vm(["cat", path])
-        cleaned = now == original
+    try:
+        # tee reads the payload from stdin, so the payload is never on a command
+        # line the VM shell parses. A bounded run means a stalled write (a dead
+        # SSH transport on host wake) reports rc=-1 and falls through to the
+        # restore instead of hanging the whole episode.
+        rc_w, _, _ = _run_on_vm_stdin(["sudo", "tee", path], marker)
+        changed = rc_w == 0
+    finally:
+        # Restore lives in a finally, not behind ``if changed``, because the
+        # danger is precisely the path where the write did NOT cleanly succeed:
+        # a timed-out or half-applied write can leave the binary holding the
+        # marker, and the next run reads that corrupted file at ``cat path`` as
+        # its "original" baseline — so the following exercise would compare a
+        # tampered baseline against itself and call the cleanup a success. The
+        # revert therefore has to be attempted on every exit path, and its own
+        # write is bounded too so a dead VM cannot hang teardown either.
+        if restore:
+            _run_on_vm_stdin(["sudo", "tee", path], original)
+            rc_c, now, _ = _run_on_vm(["cat", path])
+            cleaned = rc_c == 0 and now == original
 
     return {"changed": path, "ran_as": "root", "wrote": changed,
             "cleanup": "succeeded" if cleaned else
@@ -193,8 +227,26 @@ def _exploit_service(self: VMAdapter, verb: Verb, action: Action) -> Any:
 @V.implements("detect.telemetry")
 def _telemetry(self: VMAdapter, verb: Verb, action: Action) -> Any:
     """Is auditd actually running and are rules loaded? The real blue posture."""
-    rc, active, _ = _run_on_vm(["systemctl", "is-active", "auditd"])
-    rc2, rules, _ = _run_on_vm(["sudo", "auditctl", "-l"], timeout=15)
+    rc, active, err = _run_on_vm(["systemctl", "is-active", "auditd"])
+    # ``is-active`` legitimately exits non-zero when auditd is simply not active
+    # and still prints the state ("inactive"/"failed") to stdout, so a non-zero
+    # rc here is an *answer*, not a failure — checking rc would misread a dead
+    # service as a broken query. The broken-query case is the command not running
+    # at all (systemctl missing, sudo denied, timeout), which ``_run_on_vm``
+    # surfaces as empty output. Reporting that as "auditd is not running" would
+    # assert the blue posture of a host we never managed to ask; fail loudly so
+    # it becomes a failed Observation instead of a fabricated all-clear.
+    if not active.strip():
+        raise AdapterError(
+            f"could not query auditd state on the VM: {err.strip()[:120]}")
+    rc2, rules, err2 = _run_on_vm(["sudo", "auditctl", "-l"], timeout=15)
+    # ``auditctl -l`` prints "No rules" (rc 0) when none are loaded, so empty
+    # output is never a legitimate "zero rules" — it means the listing itself
+    # failed (no auditctl, no sudo, timeout). Counting that as 0 rules would
+    # report a watched host as unwatched, the same inversion in miniature.
+    if rc2 != 0 and not rules.strip():
+        raise AdapterError(
+            f"could not list auditd rules on the VM: {err2.strip()[:120]}")
     running = active.strip() == "active"
     rule_lines = [ln for ln in rules.splitlines()
                   if ln.strip() and "No rules" not in ln]
@@ -230,17 +282,61 @@ def _detect_proc(self: VMAdapter, verb: Verb, action: Action) -> Any:
     fire only when the replaced binary later ran, which this lab does not do.
     """
     since = int(action.params.get("since_seconds", 300))
-    rc_now, now_s, _ = _run_on_vm(["date", "+%s"])
+    rc_now, now_s, err_now = _run_on_vm(["date", "+%s"])
     try:
         cutoff = int(now_s.strip()) - since
     except ValueError:
-        cutoff = 0
+        # A wrong window is worse than a crash: with no readable guest clock we
+        # cannot honour ``since_seconds`` at all, and the old ``cutoff = 0`` did
+        # not disable the check — it widened the window to all of history, so
+        # every stale keyed record in the 2000-line tail would count and a real
+        # gap could read as a hit. We cannot answer the question, so we refuse
+        # it; the raise becomes a failed Observation and ``detection_fired``
+        # returns None ("cannot tell"), never False.
+        raise AdapterError(
+            f"could not read the guest clock to size the detection window: "
+            f"date returned {now_s.strip()!r} ({err_now.strip()[:80]})")
 
-    rc, log, _ = _run_on_vm(["sudo", "tail", "-n", "2000",
-                             "/var/log/audit/audit.log"], timeout=20)
+    rc, log, err = _run_on_vm(["sudo", "tail", "-n", "2000",
+                              "/var/log/audit/audit.log"], timeout=20)
+    # A tail that could not run tells us nothing about the control. The old code
+    # ignored ``rc`` and let a failed read fall through as an empty log, so a
+    # permission error or a 20s timeout on a loaded VM returned ``logged: False``
+    # — indistinguishable from a real "auditd saw nothing", and the kernel would
+    # then write a detection_gap manufactured entirely out of a broken query.
+    # Mirror ``_observe``: an error with no output is raised, so the turn is a
+    # failed Observation and the gap is never fabricated.
+    if rc != 0 and not log:
+        raise AdapterError(
+            f"could not read the audit log on the VM: {err.strip()[:160]}")
+
     hits = 0
     for line in log.splitlines():
-        if f"key=\"{AUDIT_KEY}\"" not in line and AUDIT_KEY not in line:
+        # Count only a real, recorded write to the watched path. The ``-w -p wa``
+        # watch tags its SYSCALL record with key="whetstone_svc" — but auditd
+        # tags its OWN rule-administration records with that same key, emitting a
+        # ``type=CONFIG_CHANGE op=add_rule key="whetstone_svc"`` line every time
+        # the rule is armed and ``op=remove_rule`` every time it is disarmed. The
+        # previous filter's second clause (a bare ``AUDIT_KEY in line``) subsumed
+        # its first and reduced the whole test to "does this line mention the
+        # string anywhere", so arming the watch — or a stale disarm from an
+        # earlier run — counted as a detected write. That inverts the project's
+        # central measurement: ARMING the control would manufacture the proof it
+        # fired. So we require the access record itself:
+        #   * key="whetstone_svc" in its exact keyed form (no bare-substring
+        #     fallback, which is what let CONFIG_CHANGE through);
+        #   * type=SYSCALL — the record of the syscall that touched the file,
+        #     which a CONFIG_CHANGE line never is;
+        #   * success=yes — the write actually completed; a denied/failed syscall
+        #     is not evidence the binary changed.
+        # The explicit CONFIG_CHANGE exclusion is redundant given the SYSCALL
+        # requirement, but it is kept so the intent survives a later refactor
+        # that loosens the type check.
+        if f'key="{AUDIT_KEY}"' not in line:
+            continue
+        if "type=SYSCALL" not in line or "type=CONFIG_CHANGE" in line:
+            continue
+        if "success=yes" not in line:
             continue
         m = _AUDIT_EPOCH.search(line)
         if m and int(m.group(1)) >= cutoff:

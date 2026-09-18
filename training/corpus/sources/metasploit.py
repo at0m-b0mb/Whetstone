@@ -144,6 +144,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -1225,9 +1226,19 @@ def _render(source: str, msf_path: str, markdown: str | None) -> str | None:
 
 def _git(*args: str, cwd: Path | None = None) -> None:
     argv = ["git", "-c", f"http.userAgent={USER_AGENT}", *args]
+    # GIT_TERMINAL_PROMPT=0 is not optional here. ``capture_output`` redirects
+    # the pipes but not the controlling tty, and git's credential prompt reads
+    # /dev/tty — so a clone that meets an auth challenge (a proxy, rate
+    # limiting, a plain 401) blocks on a username prompt for the full
+    # _GIT_TIMEOUT and then fails with "timed out", a message that points at
+    # the network rather than at the prompt that actually happened. Fifteen
+    # silent minutes twice per fetch. Both sibling git-backed adapters set
+    # these two variables for the same reason.
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_LFS_SKIP_SMUDGE": "1"}
     try:
         proc = subprocess.run(argv, cwd=None if cwd is None else str(cwd),
-                              capture_output=True, timeout=_GIT_TIMEOUT)
+                              capture_output=True, timeout=_GIT_TIMEOUT,
+                              env=env)
     except FileNotFoundError as exc:
         raise SourceError(
             "metasploit: git is not installed. This source needs it: the "
@@ -1245,6 +1256,80 @@ def _git(*args: str, cwd: Path | None = None) -> None:
             f"metasploit: git {args[0]} failed ({proc.returncode}): "
             f"{detail[-800:] or '(no stderr)'}"
         )
+
+
+def _prune_symlinks(tree: Path) -> int:
+    """Unlink every symlink in ``tree``. Returns how many there were.
+
+    This is the one adapter in the package whose transport materialises
+    symlinks. Every tarball source is protected for free by
+    ``if not member.isfile(): continue``, which drops link members before they
+    reach the filesystem; a symlink stored in a git tree is checked out as a
+    real symlink on disk and nothing filters it. So the filter is here, run on
+    the staging tree before it is renamed into place, which means every later
+    ``os.walk``, ``is_file`` and ``read_text`` in this module is operating on a
+    tree that provably contains no links out of it.
+
+    The count is recorded in the marker rather than raised on: upstream is free
+    to carry a benign symlink, and a build that dies on one would be a worse
+    failure than a build that says how many it removed. The read side in
+    :func:`_module_files` guards independently, because a cache populated by a
+    build from before this existed is never re-pruned — ``_fetch`` returns on
+    the marker without touching the network or the tree.
+    """
+    removed = 0
+    # topdown=False so a symlinked directory's own entry is reached after the
+    # walk has finished with its level; followlinks=False so the walk never
+    # descends through one in the first place.
+    for dirpath, dirnames, filenames in os.walk(tree, topdown=False,
+                                                followlinks=False):
+        here = Path(dirpath)
+        for name in (*filenames, *dirnames):
+            path = here / name
+            if path.is_symlink():
+                path.unlink(missing_ok=True)
+                removed += 1
+    return removed
+
+
+def _module_files(modules: Path, tree: str) -> list[Path]:
+    """Every ``.rb`` file under ``modules/<tree>``, sorted, following no symlink.
+
+    ``os.walk(followlinks=False)`` rather than ``Path.rglob``, and the reason is
+    not style. ``rglob("*.rb")`` will not recurse *through* a symlinked
+    subdirectory, but it does scandir the glob's own starting path — and that
+    start is ``modules/<tree>``, one of four fixed names. A tree entry checking
+    ``modules/post`` out as a link to ``$HOME`` would have had the walk leave
+    the cache entirely, count what it found toward ``_MIN_MODULE_FILES`` so the
+    floor check passed, and read every ``.rb`` under the user's home directory
+    into the training corpus. At the leaf the same hole is narrower and just as
+    real: ``Path.is_file()`` follows a link, so
+    ``modules/exploits/linux/local/x.rb -> ~/.ssh/id_rsa`` reads the key.
+
+    The glob root itself is therefore checked first, symlinked directories are
+    pruned out of ``dirnames`` in place, and each file is checked as well.
+
+    :func:`_fetch` counts with this and :func:`_documents` reads with it, on
+    purpose: a floor that is checked against a different set of files than the
+    one that is later read is a floor that can pass on files nobody emits.
+    """
+    root = modules / tree
+    if root.is_symlink() or not root.is_dir():
+        return []
+    found: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        here = Path(dirpath)
+        dirnames[:] = sorted(
+            name for name in dirnames if not (here / name).is_symlink()
+        )
+        for name in sorted(filenames):
+            if not name.endswith(".rb"):
+                continue
+            path = here / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            found.append(path)
+    return sorted(found)
 
 
 def _fetch(cache_dir: Path) -> Path:
@@ -1277,11 +1362,13 @@ def _fetch(cache_dir: Path) -> Path:
         # modules may legally be trained on.
         _git("sparse-checkout", "set", *_SPARSE_PATHS, cwd=staging)
 
-        found = sum(
-            1 for tree in _TREES
-            for path in (staging / "modules" / tree).rglob("*.rb")
-            if path.is_file()
-        )
+        # Before anything walks the checkout. git is the only transport in this
+        # package that writes symlinks to disk, and the whole tree is upstream
+        # data. See :func:`_prune_symlinks`.
+        pruned = _prune_symlinks(staging)
+
+        found = sum(len(_module_files(staging / "modules", tree))
+                    for tree in _TREES)
         if found < _MIN_MODULE_FILES:
             raise SourceError(
                 f"metasploit: only {found} module files under modules/"
@@ -1305,6 +1392,7 @@ def _fetch(cache_dir: Path) -> Path:
                     "sparse_paths": list(_SPARSE_PATHS),
                     "commit": head,
                     "module_files": found,
+                    "pruned_symlinks": pruned,
                     "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                 },
                 indent=2,
@@ -1333,11 +1421,16 @@ def _documents(path: Path) -> Iterator[Document]:
 
     excluded = _excluded_globs(root / "LICENSE")
     docs = root / "documentation" / "modules"
+    # ``documentation/`` is checked out by the same clone as ``modules/`` and is
+    # therefore the same upstream-controlled data. Resolved once here so the
+    # per-module containment check below is a comparison rather than another
+    # realpath, and dropped entirely if the directory is itself a link out.
+    docs_root = docs.resolve() if docs.is_dir() else None
+    if docs_root is not None and not docs_root.is_relative_to(root.resolve()):
+        docs_root = None
 
     for tree in _TREES:
-        for file in sorted((modules / tree).rglob("*.rb")):
-            if not file.is_file():
-                continue
+        for file in _module_files(modules, tree):
             relative = file.relative_to(root).as_posix()
             # A GPL module is dropped whole. See the module docstring: the
             # licence on SPEC has to be true of every document emitted.
@@ -1355,7 +1448,13 @@ def _documents(path: Path) -> Iterator[Document]:
 
             doc_file = docs / f"{msf_path}.md"
             markdown = None
-            if doc_file.is_file():
+            # is_symlink() on the file alone is not enough: the link can be any
+            # component of the path, and ``a -> /etc`` with a real ``b.md``
+            # inside it reads as a plain file. Containment is the only check
+            # that covers both, and it costs one realpath per module that
+            # actually has a page.
+            if (docs_root is not None and doc_file.is_file()
+                    and doc_file.resolve().is_relative_to(docs_root)):
                 try:
                     markdown = doc_file.read_text(encoding="utf-8", errors="replace")
                 except OSError:

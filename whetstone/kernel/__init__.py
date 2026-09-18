@@ -36,6 +36,16 @@ stating a fact about the platform, not failing transiently. macOS has no
 registry. Retrying is the cheapest way to burn a turn budget, and the
 distinction only exists because :class:`~whetstone.actions.Observation` carries
 it separately from ``ok``.
+
+A fifth property is the one the findings are only as good as. **Both ends of a
+detection verdict have to be earned.** "Nothing fired" is the artefact, so a
+probe that could not run must not produce it, and a probe that was never aimed
+at the technique must not retract it either — "was anything logged in the last
+five minutes" is a different question from "was this logged", and answering the
+first suppresses exactly the gaps the tool exists to find. The three finding
+kinds stay distinct for the same reason: ``detection_gap`` is a claim about the
+control, ``no_coverage`` a claim about the catalogue, and ``observation`` the
+honest "cannot tell" that neither of the others is allowed to absorb.
 """
 
 from __future__ import annotations
@@ -57,6 +67,50 @@ __all__ = [
 # did the blue side see it?
 # --------------------------------------------------------------------------
 
+#: The one ``detect.*`` parameter that narrows *when* rather than *what*. Every
+#: other parameter a detection verb declares exists to aim it at a particular
+#: technique, which is what makes the distinction below computable from the
+#: schema instead of from a hand-maintained list.
+_WINDOW_PARAM = "since_seconds"
+
+#: Parameter types whose values can be lifted out of a red observation without
+#: any conversion. Restricted to these so that a value taken from an adapter
+#: payload can never make :meth:`Verb.bind` raise mid-episode: ``Param.validate``
+#: accepts any non-blank string for all three, so the aim either lands or is
+#: skipped, and never crashes the loop.
+_TEXT_PARAM_TYPES = frozenset({"string", "path", "host"})
+
+
+def _source_unqueryable(data: dict[str, Any]) -> bool:
+    """Whether the payload states that the log behind it could not be read.
+
+    These fields are *provenance*, not a verdict. An adapter that could not open
+    the audit log, or that found the source switched off, still has to return
+    something, and all three production adapters return a falsey verdict beside
+    a marker saying why — ``source: "none"`` plus a ``gap`` note on Linux when
+    ``ausearch`` is absent, ``enabled: false`` on Windows when process-creation
+    auditing is off, ``telemetry_available: false`` on macOS where keychain
+    reads are not audited at all. Read as a verdict, every one of those is
+    "the control stayed silent", which is a detection gap invented out of a
+    query that never ran.
+
+    ``reason`` is deliberately absent from this set even though Linux happens to
+    attach it to the same payloads. It is a generic explanation field, and an
+    adapter is just as likely to use it for "no matching events" — a genuine
+    negative. Treating that as provenance would suppress a real gap, which is
+    the same failure pointing the other way, and the two markers that matter on
+    Linux already carry ``source: "none"``.
+    """
+    if data.get("source") == "none":
+        return True
+    if data.get("gap"):
+        return True
+    for key in ("enabled", "telemetry_available"):
+        if data.get(key) is False:
+            return True
+    return False
+
+
 def detection_fired(observation: Observation) -> bool | None:
     """Whether a ``detect.*`` observation indicates the control fired.
 
@@ -71,6 +125,17 @@ def detection_fired(observation: Observation) -> bool | None:
     ``process_creation_auditing`` on macOS, hit counts elsewhere. Standardising
     them is worth doing; guessing in the meantime is not, hence the explicit
     ``None``.
+
+    ``ok`` and ``unsupported`` are not enough of a guard on their own, because
+    the adapters report "I could not query the log" as a *successful* call with
+    a falsey verdict rather than as a failure. So a falsey verdict is checked
+    against :func:`_source_unqueryable` before it is believed.
+
+    That check is asymmetric on purpose, and the asymmetry is the whole point: a
+    disabled or unreadable source makes *absence* meaningless, not presence. On
+    Windows, Sysmon can record a process creation while Security/4688 auditing
+    is off, so the payload carries ``enabled: false`` alongside a real hit;
+    discarding that hit would hide a control that genuinely fired.
     """
     if not observation.ok or observation.unsupported:
         return None
@@ -78,6 +143,14 @@ def detection_fired(observation: Observation) -> bool | None:
     if not isinstance(data, dict):
         return None
 
+    verdict = _read_verdict(data)
+    if verdict is False and _source_unqueryable(data):
+        return None
+    return verdict
+
+
+def _read_verdict(data: dict[str, Any]) -> bool | None:
+    """The bare reading of a detection payload, before provenance is weighed."""
     for key in ("logged", "fired", "detected", "present"):
         if isinstance(data.get(key), bool):
             return data[key]
@@ -109,6 +182,23 @@ class Finding:
     def to_dict(self) -> dict[str, Any]:
         return {"kind": self.kind, "technique": self.technique,
                 "expected": self.expected, "detail": self.detail}
+
+
+def _inconclusive(technique: str, expected: str, why: str = "") -> Finding:
+    """The "cannot tell" finding, phrased the one way it is ever phrased.
+
+    There is more than one route to it — the probe failed to run, the log it
+    reads was not queryable, the hit it found could not be attributed — and each
+    route contributes its own ``why``. The opening and closing clauses are
+    written once here because they are the claim itself, and a claim readers
+    (and the corpus tests that grep for it) have to recognise in two phrasings is
+    a claim that will eventually drift into meaning two different things.
+    """
+    return Finding(
+        kind="observation", technique=technique, expected=expected,
+        detail=(f"{expected} could not establish whether it fired{why}; "
+                "this is not evidence of a gap"),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -307,7 +397,7 @@ class Kernel:
                 continue
 
             if turn.succeeded and self.pair_detections:
-                self._check_detections(episode, action, target)
+                self._check_detections(episode, turn, target)
 
         return episode
 
@@ -333,15 +423,48 @@ class Kernel:
         return Turn(action=action, decision=result.decision,
                     observation=result.observation)
 
+    @staticmethod
+    def _aim(probe: Verb, evidence: Observation | None) -> dict[str, Any]:
+        """Discriminator values for ``probe``, lifted from the red observation.
+
+        A red handler is the only thing in the system that knows what it just
+        touched — the ExecStart binary it overwrote, the task name it created —
+        and a probe aimed at that is asking about the technique instead of about
+        the host's background noise. The convention is an exact name match: a
+        handler that wants ``detect.process_creation`` aimed returns the process
+        under the key ``image``, which is what that verb calls its own parameter.
+
+        An exact match is used rather than anything cleverer because a *wrong*
+        discriminator is worse than none at all. A probe aimed at an image the
+        log never recorded comes back empty, and an empty correlated probe reads
+        as a detection gap — so a guess at the right key name would manufacture
+        exactly the finding this method exists to make trustworthy. Nothing is
+        inferred from the verb id, the parameters or the payload's shape.
+        """
+        if evidence is None or not isinstance(evidence.data, dict):
+            return {}
+        aimed: dict[str, Any] = {}
+        for p in probe.params:
+            if p.name == _WINDOW_PARAM or p.type not in _TEXT_PARAM_TYPES:
+                continue
+            value = evidence.data.get(p.name)
+            if isinstance(value, str) and value.strip():
+                aimed[p.name] = value
+        return aimed
+
     def _check_detections(
-        self, episode: Episode, action: Action, target: str | None
+        self, episode: Episode, red: Turn, target: str | None
     ) -> None:
         """Run the detections a red verb declared, and record silence as a gap.
 
         The whole reason the red half of this catalogue exists. An exploit proves
         a hole; this proves nobody would have known, and defenders act on the
         second far faster than the first.
+
+        Takes the whole red :class:`Turn` rather than just its action because the
+        observation is what aims the probe — see :meth:`_aim`.
         """
+        action = red.action
         verb = self.gate.registry.get(action.verb_id)
         if verb.side is not Side.RED:
             return
@@ -364,6 +487,15 @@ class Kernel:
             probe = self.gate.registry.get(expected)
             params = {p.name: p.default for p in probe.params
                       if p.default is not None}
+            params.update(self._aim(probe, red.observation))
+            # Which of the probe's discriminators went unfilled. Bound before
+            # the probe runs, because it decides what its answer is worth: a
+            # probe with nothing to match on asks a broader question than the
+            # one that was put to it, and the two possible answers are worth
+            # very different amounts (see below).
+            unaimed = [p.name for p in probe.params
+                       if p.name != _WINDOW_PARAM and p.name not in params]
+
             from ..actions import TargetKind
             probe_action = probe.bind(
                 params,
@@ -372,14 +504,30 @@ class Kernel:
             episode.turns.append(turn)
 
             fired = detection_fired(turn.observation) if turn.observation else None
+            if fired is True and unaimed:
+                # An unaimed probe counts everything of its kind in the window,
+                # including the agent's own earlier turns and whatever else the
+                # host was doing. `detect.process_creation` with no `image` asks
+                # "was anything logged", not "was THIS logged", and reading that
+                # as the verdict on the red action silently suppresses a real
+                # gap — a purple tool that reports no gaps on exactly the hosts
+                # that have telemetry.
+                #
+                # Silence from the same probe still counts, and the asymmetry is
+                # not a fudge: nothing of this kind was logged in a window that
+                # contained the technique, so the technique was not logged. Only
+                # the positive is ambiguous.
+                episode.findings.append(_inconclusive(
+                    technique, expected,
+                    why=(": it found activity in the window but had no "
+                         f"{', '.join(unaimed)} to match against, so the hit "
+                         "may be unrelated to the technique"),
+                ))
+                continue
             if fired is True:
                 continue
             if fired is None:
-                episode.findings.append(Finding(
-                    kind="observation", technique=technique, expected=expected,
-                    detail=(f"{expected} could not establish whether it fired; "
-                            "this is not evidence of a gap"),
-                ))
+                episode.findings.append(_inconclusive(technique, expected))
                 continue
             episode.findings.append(Finding(
                 kind="detection_gap", technique=technique, expected=expected,

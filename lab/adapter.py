@@ -112,9 +112,22 @@ def _vuln_perms(self: SandboxAdapter, verb: Verb, action: Action) -> Any:
 
 @T.implements("vuln.credential_exposure")
 def _vuln_creds(self: SandboxAdapter, verb: Verb, action: Action) -> Any:
+    # An *assessment* verb reports that a credential is exposed; it must not
+    # become a second copy of the credential. The old shape returned the raw
+    # matching line — ``"line": "password = hunter2-do-not-ship"`` — which is the
+    # exact leak every real adapter is built to avoid: linux emits
+    # ``value: "***redacted***"`` (find_secrets), macOS a redacted preview,
+    # windows ``redact=True``, and the VM sibling here returns only path+
+    # technique. This adapter is the one whose observations become pretraining
+    # data, so leaving the secret in ``line`` would teach the model that this
+    # verb's output *includes* the value — the opposite of the contract. We now
+    # report the line NUMBER (matching linux's ``line`` field, which is an int)
+    # and a redacted value, keeping ``path`` and ``technique`` so the ground-truth
+    # Weakness still matches by technique.
     cfg = self.target.resolve("etc/acme.conf")
-    hits = [{"path": str(cfg), "line": ln.strip(), "technique": "T1552.001"}
-            for ln in cfg.read_text().splitlines()
+    hits = [{"path": str(cfg), "line": n, "kind": "password_assignment",
+             "value": "***redacted***", "technique": "T1552.001"}
+            for n, ln in enumerate(cfg.read_text().splitlines(), start=1)
             if "password" in ln.lower() or "secret" in ln.lower()]
     return {"findings": hits}
 

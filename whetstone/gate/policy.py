@@ -38,7 +38,7 @@ from enum import Enum
 from typing import Callable
 
 from ..actions import Action, Intent, Side, TargetKind, Verb
-from .engagement import Engagement
+from .engagement import Engagement, host_form_error
 
 __all__ = ["Verdict", "Decision", "decide", "RULES"]
 
@@ -143,6 +143,22 @@ def _r_scope_host(c: _Ctx) -> Decision | None:
 
 def _host_in_scope(c: _Ctx, label: str, host: str) -> Decision | None:
     where = "" if label == "target" else f"parameter {label!r}: "
+    # Form before scope, because a string that is not a host makes both the
+    # inclusion and the exclusion comparison meaningless: every adapter strips a
+    # `host:` prefix and cuts a port off at a colon before it dials, so the gate
+    # was matching one string and the socket was opening another. `*.lab.internal`
+    # matched `evil.example.com:443.lab.internal` and the probe went to
+    # evil.example.com; `host:dc01.lab.internal` slipped past the exclusion on
+    # dc01 and the adapter stripped the prefix back off. Denying the shape is
+    # what keeps the authorised string and the dialled string the same string.
+    if (problem := host_form_error(host)) is not None:
+        return Decision(
+            Verdict.DENY,
+            "scope.host.malformed",
+            f"{where}{host!r} {problem}. A host is written one way — a bare "
+            "hostname, an IPv4 literal or an IPv6 literal — because the gate "
+            "rules on the exact string an adapter will connect to.",
+        )
     excluded = c.engagement.scope.host_excluded(host)
     if excluded:
         return Decision(

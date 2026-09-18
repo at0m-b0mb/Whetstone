@@ -192,10 +192,21 @@ def _git(args: list[str], *, cwd: Path | None = None) -> str:
 
 
 def _count_advisories(tree: Path) -> int:
-    """Count checked-out advisory files in one walk, following no symlinks."""
+    """Count checked-out advisory files in one walk, following no symlinks.
+
+    ``followlinks=False`` stops the walk descending *into* a symlinked
+    directory; it does nothing about a symlinked file, which ``os.walk`` puts
+    in ``files`` like any other. Both halves are needed, and the file half is
+    checked here as well as in :func:`_advisory_paths` so the floor below is
+    counted against exactly the set of files that will later be read. A count
+    that includes entries the reader skips is a floor that passes on documents
+    nobody emits.
+    """
     total = 0
-    for _, _, files in os.walk(tree, followlinks=False):
-        total += sum(1 for name in files if _ADVISORY_RE.match(name))
+    for directory, _, files in os.walk(tree, followlinks=False):
+        here = Path(directory)
+        total += sum(1 for name in files
+                     if _ADVISORY_RE.match(name) and not (here / name).is_symlink())
     return total
 
 
@@ -528,9 +539,21 @@ def _advisory_paths(root: Path) -> list[Path]:
     """
     found: list[str] = []
     prefix_len = len(str(root)) + 1
-    for directory, _, files in os.walk(root, followlinks=False):
+    for directory, dirnames, files in os.walk(root, followlinks=False):
+        here = Path(directory)
+        # ``followlinks=False`` already stops the descent; pruning the names as
+        # well states the intent beside the file check rather than leaving it
+        # implied by a keyword argument two lines up.
+        dirnames[:] = [name for name in dirnames if not (here / name).is_symlink()]
         for name in files:
-            if _ADVISORY_RE.match(name):
+            # This is a git clone, so a symlink stored upstream is materialised
+            # on disk — the ``member.isfile()`` filter that protects every
+            # tarball adapter in this package does not apply here. A compromised
+            # commit adding ``GHSA-aaaa-bbbb-cccc.json`` as a link to an
+            # ``.npmrc``, a credentials file or another source's cache manifest
+            # would otherwise be matched by name, counted toward the floor, and
+            # opened and parsed by _documents on every build.
+            if _ADVISORY_RE.match(name) and not (here / name).is_symlink():
                 found.append(f"{directory}/{name}"[prefix_len:])
     found.sort(reverse=True)
     return [root / rel for rel in found]

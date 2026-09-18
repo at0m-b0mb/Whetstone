@@ -243,16 +243,57 @@ class TrainConfig:
     checkpoint_every: int = 500
     eval_every: int = 250
     log_every: int = 10
+    #: How many validation windows one evaluation scores. The val set is a
+    #: FIXED, deterministic set of windows — see ``training.pretrain
+    #: .val_window_starts`` — and not a fresh random draw, because a val curve
+    #: whose sample moves every time measures the sampler as much as the model,
+    #: and "best checkpoint" then means "luckiest draw". 512 is *exhaustive*
+    #: for every corpus this project has built: the v5 val split is 498,386
+    #: tokens, which is 486 non-overlapping windows of 1,025. The cap therefore
+    #: costs nothing today and exists only so that a corpus ten times larger
+    #: cannot quietly turn an evaluation that is 1% of wall clock into one that
+    #: is 17%.
+    val_windows: int = 512
 
     def total_tokens(self, model: ModelConfig) -> int:
         return self.tokens_per_param * model.n_params
 
     def total_steps(self, model: ModelConfig) -> int:
-        return max(1, self.total_tokens(model) // self.batch_tokens)
+        # Divided by the batch the run actually takes, not the one configured.
+        # Dividing a token budget by a batch 6% larger than reality is how a
+        # run reaches its step count having trained on 6% less than Chinchilla
+        # asked for, with nothing anywhere saying so.
+        return max(1, self.total_tokens(model) // self.effective_batch_tokens(model))
 
     def grad_accum_steps(self, model: ModelConfig) -> int:
+        """Micro-batches summed into one optimizer step.
+
+        Floor division, so a ``micro_batch * max_seq_len`` that does not divide
+        ``batch_tokens`` yields a *smaller* batch than the configured one: at
+        ``micro_batch=6`` and ctx 1024 this returns 10, for 61,440 tokens
+        against the 65,536 the learning rate was chosen for. A count of
+        micro-batches cannot be fractional, so the truncation itself has to
+        stay. What must not happen is the rest of the program going on to
+        report 65,536 anyway — which is what it did, in the step budget, in the
+        tokens/step line and in the wall-clock estimate, all three confidently
+        wrong while the loss curve looked unremarkable. Every number derived
+        from batch size now comes from ``effective_batch_tokens``, so nobody
+        can reintroduce that by reading ``batch_tokens`` directly.
+        """
         per_micro = self.micro_batch * model.max_seq_len
         return max(1, self.batch_tokens // per_micro)
+
+    def effective_batch_tokens(self, model: ModelConfig) -> int:
+        """Tokens per optimizer step this config actually delivers.
+
+        Equal to ``batch_tokens`` only when ``micro_batch * max_seq_len``
+        divides it. It can also come out *larger*: a micro_batch whose single
+        forward pass already exceeds ``batch_tokens`` clamps accumulation to 1
+        and doubles the batch instead of halving it. Both directions are
+        silent in the loss curve, which is why this is a named property rather
+        than an assumption anyone is expected to hold in their head.
+        """
+        return self.grad_accum_steps(model) * self.micro_batch * model.max_seq_len
 
 
 #: The staircase. Climb it in order; do not skip a rung because the previous one

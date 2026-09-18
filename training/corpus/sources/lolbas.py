@@ -101,6 +101,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import tarfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -138,6 +139,21 @@ _MEMBER = re.compile(r"^[^/]+/yml/([A-Za-z0-9_-]+)/([A-Za-z0-9._+-]+\.yml)$")
 #: carries both the licence statement and MITRE's ATT&CK grant.
 _LICENSE_MEMBERS = {"LICENSE": "LICENSE", "NOTICE.md": "NOTICE.md"}
 _ROOTED_LICENSE = re.compile(r"^[^/]+/(LICENSE|NOTICE\.md)$")
+
+#: A ceiling on one archive member. Extraction below used to be
+#: ``write_bytes(stream.read())``, one allocation of whatever the member
+#: declared, and NUL bytes gzip at roughly 1000:1 — so a single
+#: ``yml/<category>/<name>.yml`` holding 8 GiB of them leaves the tarball
+#: looking entirely ordinary on the wire and then asks for an 8 GiB allocation.
+#: On this machine that is a MemoryError that kills the build, or an OOM kill
+#: that picks whatever else is running.
+#:
+#: Checked against ``member.size`` *before* extracting, which is sound rather
+#: than trusting: tarfile bounds the reader it returns to exactly the declared
+#: length, so a member cannot deliver more than its header claims. The largest
+#: real entry is 34 KB, so this leaves four hundred times the room it needs and
+#: still refuses a bomb.
+_MAX_MEMBER_BYTES = 16 * 1024 * 1024
 
 #: Written only after extraction completes, so an interrupted fetch is retried
 #: rather than mistaken for a populated cache.
@@ -257,12 +273,18 @@ def _fetch(cache_dir: Path) -> Path:
                 for member in tar:
                     if not member.isfile():
                         continue
+                    # Before extracting anything, including the licence: see
+                    # _MAX_MEMBER_BYTES for why the tarball's own size is no
+                    # evidence about a member's.
+                    if member.size > _MAX_MEMBER_BYTES:
+                        continue
                     rooted = _ROOTED_LICENSE.match(member.name)
                     if rooted is not None:
                         stream = tar.extractfile(member)
                         if stream is not None:
                             name = _LICENSE_MEMBERS[rooted.group(1)]
-                            (cache_dir / name).write_bytes(stream.read())
+                            with stream, (cache_dir / name).open("wb") as out:
+                                shutil.copyfileobj(stream, out, 1 << 20)
                         continue
                     match = _MEMBER.match(member.name)
                     if match is None:
@@ -273,7 +295,13 @@ def _fetch(cache_dir: Path) -> Path:
                     category, filename = match.group(1), match.group(2)
                     destination = yml_dir / category
                     destination.mkdir(parents=True, exist_ok=True)
-                    (destination / filename).write_bytes(stream.read())
+                    # Copied a megabyte at a time rather than read() into one
+                    # buffer, so peak memory is a chunk and not the file. The
+                    # ceiling above makes this belt and braces; the shape is
+                    # here so a later edit that raises the ceiling does not
+                    # silently reintroduce the allocation.
+                    with stream, (destination / filename).open("wb") as out:
+                        shutil.copyfileobj(stream, out, 1 << 20)
                     written += 1
         except tarfile.TarError as exc:
             raise SourceError(

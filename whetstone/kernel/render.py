@@ -9,6 +9,13 @@ data with no conversion step: the agent works, the work is recorded, the
 recording teaches the next model. Before it existed, trajectories were scripted
 verb sequences written by hand, so the model was learning to imitate a list
 someone else authored — which teaches the format and cannot teach the choosing.
+
+It is also, for the same reason, a trust boundary. Everything inside an
+observation was written by the target host, and a target is adversarial by
+definition; because what is rendered here is trained on and later served back to
+the model, a host that can write a protocol marker into a trajectory can write
+the model's next turn. Every string that crosses into the wire format goes
+through :func:`_neutralise` first.
 """
 
 from __future__ import annotations
@@ -34,6 +41,14 @@ BOS, EOS = "<|bos|>", "<|eos|>"
 TASK, HOST, SCOPE, VERBS = "<|task|>", "<|host|>", "<|scope|>", "<|verbs|>"
 ACT, OBS, GATE, FIND = "<|act|>", "<|obs|>", "<|gate|>", "<|find|>"
 
+#: Every protocol marker opens with this, and nothing else in a trajectory may.
+_MARKER_OPEN = "<|"
+#: What an opener found in target-supplied text is rewritten to. ASCII, and free
+#: of quotes and backslashes, because the substitution runs on text that is
+#: already JSON: anything with meaning inside a JSON string would produce a
+#: segment that no longer parses back out.
+_MARKER_ESCAPED = "<!|"
+
 
 def shrink_payload(value: Any, depth: int = 0) -> Any:
     """Cap an observation, saying where it cut.
@@ -57,8 +72,49 @@ def shrink_payload(value: Any, depth: int = 0) -> Any:
     return value
 
 
+def _neutralise(text: str) -> str:
+    """Take the protocol's own markers out of text the target controls.
+
+    An observation is written by the assessed host, which in an engagement is
+    adversarial by definition: a shell history line from
+    ``vuln.credential_exposure``, a cron entry from ``enum.persistence``, a
+    command line from ``enum.processes``, or subprocess stderr on
+    ``Observation.error``. All of it lands verbatim in a trajectory.
+
+    ``json.dumps`` escapes quotes and backslashes and nothing else, so a planted
+    ``<|act|>`` survives serialisation intact and tokenises to the real control
+    token, because the markers are registered with the BPE trainer as atomic
+    units. Two things then happen downstream, and both hand the target the pen.
+    The SFT mask walker flips supervision *on* at any model-turn marker, so an
+    ``<|act|>`` inside an observation trains the model to emit whatever the host
+    planted; an ``<|eos|>`` ends the document early instead, dropping every
+    ``<|find|>`` segment after it — the detection gaps, which are the point.
+
+    Rewriting the ``<|`` opener rather than the ten marker strings named above is
+    deliberate. This module duplicates only part of the training vocabulary:
+    ``<|plan|>``, ``<|pad|>`` and ``<|unk|>`` are not defined here, and
+    ``<|plan|>`` is one of the three segments SFT supervises — so a filter
+    written against the local list would leave the most valuable injection wide
+    open, and would silently reopen it again for any marker added later. No
+    protocol token can exist without the opener.
+
+    The replacement contains no opener of its own, so a substitution can never
+    assemble the marker it just removed, however the input was nested.
+    """
+    return text.replace(_MARKER_OPEN, _MARKER_ESCAPED)
+
+
 def _compact(payload: dict[str, Any]) -> str:
-    return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    """Serialise one segment payload, with target-controlled markers removed.
+
+    The escape runs over the finished JSON rather than over each leaf so that
+    keys, nested values, and any field a later caller adds are covered by
+    construction. A per-value filter is a filter someone eventually forgets to
+    apply to the next field, and the field they forget is the one that carries
+    text from the host.
+    """
+    return _neutralise(
+        json.dumps(payload, separators=(",", ":"), ensure_ascii=False))
 
 
 def _render_context(episode: Episode) -> list[str]:
@@ -71,9 +127,16 @@ def _render_context(episode: Episode) -> list[str]:
     format by even a marker — and the cheapest guarantee against it is to never
     write the format twice.
     """
-    parts: list[str] = [BOS, f"{TASK}{episode.task.strip()}",
-                        f"{HOST}{episode.host}", f"{SCOPE}{episode.scope}",
-                        f"{VERBS}{episode.catalogue}"]
+    # The header goes through the same escape as the payloads. None of these
+    # four is as hostile as an observation — the task is the operator's, the
+    # scope the engagement's, the catalogue the registry's, and the host is the
+    # platform string an adapter reports — but they are written into the same
+    # wire format, and a second path into that format is a second path to
+    # remember to defend. There is one.
+    parts: list[str] = [BOS, f"{TASK}{_neutralise(episode.task.strip())}",
+                        f"{HOST}{_neutralise(episode.host)}",
+                        f"{SCOPE}{_neutralise(episode.scope)}",
+                        f"{VERBS}{_neutralise(episode.catalogue)}"]
 
     for turn in episode.turns:
         parts.append(f"{ACT}{_compact(turn.action.to_dict())}")

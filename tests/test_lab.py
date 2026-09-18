@@ -97,6 +97,26 @@ class TestSandboxAdapter:
         finally:
             t.close()
 
+    def test_credential_exposure_never_returns_the_secret(self):
+        # The assess verb reports that a credential is exposed; it must not carry
+        # the value. The old shape returned the raw line ("password = hunter2..."),
+        # which every real adapter redacts and which is the one shape that becomes
+        # pretraining data — so it taught the model that this verb's output
+        # includes the secret.
+        ad, t = self._adapter()
+        try:
+            obs = ad.execute(
+                REGISTRY.get("vuln.credential_exposure"),
+                REGISTRY.bind("vuln.credential_exposure", target="127.0.0.1"))
+            assert obs.data["findings"], "the planted credential must be found"
+            assert "hunter2" not in str(obs.data), \
+                "the secret value must never appear in the observation"
+            f = obs.data["findings"][0]
+            assert f["value"] == "***redacted***"
+            assert f["technique"] == "T1552.001"
+        finally:
+            t.close()
+
     def test_credential_dump_redacts_by_default(self):
         ad, t = self._adapter()
         try:

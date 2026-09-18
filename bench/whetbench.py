@@ -25,6 +25,17 @@ that caught the corpus skew: the first ``tiny`` run answered CVE records to a
 ``Get-Process`` prompt, because advisory text outweighed shell text twelve to
 one. Loss never mentioned it.
 
+**On checking the instrument.** Every probe here scores the model's
+*continuation* and nothing else, and ``run_bench`` refuses to start until two
+properties hold. First, no probe's own prompt satisfies its own checker: both
+routing probes once reported 5/5 against any checkpoint whatsoever, because the
+scorer was handed ``prompt + continuation`` and the ``Get-Process`` prompt
+contains the marker ``get-``. Second, no probe prompt carries its own ``<|bos|>``,
+because the generator prepends one and two of them are a prefix that appears in
+no trajectory. Both bugs produced numbers that were reported as capability. A
+probe that can pass before the model has emitted a token measures nothing, and
+measuring nothing quietly is the worst thing an instrument can do here.
+
 **On honesty.** Scores are reported per probe and never averaged into one number.
 A single headline invites the reading "83% good", which is meaningless when the
 probes measure unrelated things and a 14.6M model is expected to fail most of
@@ -39,9 +50,10 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
-__all__ = ["Probe", "PROBES", "run_bench"]
+__all__ = ["Probe", "PROBES", "ProbeDesignError", "assert_probes_can_fail",
+           "assert_prompts_carry_no_bos", "run_bench"]
 
 
 # --------------------------------------------------------------------------
@@ -180,6 +192,23 @@ def check_action_json(text: str) -> tuple[bool, str]:
 
 
 def _register_checker(markers: tuple[str, ...], label: str) -> Callable[[str], tuple[bool, str]]:
+    """A substring vote on which register a continuation is written in.
+
+    Substring matching is the weakest check in this file and it survives only
+    because of where the text comes from: the *continuation alone*, from a
+    prompt that contains none of these markers. Both of those conditions are
+    load-bearing and both were once violated at the same time. ``run_bench``
+    scored ``prompt + continuation``, and the ``PS C:\\> Get-Process | `` prompt
+    contains ``get-`` while the ``logsource:`` prompt contains ``logsource``, so
+    the two routing probes returned True before the model produced a single
+    token and reported 5/5 on every checkpoint they were ever run against.
+
+    Hence the prompts below carry no marker of their own, which is a stronger
+    property than "do not concatenate": a model that has collapsed into echoing
+    its prompt — the failure mode a small model reaches first — also scores
+    zero, because repeating a prompt with no markers in it produces no hits.
+    ``assert_probes_can_fail`` enforces the property on every run.
+    """
     def check(text: str) -> tuple[bool, str]:
         hits = [m for m in markers if m.lower() in text.lower()]
         return bool(hits), (f"{label}: {', '.join(hits[:3])}" if hits
@@ -187,8 +216,30 @@ def _register_checker(markers: tuple[str, ...], label: str) -> Callable[[str], t
     return check
 
 
+# The PowerShell half of this list grew when the prompt stopped being a pipeline
+# fragment. `PS C:\> Get-Process | ` invited a continuation like
+# `Where-Object { $_.CPU -gt 10 }`, so `$_` and `| select` covered most correct
+# answers; a prompt that asks for a whole command invites `Restart-Service` or
+# `Sort-Object`, and the old list scored both as drift. `-object` is one marker
+# for the whole Select/Sort/Where/ForEach/Measure/Group-Object family.
+#
+# Every marker has to be a string that does not occur in ordinary advisory
+# prose, because advisory prose is the *wrong* answer this probe exists to catch
+# and a marker it matches would turn the probe back into one that cannot fail.
+# That rules out several obvious candidates — `-force` lives inside
+# "brute-force", `-service` inside "denial-of-service", `start-` inside
+# "start-up" — and it is why `set-` was dropped rather than kept: matching is
+# case-insensitive, so it fired on "Set-up guidance", scoring a paragraph of CVE
+# prose as PowerShell. Narrowing it instead would mean enumerating `Set-Service`,
+# `Set-ItemProperty` and the rest, which is the kind of list that goes stale.
+#
+# The cost is that `Set-Service`, `Start-Service` and `Test-Path` are correct
+# PowerShell this list scores as drift. That bias is deliberate and it is the
+# safe direction: a missed hit understates the model, a spurious hit overstates
+# it, and this file exists because of the second.
 check_shell = _register_checker(
-    ("get-", "set-", "new-", "| select", "-command", "$_", "sudo", "systemctl",
+    ("get-", "new-", "invoke-", "restart-", "-object", "-recurse",
+     "-erroraction", "| select", "-command", "$_", "$env:", "sudo", "systemctl",
      "/etc/", "chmod", "grep", "ps -", "netstat", "launchctl"), "shell")
 check_detection = _register_checker(
     ("detection:", "selection:", "condition:", "logsource", "eventid",
@@ -206,6 +257,9 @@ class Probe:
 
     name: str
     prompt: str
+    #: Given the model's CONTINUATION, never the prompt and never the two of
+    #: them joined. A checker that needed prompt context would be a checker
+    #: whose prompt can answer it, which is the one thing a probe may not be.
     check: Callable[[str], tuple[bool, str]]
     #: What a pass actually demonstrates. Printed with the result so a number is
     #: never separated from its meaning.
@@ -225,17 +279,33 @@ class Probe:
 
 
 def _action_prompt() -> str:
-    """A realistic trajectory prefix, ending at the point the model must act."""
+    """A realistic trajectory prefix, ending at the point the model must act.
+
+    Deliberately **without** a leading ``<|bos|>``. ``training.generate.generate``
+    prepends the bos id itself and does so unconditionally, so writing one here
+    too handed the model ``<|bos|><|bos|><|task|>…`` — verified against the real
+    tokenizer as ids ``[1, 1, 4, …]``. Nothing in the corpus looks like that:
+    ``render_trajectory`` opens with exactly one ``<|bos|>`` and ``training/sft``
+    encodes that text as-is. A 14.6M model has no spare capacity to absorb a
+    prefix shape it has never seen, so the probe labelled THE TASK was scoring a
+    model that had been asked the question in a dialect it was never taught.
+
+    ``verb_choice_score`` below keeps its explicit ``BOS`` and that is not an
+    inconsistency: it goes through ``decode_action`` -> ``score_continuations``,
+    which encodes the prompt bare and prepends nothing. The two generation paths
+    genuinely differ, so the prompts must differ to arrive at the same token
+    sequence. ``assert_prompts_carry_no_bos`` pins the ``generate`` half of that.
+    """
     from whetstone.actions import REGISTRY, Intent, TargetKind
     import whetstone.verbs  # noqa: F401
 
-    from training.tokenizer.protocol import ACT, BOS, HOST, SCOPE, TASK, VERBS
+    from training.tokenizer.protocol import ACT, HOST, SCOPE, TASK, VERBS
 
     catalogue = "; ".join(
         f"{v.id}({', '.join(p.name for p in v.params)})"
         for v in REGISTRY.select(intent=Intent.OBSERVE)
         if v.target is TargetKind.HOST)[:400]
-    return (f"{BOS}{TASK}Find anything on this host that runs without a human "
+    return (f"{TASK}Find anything on this host that runs without a human "
             f"starting it.{HOST}macos{SCOPE}observe; loopback only; no red "
             f"verbs{VERBS}{catalogue}{ACT}")
 
@@ -258,11 +328,27 @@ PROBES: list[Probe] = [
           check_technique_real,
           "emits ATT&CK ids that EXIST, not just ids that look right — the "
           "difference between learning a referent and learning a shape"),
-    Probe("shell-routing", "PS C:\\> Get-Process | ",
+    # The two routing prompts are constrained in a way the others are not: a
+    # prompt may not contain any marker its own checker looks for. That rules
+    # out the obvious phrasings — ``PS C:\> Get-Process | `` hands the checker
+    # ``get-`` and ``logsource:`` hands it ``logsource`` — so each prompt
+    # establishes the register with material the checker is blind to and stops
+    # one keystroke short of the thing being measured. A completed command
+    # followed by a fresh prompt is as unambiguously PowerShell as a pipeline,
+    # and a Sigma preamble with the metadata keys but no ``logsource:`` is as
+    # unambiguously Sigma. Restoring either short form silently restores a probe
+    # that passes on an untrained checkpoint; assert_probes_can_fail will stop
+    # the run if anyone tries.
+    Probe("shell-routing", "PS C:\\> Stop-Service -Name Spooler\nPS C:\\> ",
           check_shell,
           "stays in the shell register when prompted in it, rather than "
           "sliding into whatever register dominates the corpus"),
-    Probe("detection-routing", "title: Suspicious Process Creation\nlogsource:\n",
+    Probe("detection-routing",
+          "title: Suspicious Scheduled Task Creation\n"
+          "status: experimental\n"
+          "description: A scheduled task was registered by a "
+          "non-administrative process\n"
+          "author: whetstone\n",
           check_detection,
           "continues a detection rule as a detection rule"),
     # Prompted in the WIRE PROTOCOL, because that is what the model was trained
@@ -276,6 +362,85 @@ PROBES: list[Probe] = [
           "verbs, missing params and invented param names all fail here",
           max_tokens=48),
 ]
+
+
+# --------------------------------------------------------------------------
+# instrument checks — run before a single token is generated
+# --------------------------------------------------------------------------
+
+
+class ProbeDesignError(AssertionError):
+    """A probe cannot measure what it claims, so the run stops before it starts.
+
+    Raised, never scored, never warned about and never printed as a skip. The
+    failures this catches do not make a number look bad — they make it look
+    good, which is why they survived long enough to be reported to a human as
+    capability. An exception puts the fault in front of whoever ran the
+    benchmark; anything softer leaves them holding a table of real-looking
+    scores with no way to tell which rows are true.
+    """
+
+
+def assert_probes_can_fail(probes: Iterable[Probe]) -> None:
+    """Refuse to run any probe whose own prompt already satisfies its checker.
+
+    The house rule is CHECK THE INSTRUMENT FIRST, and this is that check made
+    mechanical. ``shell-routing`` and ``detection-routing`` were unfalsifiable
+    for their whole reported history: the scorer saw ``prompt + continuation``
+    and each prompt contained one of its own markers, so both returned 5/5 for
+    an untrained checkpoint, for random weights, for anything. The docstring at
+    the top of this module credits those two probes with catching the corpus
+    skew; while this held they could not have caught it again.
+
+    Scoring the continuation alone fixes the immediate arithmetic, but it does
+    not stop someone re-joining the strings later, and it does not stop a model
+    that has collapsed into echoing its prompt from scoring full marks. This
+    property does both: if the prompt cannot pass the check, then neither
+    concatenation nor echo can manufacture a pass out of nothing.
+    """
+    for probe in probes:
+        ok, detail = probe.check(probe.prompt)
+        if ok:
+            raise ProbeDesignError(
+                f"probe {probe.name!r} passes its own check on its prompt alone "
+                f"({detail!r}), so it cannot fail and its score means nothing. "
+                "Either the prompt contains the answer, or the checker is "
+                "looking for something the prompt supplies.")
+
+
+def assert_prompts_carry_no_bos(probes: Iterable[Probe], tok: Any) -> None:
+    """Refuse to run if a prompt carries a ``<|bos|>`` the generator will double.
+
+    ``training.generate.generate`` prepends the bos id to whatever it is given,
+    unconditionally, so a prompt that opens with ``<|bos|>`` reaches the model as
+    ``<|bos|><|bos|>…``. No trajectory ever looked like that — ``render_trajectory``
+    emits exactly one — and at this scale an unseen prefix shape is not absorbed,
+    it degrades the continuation. ``action-json`` carried a literal ``<|bos|>``
+    and so measured the model on input it was never trained on, while
+    ``verb-choice`` sent a single bos through a different code path and the two
+    numbers silently disagreed about what had been asked.
+
+    Checked against the token *ids* rather than the prompt text, because that is
+    the thing the model actually sees: a tokenizer that did not treat ``<|bos|>``
+    as an atomic special token would encode it as ordinary pieces and the string
+    check would be fooled by the exact failure it is meant to catch.
+    """
+    from training.tokenizer.protocol import BOS
+
+    bos = tok.token_to_id(BOS)
+    if bos is None:
+        raise ProbeDesignError(
+            f"tokenizer has no {BOS} token, so generate() prepends nothing and "
+            "every prompt here starts in a way no trajectory ever did; the "
+            "scores would describe out-of-distribution input, not capability.")
+    for probe in probes:
+        count = tok.encode(probe.prompt).ids.count(bos)
+        if count:
+            raise ProbeDesignError(
+                f"probe {probe.name!r} encodes {count} {BOS} token(s) of its "
+                f"own, and generate() prepends one more, so the model would be "
+                f"asked in a format no trajectory contains. Drop the literal "
+                f"{BOS} from the prompt and let the generator supply it.")
 
 
 #: Task -> verbs a competent operator would accept as a first move. Several are
@@ -326,6 +491,12 @@ def verb_choice_score(model: Any, tok: Any) -> tuple[int, int, list[str]]:
     hits = 0
     detail: list[str] = []
     for task, acceptable in VERB_CHOICE_TASKS:
+        # The explicit BOS belongs here and nowhere else in this file.
+        # `decode_action` scores candidates through `score_continuations`, which
+        # encodes the prompt bare, so this path must write its own bos while the
+        # `generate` probes must not write theirs. Same token sequence, two
+        # different routes to it; assuming they behave alike is what produced a
+        # double bos in `action-json`.
         prompt = (f"{BOS}{TASK}{task}{HOST}macos{SCOPE}observe; loopback only"
                   f"{VERBS}{catalogue}{ACT}")
         got = decode_action(model, tok, prompt, permitted=permitted,
@@ -342,8 +513,17 @@ def run_bench(checkpoint: Path, tokenizer: Path, *, temperature: float = 0.7,
 
     from training.generate import generate, load_for_inference
 
-    model, cfg = load_for_inference(checkpoint)
     tok = Tokenizer.from_file(str(tokenizer))
+
+    # CHECK THE INSTRUMENT FIRST, and check all of PROBES rather than only the
+    # selected ones: a probe that cannot fail is broken whether or not this
+    # particular run prints it, and finding that out from `--only` would mean
+    # the fault hides exactly when someone is narrowing in on a result. Ahead of
+    # loading the model so a design fault costs nothing to discover.
+    assert_probes_can_fail(PROBES)
+    assert_prompts_carry_no_bos(PROBES, tok)
+
+    model, cfg = load_for_inference(checkpoint)
     step = json.loads((checkpoint / "state.json").read_text())["step"]
 
     probes = [p for p in PROBES if not only or p.name in only]
@@ -353,11 +533,24 @@ def run_bench(checkpoint: Path, tokenizer: Path, *, temperature: float = 0.7,
     print("-" * 96)
 
     for probe in probes:
+        # PROBES is module state and `results` is a mutable default on it, so a
+        # second run_bench in one process would append to the first run's list
+        # and print "10/10" for five samples. Cleared here rather than by asking
+        # callers to remember, because the failure mode is a number that is
+        # merely too large and reads as an unusually good checkpoint.
+        probe.results.clear()
         for i in range(probe.samples):
             text = generate(model, tok, probe.prompt,
                             max_tokens=probe.max_tokens,
                             temperature=temperature, seed=seed + i)
-            probe.results.append(probe.check(probe.prompt + text))
+            # The CONTINUATION alone. This scored `probe.prompt + text`, which
+            # meant every probe was graded partly on text the benchmark itself
+            # wrote: the two register probes passed on their prompts before the
+            # model emitted anything. Nothing here needs prompt context — every
+            # checker looks for a pattern the model must produce — and if one
+            # ever did, the right answer is a probe whose prompt cannot supply
+            # it, not a join here that flatters all seven.
+            probe.results.append(probe.check(text))
 
         rate = probe.passed / max(len(probe.results), 1)
         mark = "SKIP" if probe.skipped else f"{probe.passed}/{len(probe.results)}"

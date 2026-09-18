@@ -53,7 +53,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from ..actions import Action, Observation, Verb
-from .base import Adapter, AdapterError, register_adapter, run, which
+from .base import (Adapter, AdapterError, register_adapter,
+                   reject_option_injection, run, which)
 
 __all__ = ["MacosAdapter"]
 
@@ -1774,6 +1775,21 @@ def _exploit_scheduled_task(self: MacosAdapter, verb: Verb, action: Action) -> A
     }
 
 
+def _mask_account(value: str) -> str:
+    """Show enough of an account value to be recognised, never enough to use.
+
+    A masked value has to stay useful as EVIDENCE — an operator reading this
+    finding needs to know which credential was found and where — while being
+    useless as a CREDENTIAL. Four leading characters identify a token's
+    provider prefix (``ghp_``, ``glpat-``, ``AKIA``) without carrying enough
+    entropy to be replayed, and the length is reported because length is what
+    distinguishes a personal access token from an ordinary username.
+    """
+    if len(value) <= 4:
+        return "*" * len(value)
+    return f"{value[:4]}{'*' * (len(value) - 4)} (len {len(value)})"
+
+
 @MacosAdapter.implements("postex.credential_dump")
 def _postex_credential_dump(self: MacosAdapter, verb: Verb, action: Action) -> dict[str, Any]:
     """Report what an intruder could enumerate WITHOUT prompting — and what is denied.
@@ -1798,7 +1814,8 @@ def _postex_credential_dump(self: MacosAdapter, verb: Verb, action: Action) -> d
     # On-disk credential stores readable without a prompt. Report accounts/counts.
     stores: list[dict[str, Any]] = []
 
-    def _account_scan(path: Path, kind: str, pat: re.Pattern[str]) -> None:
+    def _account_scan(path: Path, kind: str, pat: re.Pattern[str],
+                      *, sensitive: bool = False) -> None:
         try:
             if not path.is_file():
                 return
@@ -1806,9 +1823,19 @@ def _postex_credential_dump(self: MacosAdapter, verb: Verb, action: Action) -> d
         except OSError:
             return
         accts = sorted({m.group(1) for m in pat.finditer(text)})
+        # "account names are not secrets" is true for an AWS profile name and a
+        # netrc machine, and FALSE for .git-credentials: the userinfo this
+        # captures out of `https://<token>@github.com` IS the token, in the
+        # token-as-username form every forge now recommends. The old expression
+        # here was also a no-op -- `accts if not redact else [a for a in accts]`
+        # copies the list either way -- so `redact=True` redacted nothing at
+        # all. A credential-exposure verb that prints the credential is the one
+        # thing this verb must never do, so the sensitive store is masked
+        # unconditionally, not merely when asked.
+        shown = [_mask_account(a) for a in accts] if sensitive or redact else accts
         stores.append({"store": str(path), "kind": kind,
-                      "accounts": accts if not redact else
-                      [a for a in accts],  # account names are not secrets
+                      "accounts": shown,
+                      "redacted": bool(sensitive or redact),
                       "secret_count": len(pat.findall(text))})
 
     _account_scan(home / ".aws" / "credentials", "aws",
@@ -1816,7 +1843,7 @@ def _postex_credential_dump(self: MacosAdapter, verb: Verb, action: Action) -> d
     _account_scan(home / ".netrc", "netrc",
                   re.compile(r"machine\s+(\S+)"))
     _account_scan(home / ".git-credentials", "git",
-                  re.compile(r"https?://([^:@/]+)"))
+                  re.compile(r"https?://([^:@/]+)"), sensitive=True)
 
     # SSH private keys (presence + encryption, never contents).
     ssh_keys = []
@@ -1983,6 +2010,11 @@ def _postex_lateral_move(self: MacosAdapter, verb: Verb, action: Action) -> Any:
         return Observation(action=action, ok=False, platform="macos",
                            error="no target host supplied.")
     host = target.split(":", 1)[1] if target.startswith("host:") else target
+    # Both values land in an argv element ssh parses positionally, and a
+    # leading dash turns either into an OPTION -- `-oProxyCommand=...` executes
+    # a command. The Linux adapter has always guarded this; this one did not,
+    # which made the protection a property of which file you happened to read.
+    reject_option_injection(as_user, host)
 
     if method == "ssh":
         r = run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",

@@ -24,8 +24,18 @@ scope:
   exclude_hosts:
     # Exclusions beat inclusions, always. 10.20.4.1 is inside the /24 above and
     # is still out of scope, because the narrower, more explicit statement wins.
+    #
+    # Each carve-out appears twice, and that is not redundancy. The scope above
+    # admits a machine by address *and* by name, and the gate never resolves a
+    # name — authority must not depend on DNS we do not control — so an address
+    # exclusion cannot recognise the same box reached as gw.lab.internal. Listing
+    # only the addresses left the gateway and the finance workstation fully
+    # reachable under their hostnames, which is why Whetstone now refuses to load
+    # a document whose exclusions miss a form its inclusions admit.
     - 10.20.4.1                    # default gateway
+    - gw.lab.internal              # ...the same machine, by name
     - 10.20.4.50                   # finance workstation — explicitly carved out
+    - finance.lab.internal         # ...the same machine, by name
   paths:
     - /opt/lab
   exclude_paths:

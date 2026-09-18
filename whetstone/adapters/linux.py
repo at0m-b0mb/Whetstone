@@ -895,14 +895,26 @@ def find_secrets(text: str, source: str) -> list[dict[str, Any]]:
             m = pat.search(line)
             if not m:
                 continue
-            value = m.group(1) if m.groups() else ""
-            if value.strip().strip("'\"").lower() in _SECRET_PLACEHOLDERS:
+            captured = bool(m.groups())
+            value = m.group(1) if captured else ""
+            # The placeholder filter only makes sense for the ``key=value`` patterns
+            # that CAPTURE the secret (``password=changeme``). A marker pattern —
+            # the private-key BEGIN line — has no capture group, so ``value`` is the
+            # empty string, and "" is the first entry in _SECRET_PLACEHOLDERS. The
+            # old unconditional check therefore matched every private-key hit as a
+            # placeholder and dropped it, so the highest-severity credential kind
+            # was silently invisible on Linux (macOS reported it). Gate the filter
+            # on there actually being a captured value so a marker is always kept.
+            if captured and value.strip().strip("'\"").lower() in _SECRET_PLACEHOLDERS:
                 continue
             out.append({
                 "source": source,
                 "kind": kind,
                 "line": lineno,
-                "value_length": len(value),
+                # A marker pattern captures nothing, so report the length of the
+                # whole match rather than 0 — a zero here would read as "an
+                # empty secret", which is not what "a private key is present" means.
+                "value_length": len(value) if captured else len(m.group(0)),
                 "value": "***redacted***",
             })
     return out
@@ -1028,7 +1040,9 @@ def assess_telemetry(
     }
 
 
-def count_ausearch_records(text: str, *, key: str = "", image: str = "") -> int:
+def count_ausearch_records(
+    text: str, *, key: str = "", image: str = "", record_type: str = ""
+) -> int:
     """Count ``ausearch`` event records, optionally filtered by ``-k`` key/image.
 
     ``ausearch`` separates events with a line of dashes. We count events (not
@@ -1036,6 +1050,17 @@ def count_ausearch_records(text: str, *, key: str = "", image: str = "") -> int:
     or the image path. This drives ``detect.process_creation`` /
     ``detect.credential_access``: "did an audited event we care about occur in the
     window" is a count, and a count is a mechanically checkable training signal.
+
+    ``record_type`` is the filter that makes ``detect.process_creation`` honest.
+    Without it, an unkeyed call (which is what process-creation detection makes,
+    because its ``image`` param has no default) counts *every* event auditd
+    emitted — and auditd emits USER_AUTH / CRED_ACQ / SERVICE_START from PAM and
+    systemd whether or not a single audit rule is loaded. Counting those reported
+    "process creation was logged" on a box with zero execve auditing: a false
+    positive that deletes the detection-gap finding this tool exists to produce.
+    When ``record_type`` is set, only events that actually contain a record of
+    that type (``type=EXECVE``) are counted, so "nothing execve-shaped happened"
+    can no longer masquerade as "the control fired".
     """
     events = re.split(r"^----+\s*$", text, flags=re.MULTILINE)
     n = 0
@@ -1045,6 +1070,8 @@ def count_ausearch_records(text: str, *, key: str = "", image: str = "") -> int:
         if key and f"key={key}" not in ev and f'"{key}"' not in ev:
             continue
         if image and image not in ev:
+            continue
+        if record_type and f"type={record_type}" not in ev:
             continue
         n += 1
     return n
@@ -1073,6 +1100,99 @@ def parse_auth_events(text: str) -> dict[str, int]:
         if "sudo:" in line and "authentication failure" in line:
             counts["sudo_failed"] += 1
     return counts
+
+
+_SYSLOG_MONTHS = {
+    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+    "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+}
+# RFC 3164: "Mmm dd HH:MM:SS" (day space-padded, so one or two digits) at the
+# very start of the line. This is what /var/log/auth.log and /var/log/secure use.
+_SYSLOG_TS = re.compile(
+    r"^([A-Z][a-z]{2})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})\b")
+# RFC 3339 / ISO-8601 prefix (rsyslog's RSYSLOG_FileFormat), e.g.
+# "2026-09-18T10:00:01.123456+00:00 host ...". Timezone is ignored: these logs
+# are read on the host that wrote them, so local-time comparison is right, and a
+# five-minute window does not turn on the sub-second or offset detail.
+_ISO_TS = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})")
+
+
+def _syslog_line_epoch(line: str, *, now: float) -> float | None:
+    """Best-effort epoch for one auth.log/secure line, or None if it has no stamp.
+
+    The hard case is RFC 3164, which carries NO YEAR. The year is reconstructed
+    against ``now``: assume the current year, but if that lands the line more than
+    a day in the FUTURE, it must belong to the previous year. That single rule is
+    the only correct way to place a December line tailed in early January —
+    naively stamping it with ``now.year`` would push it eleven months forward and
+    then the window filter would silently discard a line that is actually recent.
+    The one-day slack absorbs clock skew without ever mistaking a fresh line for a
+    year-old one.
+    """
+    m = _ISO_TS.match(line)
+    if m:
+        yr, mo, dy, hh, mm, ss = (int(g) for g in m.groups())
+        try:
+            return time.mktime((yr, mo, dy, hh, mm, ss, 0, 0, -1))
+        except (ValueError, OverflowError):
+            return None
+    m = _SYSLOG_TS.match(line)
+    if not m:
+        return None
+    mon = _SYSLOG_MONTHS.get(m.group(1))
+    if mon is None:
+        return None
+    dy, hh, mm, ss = (int(m.group(i)) for i in range(2, 6))
+    now_year = time.localtime(now).tm_year
+    for year in (now_year, now_year - 1):
+        try:
+            epoch = time.mktime((year, mon, dy, hh, mm, ss, 0, 0, -1))
+        except (ValueError, OverflowError):
+            return None
+        # More than a day ahead of "now" means we guessed the wrong (current) year
+        # for a line that is really from last December; fall through to now_year-1.
+        if epoch <= now + 86400:
+            return epoch
+    return epoch
+
+
+def filter_auth_window(
+    text: str, since_seconds: int, *, now: float | None = None
+) -> tuple[str, bool]:
+    """Keep only auth.log/secure lines stamped within the last ``since_seconds``.
+
+    ``detect.authentication``'s journald path passes ``--since``; its file-tail
+    fallback used to tally the WHOLE file and then report ``window_seconds`` as
+    though a window had been applied. That made ``logged`` true whenever the log
+    had ever held a line — months-old sshd records counting as an in-window
+    event — and rotating the file to empty flipped the same host to the opposite
+    answer with no change in its telemetry. This restores the window on the
+    fallback so both paths answer the same question.
+
+    Returns ``(in_window_text, parsed_any)``. ``parsed_any`` is False only when
+    not one line carried a timestamp we could read: the caller must then decline
+    to report a result rather than tally the whole file, because a count with no
+    window is precisely the false positive this function exists to prevent. Lines
+    that individually fail to parse are dropped from the window (they cannot be
+    placed) but do not by themselves clear ``parsed_any`` — one good timestamp is
+    enough to trust the filter.
+    """
+    if now is None:
+        now = time.time()
+    cutoff = now - since_seconds
+    kept: list[str] = []
+    parsed_any = False
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        epoch = _syslog_line_epoch(line, now=now)
+        if epoch is None:
+            continue
+        parsed_any = True
+        if epoch >= cutoff:
+            kept.append(line)
+    return "\n".join(kept), parsed_any
 
 
 # ---- vulnerability heuristics (pure) ---------------------------------------
@@ -1700,11 +1820,21 @@ def _detect_telemetry(self: LinuxAdapter, verb: Verb, action: Action) -> dict[st
     )
 
 
-def _ausearch_window(since_seconds: int, *, key: str = "", image: str = "") -> tuple[bool, dict[str, Any]]:
+def _ausearch_window(
+    since_seconds: int, *, key: str = "", image: str = "", record_type: str = ""
+) -> tuple[bool, dict[str, Any]]:
     """Shared helper for the detect.* verbs that query the audit log.
 
     Returns (auditd_available, result-dict). Kept separate so each detect verb is
     a two-liner and the audit-query logic is written once.
+
+    ``record_type`` narrows the query to a single auditd message type. It is
+    filtered twice on purpose: once at the kernel side (``ausearch -m EXECVE``) so
+    an unrelated record never leaves auditd, and again in ``count_ausearch_records``
+    so that even if a given ``ausearch`` build ignores ``-m`` we still count only
+    matching records. The double filter is what stops an unkeyed process-creation
+    query from counting PAM/systemd noise and reporting the control as fired when
+    no execve auditing exists.
     """
     if not which("ausearch"):
         return False, {"logged": False, "source": "none",
@@ -1714,11 +1844,14 @@ def _ausearch_window(since_seconds: int, *, key: str = "", image: str = "") -> t
     argv = ["ausearch", "-i", "--start", start]
     if key:
         argv += ["-k", key]
+    if record_type:
+        argv += ["-m", record_type]
     res = run(argv)
     if "<no matches>" in (res.stdout + res.stderr):
         return True, {"logged": False, "count": 0, "source": "auditd",
                       "window_seconds": since_seconds}
-    count = count_ausearch_records(res.stdout, key=key, image=image)
+    count = count_ausearch_records(res.stdout, key=key, image=image,
+                                   record_type=record_type)
     return True, {"logged": count > 0, "count": count, "source": "auditd",
                   "window_seconds": since_seconds}
 
@@ -1727,7 +1860,13 @@ def _ausearch_window(since_seconds: int, *, key: str = "", image: str = "") -> t
 def _detect_process_creation(self: LinuxAdapter, verb: Verb, action: Action) -> dict[str, Any]:
     since = int(action.params.get("since_seconds", 300))
     image = action.params.get("image", "") or ""
-    available, result = _ausearch_window(since, key="", image=image)
+    # Process creation IS the execve syscall, so query the EXECVE record type
+    # specifically. Counting every audit record instead treated a PAM login or a
+    # systemd SERVICE_START as proof that process creation was logged, which is
+    # exactly the "auditd installed, no rules loaded" false positive this project
+    # exists to catch: no EXECVE records means logged=False, which is the honest
+    # detection gap, not a fired control.
+    available, result = _ausearch_window(since, image=image, record_type="EXECVE")
     result["image_filter"] = image
     if not available:
         result["gap"] = ("no auditd execve auditing: process creation is not "
@@ -1775,7 +1914,21 @@ def _detect_authentication(self: LinuxAdapter, verb: Verb, action: Action) -> di
         if auth is None:
             return {"logged": False, "source": "none",
                     "reason": "no journalctl and no auth.log/secure readable"}
-        counts = parse_auth_events(auth)
+        # Apply the same time window the journald path applies. Tallying the whole
+        # file instead answered "has this log ever held a line", not "was an auth
+        # event logged in the window", so a host with months of old records read
+        # as logged=True regardless of its current telemetry.
+        windowed, parsed = filter_auth_window(auth, since)
+        if not parsed:
+            # No parseable timestamps means the window could not be applied. Report
+            # "cannot tell" (logged=None → the kernel's honest observation path)
+            # rather than counting the whole file and calling that an in-window
+            # result — a wrong "the control fired" hides a real detection gap.
+            return {"logged": None, "source": "auth.log", "window_seconds": since,
+                    "reason": ("auth.log timestamps could not be parsed, so the "
+                               "window could not be applied; refusing to tally the "
+                               "whole file and call that an in-window result")}
+        counts = parse_auth_events(windowed)
         return {"logged": counts["total"] > 0, "counts": counts,
                 "source": "auth.log", "window_seconds": since}
     res = run(["journalctl", "--since", f"{since} seconds ago", "--no-pager",
@@ -2171,6 +2324,29 @@ def _write_cron_job(cron_dir: str, name: str, schedule: str, command: str,
     return {"path": path, "line": line.strip(), "as_user": as_user}
 
 
+def _create_proof_marker(*, dir: str = "/tmp") -> str:
+    """Mint an unpredictable, freshly-owned proof file and return its path.
+
+    scheduled_task drops a cron line that runs ``id > <marker>`` AS ROOT every
+    minute. The old code hard-coded ``/tmp/whetstone-scheduled-task.proof`` — a
+    constant name in a world-writable directory — and root's shell redirect
+    follows symlinks and truncates. Any local user could pre-plant
+    ``ln -s /etc/nologin /tmp/whetstone-scheduled-task.proof`` and turn a "prove a
+    cron job can be created" demo into an arbitrary root-owned-file overwrite.
+
+    ``mkstemp`` closes that hole: it opens with ``O_CREAT | O_EXCL | O_NOFOLLOW``
+    semantics, so it refuses to reuse an existing path or follow a symlink, and it
+    picks a random name so there is nothing predictable to squat. The file exists,
+    is 0600, and is owned by us before the cron line ever fires, so the redirect
+    only ever truncates this fresh file — never a pre-existing target. Returning
+    the concrete path lets the caller clean it up and lets the audit log name it.
+    """
+    fd, path = tempfile.mkstemp(prefix="whetstone-schedtask-", suffix=".proof",
+                                dir=dir)
+    os.close(fd)
+    return path
+
+
 @LinuxAdapter.implements("exploit.scheduled_task")
 def _exploit_scheduled_task(self: LinuxAdapter, verb: Verb, action: Action) -> Observation | dict[str, Any]:
     as_user = action.params.get("as_user", "SYSTEM")
@@ -2187,23 +2363,42 @@ def _exploit_scheduled_task(self: LinuxAdapter, verb: Verb, action: Action) -> O
                            error="/etc/cron.d is not writable by the current user; "
                                  "creating a scheduled task requires root here")
     name = "whetstone-demo"
-    marker = "/tmp/whetstone-scheduled-task.proof"
+    # Mint the proof file up front so root's cron redirect only ever truncates a
+    # fresh, unpredictable, already-owned path — see _create_proof_marker for why
+    # a fixed /tmp name was a root-file-overwrite primitive.
+    marker = _create_proof_marker()
     command = f"/bin/sh -c 'id > {marker}'"
     try:
         rec = _write_cron_job("/etc/cron.d", name, "* * * * *", command, as_user=as_user)
     except OSError as exc:
+        # The cron drop-in failed, so roll back the marker we already created
+        # rather than leaving an orphaned file behind for a run that never armed.
+        try:
+            os.unlink(marker)
+        except OSError:
+            pass
         return Observation(action=action, ok=False, platform=self.platform,
                            error=f"could not write cron drop-in: {exc}")
-    rec["changed"] = {"created_file": rec["path"]}
+    rec["marker"] = marker
+    rec["changed"] = {"created_file": rec["path"], "created_marker": marker}
     rec["cleanup_requested"] = cleanup
     if cleanup:
-        try:
-            os.remove(rec["path"])
-            rec["cleaned_up"] = True
-        except OSError as exc:
+        # Remove both artefacts. The marker is not optional cleanup: mkstemp
+        # created it immediately, so skipping it would leave an empty file in
+        # /tmp on every run even when the cron line never fired.
+        failures = []
+        for target in (rec["path"], marker):
+            try:
+                os.remove(target)
+            except OSError as exc:
+                failures.append(f"{target} ({exc})")
+        if failures:
             rec["cleaned_up"] = False
-            rec["cleanup_error"] = (f"CLEANUP FAILED: {exc}. Remove {rec['path']} "
-                                    "by hand or it runs every minute as root.")
+            rec["cleanup_error"] = ("CLEANUP FAILED for " + ", ".join(failures)
+                                    + f". Remove {rec['path']} by hand or it runs "
+                                    "every minute as root.")
+        else:
+            rec["cleaned_up"] = True
     return rec
 
 
@@ -2842,6 +3037,26 @@ def _run_self_tests() -> int:  # noqa: C901 — a test runner is allowed to be l
     check("ausearch.count_key", count_ausearch_records(AUSEARCH, key="exec") == 2)
     check("ausearch.count_image", count_ausearch_records(AUSEARCH, image="/usr/bin/whoami") == 1)
     check("ausearch.count_none", count_ausearch_records(AUSEARCH, key="cred") == 0)
+    # Only the first event carries a type=EXECVE record; the EXECVE filter that
+    # keeps detect.process_creation honest must count that one and not the bare
+    # SYSCALL event.
+    check("ausearch.record_type_execve",
+          count_ausearch_records(AUSEARCH, record_type="EXECVE") == 1,
+          count_ausearch_records(AUSEARCH, record_type="EXECVE"))
+    # auditd emits these from PAM/systemd with no rules loaded. Counting them as
+    # process creation was the false positive that deleted the detection gap.
+    AUSEARCH_NOISE = (
+        "----\n"
+        "type=USER_AUTH msg=audit(1700000000.1:1): pid=900 uid=0 "
+        "msg='op=PAM:authentication acct=\"kali\" exe=\"/usr/bin/sudo\" res=success'\n"
+        "----\n"
+        "type=CRED_ACQ msg=audit(1700000001.2:2): pid=901 uid=0 "
+        "msg='op=PAM:setcred acct=\"kali\" res=success'\n"
+    )
+    check("ausearch.noise_all_counted", count_ausearch_records(AUSEARCH_NOISE) == 2)
+    check("ausearch.noise_not_execve",
+          count_ausearch_records(AUSEARCH_NOISE, record_type="EXECVE") == 0,
+          count_ausearch_records(AUSEARCH_NOISE, record_type="EXECVE"))
 
     AUTH_LOG = (
         "Jan 10 10:00:01 host sshd[812]: Accepted publickey for kali from 192.168.1.5 port 51314 ssh2\n"
@@ -2854,6 +3069,29 @@ def _run_self_tests() -> int:  # noqa: C901 — a test runner is allowed to be l
     check("auth.failed", auth["failed"] >= 1, auth)
     check("auth.sudo", auth["sudo"] == 1, auth)
     check("auth.sudo_failed", auth["sudo_failed"] == 1, auth)
+
+    # ---- auth.log time-window filter (the fallback that used to ignore it) ----
+    # Anchor "now" to just after the AUTH_LOG lines so the window is deterministic.
+    NOW = time.mktime((time.localtime().tm_year, 1, 10, 10, 4, 0, 0, 0, -1))
+    win, parsed = filter_auth_window(AUTH_LOG, 300, now=NOW)
+    check("authwin.parses", parsed is True)
+    check("authwin.in_window_total", parse_auth_events(win)["total"] == 4,
+          parse_auth_events(win))
+    # A one-second window keeps nothing: the file is full of records but none are
+    # recent, which is exactly the case the old whole-file tally got wrong.
+    win_narrow, _ = filter_auth_window(AUTH_LOG, 1, now=NOW)
+    check("authwin.excludes_old", parse_auth_events(win_narrow)["total"] == 0,
+          parse_auth_events(win_narrow))
+    # A December line tailed in January belongs to last year, not eleven months
+    # ahead: reconstructing it as this year would push it out of every window.
+    DEC = "Dec 31 23:59:59 host sshd[9]: Accepted publickey for kali from ::1 port 1 ssh2\n"
+    jan_now = time.mktime((2027, 1, 1, 0, 0, 30, 0, 0, -1))
+    dec_win, dec_parsed = filter_auth_window(DEC, 300, now=jan_now)
+    check("authwin.dec_jan_rollover",
+          dec_parsed and parse_auth_events(dec_win)["total"] == 1, dec_win)
+    # No parseable timestamp anywhere → the caller must be told it cannot tell.
+    no_ts, no_parsed = filter_auth_window("garbage line with no timestamp\n", 300, now=NOW)
+    check("authwin.unparseable_flagged", no_parsed is False and no_ts == "")
 
     # ---- vuln ----
     m = statmod.S_IFREG | 0o777
@@ -2873,6 +3111,7 @@ def _run_self_tests() -> int:  # noqa: C901 — a test runner is allowed to be l
         "aws_key = AKIAIOSFODNN7EXAMPLE\n"
         "password = changeme\n"
         "# just a note about passwords\n"
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n"
     )
     secrets = find_secrets(SECRETS, source="/home/kali/.env")
     kinds = {s["kind"] for s in secrets}
@@ -2881,6 +3120,12 @@ def _run_self_tests() -> int:  # noqa: C901 — a test runner is allowed to be l
     check("secrets.conn_string", "connection_string_password" in kinds, kinds)
     check("secrets.api_key", "api_key_assignment" in kinds, kinds)
     check("secrets.aws_id", "aws_access_key_id" in kinds, kinds)
+    # The private-key BEGIN line is a marker with no capture group; the old
+    # placeholder filter treated its empty "value" as a placeholder and dropped
+    # every hit, so the highest-severity kind was invisible on Linux.
+    check("secrets.private_key", "private_key_block" in kinds, kinds)
+    pk = next(s for s in secrets if s["kind"] == "private_key_block")
+    check("secrets.private_key_length", pk["value_length"] > 0, pk)
     check("secrets.placeholder_dropped",
           not any(s["line"] == 6 for s in secrets), [s["line"] for s in secrets])
     # The redaction contract: no secret material anywhere in the output.
@@ -2988,6 +3233,18 @@ def _run_self_tests() -> int:  # noqa: C901 — a test runner is allowed to be l
         check("cron.records_line", "root /bin/true" in job["line"], job)
         os.remove(job["path"])
         check("cron.removed", not os.path.exists(job["path"]))
+
+        # scheduled_task proof marker: unpredictable name, exists on return, and a
+        # second call never collides — the property that closes the fixed-/tmp-path
+        # symlink overwrite. Point it at the sandbox so we do not litter /tmp.
+        marker1 = _create_proof_marker(dir=sb)
+        marker2 = _create_proof_marker(dir=sb)
+        check("marker.created", os.path.isfile(marker1), marker1)
+        check("marker.unpredictable", marker1 != marker2, (marker1, marker2))
+        check("marker.not_fixed_name",
+              not marker1.endswith("whetstone-scheduled-task.proof"), marker1)
+        os.remove(marker1)
+        os.remove(marker2)
 
         # persistence_install: each mechanism creates + cleans its artefact.
         for mech in ("autorun", "cron", "service", "profile"):

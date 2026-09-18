@@ -2,6 +2,10 @@
 
 > A real run, captured verbatim. The observations are what the adapter
 > returned from the actual target; nothing here is illustrative.
+>
+> **Host identity is substituted.** The account name reads `operator` and the
+> per-user temp directory reads `/tmp`, because this repository is public.
+> Nothing else is edited — see [`README.md`](README.md).
 
 | | |
 |---|---|
@@ -64,7 +68,7 @@
   "services": [
     {
       "name": "acme-agent",
-      "path": "/private/var/folders/xk/bwj0m73x24n6k48n0hq6v44c0000gn/T/whetstone-lab-8c2owhk1/opt/acme/acme-agent",
+      "path": "/tmp/whetstone-lab-8c2owhk1/opt/acme/acme-agent",
       "runs_as": "root",
       "mode": "0o777"
     }
@@ -129,7 +133,7 @@
 {
   "findings": [
     {
-      "path": "/private/var/folders/xk/bwj0m73x24n6k48n0hq6v44c0000gn/T/whetstone-lab-8c2owhk1/etc/acme.conf",
+      "path": "/tmp/whetstone-lab-8c2owhk1/etc/acme.conf",
       "line": "password = hunter2-do-not-ship",
       "technique": "T1552.001"
     }
@@ -144,7 +148,7 @@
 {
   "os": "sandbox-linux",
   "hostname": "acme-lab",
-  "root": "/private/var/folders/xk/bwj0m73x24n6k48n0hq6v44c0000gn/T/whetstone-lab-8c2owhk1",
+  "root": "/tmp/whetstone-lab-8c2owhk1",
   "kernel": "6.1.0-lab"
 }
 ```
@@ -192,7 +196,7 @@
 {
   "findings": [
     {
-      "path": "/private/var/folders/xk/bwj0m73x24n6k48n0hq6v44c0000gn/T/whetstone-lab-8c2owhk1/opt/acme/acme-agent",
+      "path": "/tmp/whetstone-lab-8c2owhk1/opt/acme/acme-agent",
       "mode": "0o777",
       "runs_as": "root",
       "technique": "T1574.010",
@@ -207,7 +211,7 @@
 
 ```json
 {
-  "changed": "/private/var/folders/xk/bwj0m73x24n6k48n0hq6v44c0000gn/T/whetstone-lab-8c2owhk1/opt/acme/acme-agent",
+  "changed": "/tmp/whetstone-lab-8c2owhk1/opt/acme/acme-agent",
   "bytes_written": 59,
   "ran_as": "root",
   "cleanup": "succeeded",
@@ -230,7 +234,7 @@
 
 ```json
 {
-  "source": "/private/var/folders/xk/bwj0m73x24n6k48n0hq6v44c0000gn/T/whetstone-lab-8c2owhk1/etc/acme.conf",
+  "source": "/tmp/whetstone-lab-8c2owhk1/etc/acme.conf",
   "secrets_found": 1,
   "accounts": [
     "db"
@@ -256,7 +260,7 @@
 
 ```json
 {
-  "installed_in": "/private/var/folders/xk/bwj0m73x24n6k48n0hq6v44c0000gn/T/whetstone-lab-8c2owhk1/etc/crontab",
+  "installed_in": "/tmp/whetstone-lab-8c2owhk1/etc/crontab",
   "entry": "@reboot root /tmp/.whetstone-marker  # whetstone persistence test",
   "cleanup": "succeeded",
   "telemetry_written": false

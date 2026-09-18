@@ -73,6 +73,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import tarfile
 from collections import Counter
 from datetime import datetime, timezone
@@ -192,6 +193,22 @@ _MIN_CHARS = 120
 #: mysteriously thin build report.
 _MIN_DETECTIONS = 1200
 
+#: A ceiling on one archive member, and a different kind of ceiling from
+#: :data:`_MIN_CHARS`: a file over this is not a quality problem, it is an
+#: accident or an attack. Extraction below used to be
+#: ``target.write_bytes(stream.read())``, one allocation of whatever the member
+#: declared, and NUL bytes gzip at roughly 1000:1 — so a member holding 8 GiB of
+#: them leaves the tarball looking normal on the wire and then asks for an 8 GiB
+#: allocation. On this machine that is a MemoryError that kills the build, or an
+#: OOM kill that picks whatever else is running.
+#:
+#: Checked against ``member.size`` *before* extracting, which is sound rather
+#: than trusting: tarfile bounds the reader it returns to exactly the declared
+#: length, so a member cannot deliver more than its header claims. The largest
+#: real file here is the 2.1 MB ``lookups/csv/dynamic_dns_providers_default.csv``,
+#: so this leaves eight times the room it needs and still refuses a bomb.
+_MAX_MEMBER_BYTES = 16 * 1024 * 1024
+
 
 def _relative(member_name: str) -> str | None:
     """Repo-relative path for a tar member, or ``None`` if it is not safe.
@@ -268,10 +285,17 @@ def _fetch(cache_dir: Path) -> Path:
                     rel = _relative(member.name)
                     if rel is None:
                         continue
+                    # Before extracting anything, including the licence: see
+                    # _MAX_MEMBER_BYTES for why the archive's own size is no
+                    # evidence about a member's. The holdback counters below
+                    # still see the member, because a declined member should be
+                    # counted honestly whatever the reason for declining it.
+                    oversize = member.size > _MAX_MEMBER_BYTES
                     if rel == "LICENSE":
                         stream = tar.extractfile(member)
-                        if stream is not None:
-                            (cache_dir / "LICENSE").write_bytes(stream.read())
+                        if stream is not None and not oversize:
+                            with stream, (cache_dir / "LICENSE").open("wb") as handle:
+                                shutil.copyfileobj(stream, handle, 1 << 20)
                         continue
                     # Count what the tree offered and we declined, without
                     # spending the bytes to extract it — the holdback report
@@ -281,7 +305,7 @@ def _fetch(cache_dir: Path) -> Path:
                             skipped_files[tree] += 1
                             skipped_bytes[tree] += member.size
                             break
-                    if not _wanted(rel):
+                    if not _wanted(rel) or oversize:
                         continue
                     target = staging / rel
                     if not target.resolve().is_relative_to(resolved):
@@ -290,7 +314,13 @@ def _fetch(cache_dir: Path) -> Path:
                     if stream is None:
                         continue
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_bytes(stream.read())
+                    # Copied a megabyte at a time rather than read() into one
+                    # buffer, so peak memory is a chunk and not the file. The
+                    # ceiling above makes this belt and braces; the shape is here
+                    # so a later edit that raises the ceiling does not silently
+                    # reintroduce the allocation.
+                    with stream, target.open("wb") as handle:
+                        shutil.copyfileobj(stream, handle, 1 << 20)
                     kept[rel.split("/", 1)[0]] += 1
         except tarfile.TarError as exc:
             raise SourceError(
@@ -339,11 +369,9 @@ def _fetch(cache_dir: Path) -> Path:
 
 
 def _rmtree(path: Path) -> None:
-    """Remove a directory tree if present, without importing shutil for one call."""
+    """Remove a directory tree if present."""
     if not path.exists():
         return
-    import shutil
-
     shutil.rmtree(path, ignore_errors=True)
 
 

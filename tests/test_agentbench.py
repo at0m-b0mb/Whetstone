@@ -338,7 +338,13 @@ class TestMetricsDoNotCollapse:
             wrap_executor=lambda inner: BrokenDetection(inner))
         assert score.gaps_reported == set(), (
             "an unknown control state must not be reported as a gap")
-        assert score.undetermined == 1
+        # Two, not one: the broken probe, plus detect.process_creation, which
+        # the kernel submits with no `image` because no red handler tells it
+        # which one to match. With telemetry on that probe returns a hit it
+        # cannot attribute to the exploit — background telemetry counts too —
+        # and an unattributable hit is another unknown control state rather
+        # than a control that fired. See Kernel._check_detections.
+        assert score.undetermined == 2
 
 
 # --------------------------------------------------------------------------

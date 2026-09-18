@@ -13,6 +13,25 @@ out of scope even if a wider CIDR in ``hosts`` covers it. The gateway inside the
 lab subnet is the classic case, and the safe default is that the narrower, more
 explicit statement of "not this one" wins.
 
+That promise has a sharp edge, because one machine can be named two ways and
+scope never resolves a name — DNS is not ours, and authority must not depend on
+something we do not control. An exclusion written ``10.20.4.1`` therefore cannot
+recognise the same gateway reached as ``gw.lab.internal``. The two directions
+fail in opposite ways: a pattern that can never match is fail-closed in ``hosts``
+(everything is denied and the operator notices within a minute) and fail-OPEN in
+``exclude_hosts``, where nothing ever reports that the carve-out did not fire. So
+a document whose ``hosts`` admits a naming form that none of its ``exclude_hosts``
+uses is refused at load (:func:`_validate_scope`), and the operator writes each
+carve-out in every form the scope admits.
+
+*A host value has exactly one legal form.* The gate must rule on the same string
+the adapter will ultimately dial, or the check is theatre. The adapters strip a
+leading ``host:`` and split a ``:port`` off a host before they open a socket, so
+``dc01.lab.internal:22`` and ``host:dc01.lab.internal`` are each two strings
+wearing one coat: the gate matched the whole thing and the socket went somewhere
+else. :func:`host_form_error` refuses those shapes rather than growing a fourth
+parser here that would have to agree with the other three forever.
+
 *An absent engagement is not an unrestricted one.* With no engagement file
 loaded, :func:`null_engagement` gives you loopback-only, observe-only, blue-and-
 neutral-only. You can read your own machine and nothing else. This is the mode
@@ -45,6 +64,7 @@ __all__ = [
     "null_engagement",
     "load_engagement",
     "parse_engagement",
+    "host_form_error",
 ]
 
 
@@ -55,22 +75,119 @@ class EngagementError(ValueError):
 _LOOPBACK_NAMES = frozenset({"localhost", "127.0.0.1", "::1", "loopback", ""})
 
 
+def _as_address(text: str) -> ipaddress._BaseAddress | None:
+    """Parse ``text`` as a bare IP literal, or return None if it is not one."""
+    try:
+        return ipaddress.ip_address(text)
+    except ValueError:
+        return None
+
+
 def _is_loopback(host: str) -> bool:
     h = host.strip().lower()
     if h in _LOOPBACK_NAMES:
         return True
-    try:
-        return ipaddress.ip_address(h).is_loopback
-    except ValueError:
-        return False
+    addr = _as_address(h)
+    return addr is not None and addr.is_loopback
 
 
 def _as_network(text: str) -> ipaddress._BaseNetwork | None:
-    """Parse ``text`` as an IP or CIDR, or return None if it is a hostname."""
+    """Parse ``text`` as an IP or CIDR, or return None if it is a hostname.
+
+    ``strict=True`` is load-bearing. Under ``strict=False`` — which is what this
+    used to pass — ``ip_network("192.168.1.50/24")`` does not fail; it discards
+    the host bits and hands back ``192.168.1.0/24``, so an operator who copied
+    one workstation's address out of ``ip addr show`` silently authorised 256
+    machines. Nothing said so: the document still read ``192.168.1.50/24`` and
+    :meth:`Engagement.summary` echoed the operator's own text back at them.
+    Strict parsing turns that into a pattern that does not parse, which
+    :func:`_pattern_form` then refuses at load with a message naming the entry
+    and both readings. Nothing legitimate depended on the loose mode — a bare
+    ``10.0.0.5`` still parses, as a /32.
+    """
     try:
-        return ipaddress.ip_network(text, strict=False)
+        return ipaddress.ip_network(text, strict=True)
     except ValueError:
         return None
+
+
+#: Substrings that mean a host value is carrying something other than a host:
+#: a scheme, a path or CIDR suffix, userinfo, a bracketed literal, or a glob
+#: that belongs in a scope pattern rather than in an action.
+_HOST_VALUE_BANS: tuple[tuple[str, str], ...] = (
+    ("://", "looks like a URL; a host names a machine, not a service"),
+    ("/", "contains '/', so it is a CIDR or a path rather than one host"),
+    ("@", "contains '@'; credentials do not travel in a host value"),
+    ("[", "is bracketed; write an IPv6 literal bare, because no adapter unbrackets it"),
+    ("]", "is bracketed; write an IPv6 literal bare, because no adapter unbrackets it"),
+    ("*", "contains a glob; a glob is a scope *pattern*, and an action runs against one host"),
+    ("?", "contains a glob; a glob is a scope *pattern*, and an action runs against one host"),
+)
+
+
+def host_form_error(value: str) -> str | None:
+    """Why ``value`` is not a host the gate may rule on, or None if it is one.
+
+    The gate has to judge the exact string an adapter will hand to
+    ``socket.create_connection``, or the check is theatre. Every adapter
+    re-parses a host before it dials: all three strip a leading ``host:`` and
+    then cut a port off at a colon — ``adapters/macos.py`` and
+    ``adapters/windows.py`` at the first colon, ``adapters/linux.py`` at the
+    last. So the gate matched ``evil.example.com:443.lab.internal`` against
+    ``*.lab.internal``, said ALLOW, and the socket went to evil.example.com:443.
+    The same trick walks past an exclusion from the other side:
+    ``host:dc01.lab.internal`` is not the excluded ``dc01.lab.internal`` to a
+    literal comparison, but the ``*`` in an inclusion glob eats the prefix that
+    the adapter then strips back off.
+
+    The repair is not a fourth parser here. A parser differential is what caused
+    this, and a copy of the splitting logic in the gate would have to stay in
+    agreement with three adapters that already disagree with each other about
+    which colon wins. Instead a host value has one legal form — a bare hostname,
+    an IPv4 literal or an IPv6 literal — on which the adapters' stripping and
+    splitting are the identity, so what was authorised is provably what gets
+    dialled. Anything else is refused, and the refusal names the part of the
+    string that did it.
+
+    The one surviving gap is an IPv6 literal, which is a real host but does
+    contain colons, so the ``sink`` splitters still cut it in half. That mangles
+    the probe rather than aiming it somewhere an attacker chose, and closing it
+    properly means giving ``postex.exfil_probe`` its own integer ``port``
+    parameter and deleting the splits — a change in ``whetstone/verbs.py`` and
+    the three adapters, not here. Until then this function admits IPv6 because
+    the corpus and the target path treat it as an ordinary host, and refuses
+    every colon that is not part of one.
+    """
+    if not value.strip():
+        return "is blank"
+    if value != value.strip():
+        return (
+            "carries surrounding whitespace, so the gate would match the "
+            "trimmed string while an adapter dials the raw one"
+        )
+    if any(ch.isspace() for ch in value):
+        return "contains whitespace, so it is not a single host"
+    for needle, why in _HOST_VALUE_BANS:
+        if needle in value:
+            return why
+    if value.lower().startswith("host:"):
+        # Named separately from the host:port case below because it is the one
+        # that defeats an *exclusion*: the prefix is invisible to a literal
+        # comparison, an inclusion glob swallows it, and the adapter takes it
+        # straight back off before dialling the host underneath.
+        return (
+            "starts with 'host:', a prefix every adapter strips before it "
+            "dials, so the gate would be ruling on characters the socket never "
+            "sees"
+        )
+    if ":" in value and _as_address(value) is None:
+        return (
+            "looks like host:port. The port has to travel in its own parameter: "
+            "the gate would scope-check the whole string while an adapter splits "
+            "it at a colon and dials only one side, and a 'host:' prefix that an "
+            "adapter strips is enough to walk past an exclusion"
+        )
+    return None
 
 
 def _parse_ts(value: Any, field_name: str) -> datetime | None:
@@ -115,6 +232,15 @@ class Scope:
     glob such as ``*.lab.internal``. Path patterns are directory prefixes and
     are compared after resolution, so a symlink out of the tree does not escape
     the scope — it resolves to somewhere outside and is refused.
+
+    Two rules about host strings live either side of this class, and both exist
+    because a machine can be named more than one way. A carve-out has to appear
+    in every naming form the scope admits, which :func:`_validate_scope` checks
+    when an :class:`Engagement` is built rather than here, where a mismatch
+    would be undecidable without DNS. And the host *values* compared against
+    these patterns have exactly one legal form — see :func:`host_form_error` —
+    because the gate must judge the string an adapter will dial, not a longer
+    one that contains it.
     """
 
     hosts: tuple[str, ...] = ()
@@ -126,10 +252,23 @@ class Scope:
     allow_loopback: bool = False
 
     def host_excluded(self, host: str) -> str | None:
-        """Return the exclusion pattern that covers ``host``, if any."""
-        return _match_host(host, self.exclude_hosts)
+        """Return the exclusion pattern that covers ``host``, if any.
+
+        Deliberately does *not* refuse a malformed host the way
+        :meth:`host_included` does. A string nobody should be acting on is still
+        excluded if an exclusion catches it; dropping out early here would be
+        the one direction where being strict grants authority.
+        """
+        return _match_host(host, self.exclude_hosts, exclusion=True)
 
     def host_included(self, host: str) -> str | None:
+        if host_form_error(host) is not None:
+            # Not a host this gate can honestly compare: the adapter would act
+            # on a different string than the one matched here, so treating the
+            # match as authorisation is exactly the bypass host_form_error
+            # exists to describe. Inclusion is the direction where being wrong
+            # hands out authority, so it fails closed.
+            return None
         if self.allow_loopback and _is_loopback(host):
             return "loopback"
         return _match_host(host, self.hosts)
@@ -141,22 +280,46 @@ class Scope:
         return _match_path(path, self.paths)
 
 
-def _match_host(host: str, patterns: Sequence[str]) -> str | None:
-    """Return the first pattern in ``patterns`` matching ``host``, else None."""
+def _match_host(host: str, patterns: Sequence[str], *, exclusion: bool = False) -> str | None:
+    """Return the first pattern in ``patterns`` matching ``host``, else None.
+
+    ``exclusion`` is not cosmetic. The same comparison serves both directions,
+    but the two directions fail opposite ways — a pattern that cannot match
+    denies everything in ``hosts`` and permits everything in ``exclude_hosts``,
+    silently — so an exclusion is allowed to match *more*, and every asymmetry
+    below leans that way. Two exclusion shapes used to be inert:
+
+    ``exclude_hosts: ["10.0.0.*"]``
+        A glob was only ever compared against a host that was not an IP, so a
+        glob written over a range of addresses excluded nothing at all while
+        reading, in the document, exactly as if it did. Under ``exclusion`` the
+        glob is applied to the address text too.
+
+    ``exclude_hosts: ["127.0.0.1"]`` with ``allow_loopback``
+        ``localhost`` is the same machine and a different string. Loopback is
+        the one cross-form case that is decidable without asking DNS, because
+        the standard fixes both forms, so an exclusion naming loopback in any
+        form covers loopback named in any other.
+
+    The remaining cross-form case — an address exclusion against a target named
+    by hostname — cannot be decided here at all without resolving the name,
+    which this function refuses to do on purpose. :func:`_validate_scope`
+    refuses the *document* instead, at load, where a human can fix it.
+    """
     h = host.strip().lower()
     if not h:
         return None
-    addr: ipaddress._BaseAddress | None
-    try:
-        addr = ipaddress.ip_address(h)
-    except ValueError:
-        addr = None
+    addr = _as_address(h)
 
     for pat in patterns:
         p = pat.strip().lower()
         if not p:
             continue
         net = _as_network(p)
+        if exclusion and _is_loopback(h) and (
+            _is_loopback(p) or (net is not None and net.is_loopback)
+        ):
+            return pat
         if net is not None:
             # Pattern is an IP or CIDR. It can only match an IP target; a
             # hostname is not silently resolved, because resolution depends on
@@ -164,7 +327,7 @@ def _match_host(host: str, patterns: Sequence[str]) -> str | None:
             if addr is not None and addr in net:
                 return pat
             continue
-        if addr is None and fnmatch.fnmatch(h, p):
+        if (addr is None or exclusion) and fnmatch.fnmatch(h, p):
             return pat
     return None
 
@@ -185,6 +348,129 @@ def _match_path(path: str, patterns: Sequence[str]) -> str | None:
         if target == root or root in target.parents:
             return pat
     return None
+
+
+#: The two ways a scope pattern can name a machine. They are not interchangeable
+#: and nothing here translates between them, because translating means asking
+#: DNS and scope must not depend on DNS.
+_FORM_ADDRESS = "address"
+_FORM_NAME = "name"
+
+#: Written for the operator, not for the parser: each form paired with the
+#: reason the *other* form cannot stand in for it.
+_FORM_PROSE: dict[str, tuple[str, str]] = {
+    _FORM_NAME: (
+        "by name",
+        "An address exclusion can never match a host reached by name, because "
+        "the gate does not resolve names — so the machine you carved out is "
+        "still in scope under its hostname.",
+    ),
+    _FORM_ADDRESS: (
+        "by address",
+        "A name exclusion can never match a host reached by address, because "
+        "the gate does not resolve names — so the machine you carved out is "
+        "still in scope under its IP.",
+    ),
+}
+
+
+def _pattern_form(pat: str, where: str) -> str:
+    """Classify one scope pattern, or raise :class:`EngagementError`.
+
+    Every pattern is either an address form (a literal or a CIDR) or a name form
+    (a hostname or a glob), and a pattern that is neither is rejected here
+    rather than being quietly filed under "name", where it would become a glob
+    that matches nothing: inert in ``hosts`` is merely annoying, inert in
+    ``exclude_hosts`` is an authorisation bypass that reads correctly in the
+    document.
+    """
+    p = pat.strip().lower()
+    if not p:
+        raise EngagementError(f"{where}: an empty pattern matches nothing; remove it")
+    if "/" in p:
+        if _as_network(p) is not None:
+            return _FORM_ADDRESS
+        try:
+            loose = ipaddress.ip_network(p, strict=False)
+        except ValueError:
+            raise EngagementError(
+                f"{where}: {pat!r} contains '/' but is not a CIDR block"
+            ) from None
+        # Reached only via strict parsing having refused it: the operator wrote
+        # an address with a prefix length that does not cover it, which is what
+        # `ip addr show` prints. The two readings differ by the whole subnet, so
+        # they have to say which one they signed for.
+        host_part = p.split("/", 1)[0]
+        raise EngagementError(
+            f"{where}: {pat!r} has host bits set. Write "
+            f"{loose.network_address}/{loose.prefixlen} for the whole subnet or "
+            f"{host_part}/{loose.max_prefixlen} for that one host — the two "
+            f"differ by {loose.num_addresses} machines, so say which you mean."
+        )
+    if _as_address(p) is not None:
+        return _FORM_ADDRESS
+    # Whatever is left has to be a hostname or a hostname glob. A glob is legal
+    # in a pattern and nowhere else — that is the only way patterns are laxer
+    # than values — and anything else is refused rather than filed under "name",
+    # where it would become a glob that matches nothing while reading, in the
+    # document, exactly like a carve-out.
+    for needle, why in (
+        ("@", "contains '@'; a scope pattern names machines, not accounts"),
+        ("[", "is bracketed; write an IPv6 pattern bare"),
+        ("]", "is bracketed; write an IPv6 pattern bare"),
+        (":", "contains a colon but is not an IPv6 address or network, and a "
+              "port is not part of a host pattern"),
+    ):
+        if needle in p:
+            raise EngagementError(f"{where}: {pat!r} {why}")
+    if any(ch.isspace() for ch in p):
+        raise EngagementError(
+            f"{where}: {pat!r} contains whitespace, so it is not one host pattern"
+        )
+    return _FORM_NAME
+
+
+def _validate_scope(scope: Scope) -> None:
+    """Refuse a scope whose exclusions cannot reach what its inclusions admit.
+
+    This is the only place the cross-form hole can be caught. At match time the
+    two naming forms are genuinely incomparable without DNS, and an exclusion
+    that cannot fire is invisible: ``host_excluded`` returns None, the policy
+    rule reads that as "not excluded", and nothing anywhere says the carve-out
+    never applied. Whetstone's own shipped example was this shape — a /24 and
+    ``*.lab.internal`` in ``hosts``, two bare addresses in ``exclude_hosts`` —
+    and a credential dump against the excluded gateway was ALLOW the moment it
+    was named ``gw.lab.internal`` instead of ``10.20.4.1``.
+
+    So: if the document admits hosts in a form that no exclusion uses, it does
+    not load. The operator writes each carve-out in every form the scope admits,
+    which is a sentence of typing and the only statement that means what the
+    document appears to say. Note this fires on the *scope*, not on the match,
+    so it costs nothing at decision time and cannot be argued with at 2am.
+    """
+    included: dict[str, list[str]] = {}
+    for pat in scope.hosts:
+        included.setdefault(_pattern_form(pat, "scope.hosts"), []).append(pat)
+    excluded: dict[str, list[str]] = {}
+    for pat in scope.exclude_hosts:
+        excluded.setdefault(_pattern_form(pat, "scope.exclude_hosts"), []).append(pat)
+
+    if not excluded:
+        # Nothing to be inert. A scope with no carve-outs promises nothing about
+        # them, and loopback is handled by _is_loopback, which knows both forms.
+        return
+
+    for form in (_FORM_NAME, _FORM_ADDRESS):
+        if form not in included or form in excluded:
+            continue
+        admits, why = _FORM_PROSE[form]
+        raise EngagementError(
+            f"scope.hosts admits hosts {admits} "
+            f"({', '.join(repr(p) for p in included[form])}) but no entry in "
+            f"scope.exclude_hosts is written that way "
+            f"({', '.join(repr(p) for p in sum(excluded.values(), []))}). "
+            f"{why} List every excluded host in each form this scope admits."
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,6 +527,11 @@ class Engagement:
     def __post_init__(self) -> None:
         if not self.name.strip():
             raise EngagementError("engagement has no name")
+        # Validated on the object rather than in parse_engagement so that an
+        # engagement assembled in code — the corpus builder and the lab both do
+        # this — cannot hold an inert exclusion either. There is one shape of
+        # authority in this system, and it is checked in one place.
+        _validate_scope(self.scope)
         if self.starts and self.expires and self.expires <= self.starts:
             raise EngagementError(
                 f"engagement {self.name!r} expires at or before it starts"

@@ -121,6 +121,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import tarfile
 import textwrap
 import tomllib
@@ -191,6 +192,23 @@ _SKIPPED_TREES: tuple[str, ...] = ("hunting/",)
 #: instead of a mysteriously thin build report.
 _MIN_RULE_FILES = 1500
 
+#: A ceiling on one archive member, and a different kind of ceiling from
+#: :data:`_MIN_CHARS` below: a rule file over this is not a quality problem, it
+#: is an accident or an attack. The extraction below used to be
+#: ``target.write_bytes(stream.read())``, one allocation of whatever the member
+#: declared. NUL bytes gzip at roughly 1000:1, so a single ``rules/windows/
+#: bogus.toml`` holding 8 GiB of them — a committed core dump, or a commit after
+#: an upstream compromise — leaves the 62 MB tarball looking entirely normal and
+#: then asks for an 8 GiB allocation. On this machine that is a MemoryError that
+#: kills the build, or an OOM kill that picks the training run instead.
+#:
+#: Checked against ``member.size`` *before* extracting, which is sound rather
+#: than trusting: tarfile bounds the reader it returns to exactly the declared
+#: length, so a member cannot deliver more than its header claims. The largest
+#: real file in this tree is 53 KB, so this leaves three hundred times the room
+#: it needs and still refuses a bomb.
+_MAX_MEMBER_BYTES = 16 * 1024 * 1024
+
 #: A rendered rule is always a header plus a description, so real documents start
 #: around 500 characters. Below this, something is a stub or a parse casualty.
 _MIN_CHARS = 200
@@ -256,8 +274,6 @@ def _wanted(rel: str) -> bool:
 def _rmtree(path: Path) -> None:
     if not path.exists():
         return
-    import shutil
-
     shutil.rmtree(path, ignore_errors=True)
 
 
@@ -310,10 +326,16 @@ def _fetch(cache_dir: Path) -> Path:
                     rel = _relative(member.name)
                     if rel is None:
                         continue
+                    # Before extracting anything, including the licence: see
+                    # _MAX_MEMBER_BYTES for why the archive's own size is no
+                    # evidence about a member's.
+                    if member.size > _MAX_MEMBER_BYTES:
+                        continue
                     if rel in _LICENSE_FILES:
                         stream = tar.extractfile(member)
                         if stream is not None:
-                            (cache_dir / rel).write_bytes(stream.read())
+                            with stream, (cache_dir / rel).open("wb") as handle:
+                                shutil.copyfileobj(stream, handle, 1 << 20)
                         continue
                     if not _wanted(rel):
                         continue
@@ -324,7 +346,13 @@ def _fetch(cache_dir: Path) -> Path:
                     if stream is None:
                         continue
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_bytes(stream.read())
+                    # Copied a megabyte at a time rather than read() into one
+                    # buffer, so peak memory is a chunk and not the file. The
+                    # ceiling above makes this belt and braces; the shape is
+                    # here so a later edit that raises the ceiling does not
+                    # silently reintroduce the allocation.
+                    with stream, target.open("wb") as handle:
+                        shutil.copyfileobj(stream, handle, 1 << 20)
                     kept[rel.split("/", 1)[0]] += 1
         except tarfile.TarError as exc:
             raise SourceError(

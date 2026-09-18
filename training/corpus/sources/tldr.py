@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import io
 import os
+import shutil
 import tarfile
 from pathlib import Path
 from typing import Iterator
@@ -56,6 +57,23 @@ _PAGES_ROOT = "pages"
 
 _MIN_CHARS = 120
 
+#: A ceiling on one archive member, and a different kind of ceiling from
+#: :data:`_MIN_CHARS`: a page over this is not a quality problem, it is an
+#: accident or an attack. Extraction below used to be
+#: ``target.write_bytes(extracted.read())``, one allocation of whatever the
+#: member declared, and NUL bytes gzip at roughly 1000:1 — so a single
+#: ``pages/linux/x.md`` holding 8 GiB of them leaves the tarball looking
+#: entirely ordinary on the wire and then asks for an 8 GiB allocation. On this
+#: machine that is a MemoryError that kills the build, or an OOM kill that picks
+#: whatever else is running.
+#:
+#: Checked against ``member.size`` *before* extracting, which is sound rather
+#: than trusting: tarfile bounds the reader it returns to exactly the declared
+#: length, so a member cannot deliver more than its header claims. A tldr page
+#: is a screenful — the largest of the 7,518 here is 2.3 KB — so a 4 MB ceiling
+#: is already absurdly generous.
+_MAX_MEMBER_BYTES = 4 * 1024 * 1024
+
 
 def _fetch(cache_dir: Path) -> Path:
     """Download and extract the page tree. Idempotent and network-free when warm."""
@@ -71,6 +89,10 @@ def _fetch(cache_dir: Path) -> Path:
             for member in tar.getmembers():
                 if not member.isfile() or not member.name.endswith(".md"):
                     continue
+                # Before extracting: see _MAX_MEMBER_BYTES for why the
+                # tarball's own size is no evidence about a member's.
+                if member.size > _MAX_MEMBER_BYTES:
+                    continue
                 parts = Path(member.name).parts[1:]        # drop the tldr-main/ root
                 if not parts or parts[0] != _PAGES_ROOT:
                     continue
@@ -83,7 +105,13 @@ def _fetch(cache_dir: Path) -> Path:
                 extracted = tar.extractfile(member)
                 if extracted is None:
                     continue
-                target.write_bytes(extracted.read())
+                # Copied a megabyte at a time rather than read() into one
+                # buffer, so peak memory is a chunk and not the file. The
+                # ceiling above makes this belt and braces; the shape is here so
+                # a later edit that raises the ceiling does not silently
+                # reintroduce the allocation.
+                with extracted, target.open("wb") as handle:
+                    shutil.copyfileobj(extracted, handle, 1 << 20)
         marker.write_text("ok", encoding="utf-8")
     except Exception as exc:
         raise SourceError(f"tldr: fetch failed: {type(exc).__name__}: {exc}") from None

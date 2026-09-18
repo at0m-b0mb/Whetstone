@@ -78,8 +78,35 @@ def score_continuations(
     decoder then returned the same verb for every task while its own runners-up
     were visibly better. The flag is kept because length bias is real when the
     candidate set is open; for a registry it is not.
+
+    **The slice before the softmax is load-bearing, not tidiness.** Only the
+    candidate's own positions are ever read — about nine tokens for
+    ``{"verb":"<id>"`` — while the forward pass produces logits for every
+    position of the prompt as well, and the prompt is an entire episode
+    transcript that grows with each turn. Normalising the whole tensor and then
+    indexing into it allocated two full-vocabulary float32 copies of it: at 27
+    permitted verbs, a 1,700-token prompt and a 16,384 vocabulary that is 3.0 GB
+    each, live at once, to read 243 numbers. On a laptop that is also holding a
+    training run it is an allocation failure or minutes of swap per agent turn,
+    and it gets worse with every verb added to the registry and every turn added
+    to the episode. Slicing first is exact rather than approximate — a softmax is
+    computed per position over the vocabulary axis, so which positions are kept
+    cannot change the value of the ones that are — and it makes the cost depend
+    on the candidates instead of on the transcript.
     """
     prompt_ids = tok.encode(prompt).ids
+    if not prompt_ids:
+        raise ValueError(
+            "score_continuations needs a non-empty prompt. A candidate's first "
+            "token is scored at the position *before* it, so an empty prompt "
+            "makes that index -1, which in MLX reads the last position of the "
+            "row and returns a confident number computed from the wrong place. "
+            "Every real caller passes render_prompt output, which opens with "
+            "<|bos|>; a caller that does not should hear about it."
+        )
+    if not candidates:
+        return []
+
     rows: list[list[int]] = []
     spans: list[int] = []
     for cand in candidates:
@@ -87,25 +114,43 @@ def score_continuations(
         rows.append(prompt_ids + cand_ids)
         spans.append(len(cand_ids))
 
+    empty = [c for c, span in zip(candidates, spans) if span == 0]
+    if empty:
+        raise ValueError(
+            f"candidate {empty[0]!r} tokenises to no tokens, so there is "
+            "nothing to take the log-probability of. The tempting answer is the "
+            "empty sum, 0.0 — and every real candidate scores negative, so the "
+            "candidate nobody can score would win the ranking outright."
+        )
+
     width = max(len(r) for r in rows)
     pad_id = tok.token_to_id("<|pad|>") or 0
     batch = mx.array([r + [pad_id] * (width - len(r)) for r in rows])
 
     logits, _ = model(batch[:, :-1])
-    logprobs = logits.astype(mx.float32) - mx.logsumexp(
-        logits.astype(mx.float32), axis=-1, keepdims=True
-    )
-    mx.eval(logprobs)
 
-    out: list[float] = []
+    # Positions start-1 .. start+reach-2 predict the candidate tokens at
+    # start .. start+reach-1, and nothing else in the pass is ever read.
     start = len(prompt_ids)
-    for i, span in enumerate(spans):
-        total = 0.0
-        for j in range(span):
-            pos = start + j - 1          # position predicting token at start+j
-            token = int(batch[i, start + j].item())
-            total += float(logprobs[i, pos, token].item())
-        out.append(total / span if (length_normalise and span) else total)
+    reach = max(spans)
+    window = logits[:, start - 1:start - 1 + reach, :].astype(mx.float32)
+    logprobs = window - mx.logsumexp(window, axis=-1, keepdims=True)
+
+    # One gather instead of a scalar read per token: the loop that was here
+    # called .item() twice per candidate token, and each call is a device
+    # synchronisation — roughly 250 of them per agent turn, spent fetching
+    # numbers that were already on the device.
+    wanted = batch[:, start:start + reach]
+    picked = mx.take_along_axis(logprobs, wanted[:, :, None], axis=-1)[:, :, 0]
+    # Candidates differ in length, so the batch is scored to the longest and the
+    # overhang — which sits on padding — is zeroed rather than summed.
+    live = (mx.arange(reach)[None, :] < mx.array(spans)[:, None]).astype(mx.float32)
+    totals = (picked * live).sum(axis=1)
+    mx.eval(totals)
+
+    out = [float(t) for t in totals.tolist()]
+    if length_normalise:
+        out = [t / span for t, span in zip(out, spans)]
     return out
 
 

@@ -45,6 +45,7 @@ tokenizer that can fail on input is a runtime that can crash on evidence.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -240,24 +241,76 @@ def compare(tok: Tokenizer | None) -> None:
           f"hour and {saved:.0f}% more log output per context window.")
 
 
-#: Every Nth document is withheld from tokenizer training and used only for the
-#: compression measurement. Deterministic by position so the split is identical
-#: on every run and across machines — a shuffled split would put near-duplicate
-#: passages on both sides and flatter the result.
+#: Roughly one document in this many is withheld from tokenizer training and
+#: used only for the compression measurement.
 HOLDOUT_EVERY = 20
+
+#: How a document's side of the split is decided. Recorded in meta.json so that
+#: a later ``--compare`` can prove it is measuring the same partition the
+#: tokenizer was fitted against — a tokenizer trained under one rule and
+#: measured under another has no holdout at all. Change the rule below, change
+#: this string, and every tokenizer fitted under the old one is refused instead
+#: of quietly mismeasured.
+HOLDOUT_SCHEME = "fingerprint"
+
+
+def corpus_identity(clean_dir: Path) -> str:
+    """Name the exact corpus build a tokenizer was fitted to, from one stat each.
+
+    File names and sizes, hashed. Deliberately not a content digest: reading half
+    a gigabyte to label a measurement would cost more than the measurement does.
+    Any rebuild that changes what a source contributed changes that source's file
+    size, which is the whole of what this has to notice.
+    """
+    h = hashlib.sha256()
+    for path in sorted(clean_dir.glob("*.jsonl")):
+        h.update(f"{path.name}:{path.stat().st_size}\n".encode())
+    return h.hexdigest()[:16]
 
 
 def iter_split(clean_dir: Path, *, holdout: bool) -> Iterator[tuple[str, str]]:
-    """Yield ``(register, text)`` from the built corpus, train or holdout side."""
-    from ..corpus.build import read_documents
+    """Yield ``(register, text)`` from the built corpus, train or holdout side.
 
-    for i, row in enumerate(read_documents(clean_dir)):
-        is_holdout = (i % HOLDOUT_EVERY) == 0
+    A document's side is decided by its own content, never by where it sits in
+    the directory.
+
+    Position was the original rule — ``i % HOLDOUT_EVERY == 0`` over
+    ``read_documents`` — and it was deterministic in precisely the way that does
+    not help. ``i`` counts every document preceding this one across the sorted
+    ``*.jsonl``, so inserting, dropping or reordering a single document anywhere
+    shifts every index after it and ROTATES the partition: what was training
+    becomes holdout. Rebuilding the corpus was therefore enough to turn the
+    held-out compression number into a memorisation check, with nothing said,
+    and this corpus is rebuilt often. ``tokenizer-v5``'s meta.json records
+    115,849 training documents against a ``clean/`` directory that now holds
+    46,835 — a ``--compare --clean`` against it today would have no holdout in
+    it at all, and that number is the one the from-scratch case rests on.
+
+    Hashing the text fixes the only property that matters: a document's side must
+    not move when its neighbours do. It reuses the corpus's own dedup fingerprint
+    rather than introducing a second hash, so two copies of one document can
+    never land on opposite sides of the split.
+
+    What this does **not** fix, and is worth not pretending about: a held-out
+    document's near neighbours are still on the training side. A hash scatters
+    the split as thoroughly as every-20th did, and sources like sigma group
+    related rules by directory, so a held-out rule's siblings are usually in
+    training. Measured on the built corpus with ``difflib`` over a 449-pair
+    sample of adjacent sigma.jsonl documents, 9% of neighbouring pairs exceed
+    0.6 similarity. Closing that needs the split keyed on a group rather than a
+    document, and ``ident`` is not reliably a path to group by.
+    """
+    from ..corpus.build import read_documents
+    from ..corpus.source import fingerprint
+
+    for row in read_documents(clean_dir):
+        is_holdout = (int(fingerprint(row["text"]), 16) % HOLDOUT_EVERY) == 0
         if is_holdout == holdout:
             yield row.get("register", "unknown"), row["text"]
 
 
-def compare_on_corpus(tok: Tokenizer, clean_dir: Path, *, max_chars_per_register: int = 400_000) -> None:
+def compare_on_corpus(tok: Tokenizer, clean_dir: Path, *, meta: dict | None = None,
+                      max_chars_per_register: int = 400_000) -> None:
     """Measure compression against gpt2 on **held-out real corpus text**, by register.
 
     This is the measurement that actually settles the domain-tokenizer question,
@@ -270,7 +323,46 @@ def compare_on_corpus(tok: Tokenizer, clean_dir: Path, *, max_chars_per_register
     Per-register matters as much as the total. The first attempt's 7% hid a
     +47%/-45% spread, and an aggregate number would have hidden it again. A
     register that loses to gpt2 is a register the corpus is still starved of.
+
+    ``meta`` is the tokenizer's own meta.json, and it is checked before anything
+    is measured. The number below is only held out if this tokenizer was fitted
+    against the same split rule :func:`iter_split` applies now, so a missing or
+    disagreeing record is refused rather than reported. That is the harsher
+    option on purpose: this figure feeds the decision gate at the bottom of this
+    function, and a measurement that has quietly stopped being held out is worse
+    than no measurement — it reads as a win.
     """
+    recorded = (meta or {}).get("holdout")
+    if not isinstance(recorded, dict):
+        raise SystemExit(
+            "this tokenizer's meta.json records no holdout rule, so there is no "
+            "way to tell which documents it was trained on. It was fitted before "
+            "the split was keyed on content, under the positional rule whose "
+            "partition rotates every time the corpus is rebuilt — measuring it "
+            f"against {clean_dir} now would report compression on its own "
+            "training text. Refit the tokenizer against this corpus.")
+    if (recorded.get("scheme"), recorded.get("every")) != (HOLDOUT_SCHEME, HOLDOUT_EVERY):
+        raise SystemExit(
+            f"this tokenizer was fitted with the holdout rule "
+            f"{recorded.get('scheme')!r}/{recorded.get('every')!r}; this code "
+            f"splits with {HOLDOUT_SCHEME!r}/{HOLDOUT_EVERY!r}. The two "
+            f"partitions do not agree, so the held-out side would contain "
+            f"documents the tokenizer trained on. Refit the tokenizer.")
+
+    identity = corpus_identity(clean_dir)
+    if recorded.get("corpus") and recorded["corpus"] != identity:
+        # Not fatal, and the distinction is the point. Because the split is keyed
+        # on content, a document that was on the training side of the old corpus
+        # is on the training side of this one too — so the holdout below really
+        # is held out and the total is sound. What has changed is the register
+        # MIX being measured, which is not the mix this tokenizer was fitted to,
+        # and the per-register rows have to be read as a comparison across two
+        # corpora rather than a report on one.
+        print(f"\nNOTE: fitted to corpus build {recorded['corpus']}, measuring "
+              f"against {identity}. The split is keyed on document content, so "
+              f"this is still genuinely held out — but the register mix below is "
+              f"not the mix the tokenizer was fitted to.", file=sys.stderr)
+
     try:
         from tokenizers import Tokenizer as T
         gpt2 = T.from_pretrained("gpt2")
@@ -291,7 +383,8 @@ def compare_on_corpus(tok: Tokenizer, clean_dir: Path, *, max_chars_per_register
               file=sys.stderr)
         return
 
-    print(f"\ncompression on HELD-OUT corpus text (every {HOLDOUT_EVERY}th document)")
+    print(f"\ncompression on HELD-OUT corpus text "
+          f"(~1 document in {HOLDOUT_EVERY}, chosen by content hash)")
     print(f"{'register':<12}{'chars':>11}{'gpt2 tok':>11}{'ours':>10}{'saved':>8}")
     print("-" * 54)
 
@@ -343,7 +436,13 @@ def main(argv: list[str] | None = None) -> int:
         tok = Tokenizer.from_file(str(existing))
         compare(tok)
         if args.clean:
-            compare_on_corpus(tok, args.clean)
+            # The held-out measurement is only meaningful alongside the record of
+            # how this tokenizer's split was drawn, so it is read from beside the
+            # tokenizer rather than assumed to match the code running now.
+            meta_path = args.out / "meta.json"
+            meta = (json.loads(meta_path.read_text(encoding="utf-8"))
+                    if meta_path.is_file() else {})
+            compare_on_corpus(tok, args.clean, meta=meta)
         return 0
 
     # Train on the training side of the split only, so the held-out measurement
@@ -365,7 +464,8 @@ def main(argv: list[str] | None = None) -> int:
                 yield text
 
         print(f"training on the corpus under {args.clean} "
-              f"(every {HOLDOUT_EVERY}th document held out for measurement)")
+              f"(~1 document in {HOLDOUT_EVERY} held out for measurement, "
+              f"chosen by content hash so a rebuild cannot move it)")
         tok.train_from_iterator(_training_texts(), trainer=trainer)
         if not seen:
             raise SystemExit(f"no documents under {args.clean}")
@@ -373,15 +473,25 @@ def main(argv: list[str] | None = None) -> int:
         texts = None  # noqa: F841  — nothing below may rely on the materialised list
         args.out.mkdir(parents=True, exist_ok=True)
         tok.save(str(args.out / "tokenizer.json"))
-        (args.out / "meta.json").write_text(json.dumps({
+        # The holdout block replaces the bare `holdout_every` this used to write.
+        # A number on its own could not say which RULE produced the partition or
+        # which corpus it was drawn over, which is exactly what a later
+        # --compare has to know before it can claim the measurement is held out.
+        meta = {
             "vocab_size": tok.get_vocab_size(),
             "special_tokens": list(SPECIAL_TOKENS),
             "documents": seen,
-            "holdout_every": HOLDOUT_EVERY,
-        }, indent=2), encoding="utf-8")
+            "holdout": {
+                "scheme": HOLDOUT_SCHEME,
+                "every": HOLDOUT_EVERY,
+                "corpus": corpus_identity(args.clean),
+                "dir": str(args.clean),
+            },
+        }
+        (args.out / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
         print(f"wrote {args.out/'tokenizer.json'} ({tok.get_vocab_size()} tokens)")
         compare(tok)
-        compare_on_corpus(tok, args.clean)
+        compare_on_corpus(tok, args.clean, meta=meta)
         return 0
 
     tok = train(args.corpus, args.out, args.vocab_size)
