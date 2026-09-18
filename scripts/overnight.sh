@@ -18,17 +18,28 @@ set -uo pipefail          # NOT -e: a failed stage must be caught and reported,
                           # not kill the supervisor that is meant to retry it.
 
 D=/Volumes/at0m_b0mb/whetstone
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Overridable, because this script is meant to be run from an immutable
+# snapshot copy: bash reads a script incrementally by byte offset, so editing
+# the file a run is executing can make it resume mid-line. A snapshot lives
+# outside the repo, so it cannot infer the repo from its own path.
+REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 VER=v5
 RUN="$D/runs/overnight-$VER"
 MARK="$RUN/markers"
 MODEL=${MODEL:-small}
 MAX_RETRIES=${MAX_RETRIES:-20}
 HOURS=${HOURS:-9}          # wall-clock budget for pretraining
+# NOT the config default of 8. `small` at micro-batch 8 drove this 24 GB machine
+# into 24.9 GB of swap and never reached step 1; at 4 it sustains ~9,300 tok/s.
+# A run that has started swapping is finished, so this is not a tuning knob.
+MICRO=${MICRO:-4}
 
 mkdir -p "$RUN" "$MARK"
 cd "$REPO" || exit 1
 export PYTHONPATH="$REPO"
+# Unbuffered, or every stage log stays empty until its stage ends and the
+# question "is it still making progress at 3am" has no answer until 7am.
+export PYTHONUNBUFFERED=1
 
 FROM=0
 [[ "${1:-}" == "--from" ]] && FROM="${2:-0}"
@@ -153,6 +164,7 @@ pretrain() {
         if python3 -m training.pretrain --model "$MODEL" \
                 --data "$D/corpus/tokenized-$VER" \
                 --out "$D/models/checkpoints-$VER" \
+                --micro-batch "$MICRO" \
                 --max-steps "$steps" $resume; then
             return 0
         fi
