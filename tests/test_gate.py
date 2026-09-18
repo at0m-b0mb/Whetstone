@@ -709,3 +709,105 @@ class TestCheckRehearsal:
         # 4 techniques authorised; exactly 3 red verbs fall inside them.
         assert "3 of them red" in out
         assert "blocked by technique.unauthorized" in out
+
+
+class TestScopedParameters:
+    """A parameter that names a host or a path is scope-checked like a target.
+
+    Found by the trajectory generator, not by a test: ``postex.exfil_probe``
+    declares ``sink`` as a host and its own caution told the operator the sink
+    "is scope-checked like any other host" — while the rule read only
+    ``action.target``. An exfiltration probe pointed at an in-scope target could
+    therefore name any collector on the internet and be allowed. A caution that
+    describes a check nobody implemented is worse than no caution, because it
+    is relied upon.
+
+    ``harden.fix_permissions`` had the same hole in the other direction: its target
+    is not a path, so its ``path`` parameter was never compared against the path
+    scope and a blue verb could write outside the engagement.
+    """
+
+    def _engagement(self):
+        from datetime import datetime, timedelta, timezone
+
+        from whetstone.actions import Intent
+        from whetstone.gate.engagement import Authorization, Engagement, Scope
+
+        now = datetime.now(timezone.utc)
+        return Engagement(
+            name="scoped-params",
+            authorization="TEST",
+            starts=now - timedelta(minutes=1),
+            expires=now + timedelta(hours=1),
+            scope=Scope(hosts=("127.0.0.1",), paths=("/tmp/lab",),
+                        allow_loopback=True),
+            authorize=Authorization(red_team=True, max_intent=Intent.EXECUTE,
+                                    techniques=("T1041", "T1222"),
+                                    unattended=frozenset(Intent)),
+        )
+
+    def test_exfil_sink_outside_scope_is_denied(self):
+        import whetstone.verbs  # noqa: F401
+        from whetstone.actions import REGISTRY
+        from whetstone.gate.policy import decide
+
+        action = REGISTRY.bind("postex.exfil_probe",
+                               {"sink": "collector.evil.example"},
+                               target="127.0.0.1")
+        d = decide(self._engagement(), REGISTRY.get("postex.exfil_probe"),
+                   action)
+        assert d.verdict.name == "DENY", (
+            "an in-scope target must not launder an out-of-scope sink")
+        assert "sink" in d.reason
+
+    def test_exfil_sink_inside_scope_is_not_denied_for_scope(self):
+        import whetstone.verbs  # noqa: F401
+        from whetstone.actions import REGISTRY
+        from whetstone.gate.policy import decide
+
+        action = REGISTRY.bind("postex.exfil_probe", {"sink": "127.0.0.1"},
+                               target="127.0.0.1")
+        d = decide(self._engagement(), REGISTRY.get("postex.exfil_probe"),
+                   action)
+        assert not d.rule.startswith("scope."), d.reason
+
+    def test_harden_path_outside_scope_is_denied(self):
+        import whetstone.verbs  # noqa: F401
+        from whetstone.actions import REGISTRY
+        from whetstone.gate.policy import decide
+
+        # target=HOST with a path parameter: the path rule used to return
+        # early because the TARGET was not a path, so this parameter was never
+        # compared against the path scope at all.
+        verb = REGISTRY.get("harden.fix_permissions")
+        action = REGISTRY.bind("harden.fix_permissions",
+                               {"path": "/etc/shadow"}, target="127.0.0.1")
+        d = decide(self._engagement(), verb, action)
+        assert d.verdict.name == "DENY", "blue verbs write too"
+        assert "path" in d.reason
+
+    def test_every_host_or_path_param_is_reachable_by_the_scope_rules(self):
+        """No verb may declare a host/path parameter the rules cannot see."""
+        import whetstone.verbs  # noqa: F401
+        from whetstone.actions import REGISTRY
+        from whetstone.gate.policy import _scoped_hosts, _scoped_paths
+
+        for verb_id in REGISTRY.ids():
+            verb = REGISTRY.get(verb_id)
+            declared = {p.name for p in verb.params if p.type in ("host", "path")}
+            if not declared:
+                continue
+            params = {p.name: "x" for p in verb.params if p.type in ("host", "path")}
+            action = REGISTRY.bind(verb.id, params, target="127.0.0.1"
+                                   if verb.target.name != "NONE" else None)
+
+            class _C:
+                pass
+
+            c = _C()
+            c.verb, c.action = verb, action
+            seen = {n for n, _ in _scoped_hosts(c)} | {n for n, _ in _scoped_paths(c)}
+            missing = declared - seen
+            assert not missing, (
+                f"{verb.id} declares {missing} as host/path but the scope "
+                "rules would never check them")

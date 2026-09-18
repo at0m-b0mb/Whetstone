@@ -111,23 +111,51 @@ def _r_window(c: _Ctx) -> Decision | None:
     return None
 
 
+def _scoped_hosts(c: _Ctx) -> list[tuple[str, str]]:
+    """Every host this action would touch, as ``(label, value)``.
+
+    The target is the obvious one. The parameters are the one that was
+    missed: ``postex.exfil_probe`` declares ``sink`` as a host and its own
+    caution promised the sink "is scope-checked like any other host", but the
+    rule only ever read ``action.target``. An exfiltration probe aimed at an
+    in-scope target could therefore name any collector on the internet and be
+    allowed, which is the precise shape of mistake the gate exists to make
+    impossible. A parameter that names a host is a host.
+    """
+    seen: list[tuple[str, str]] = []
+    if c.verb.target is TargetKind.HOST:
+        seen.append(("target", c.action.target or ""))
+    for param in c.verb.params:
+        if param.type != "host":
+            continue
+        value = c.action.params.get(param.name)
+        if isinstance(value, str) and value:
+            seen.append((param.name, value))
+    return seen
+
+
 def _r_scope_host(c: _Ctx) -> Decision | None:
-    if c.verb.target is not TargetKind.HOST:
-        return None
-    host = c.action.target or ""
+    for label, host in _scoped_hosts(c):
+        if (d := _host_in_scope(c, label, host)) is not None:
+            return d
+    return None
+
+
+def _host_in_scope(c: _Ctx, label: str, host: str) -> Decision | None:
+    where = "" if label == "target" else f"parameter {label!r}: "
     excluded = c.engagement.scope.host_excluded(host)
     if excluded:
         return Decision(
             Verdict.DENY,
             "scope.host.excluded",
-            f"{host} is explicitly excluded by the rule {excluded!r}. An "
+            f"{where}{host} is explicitly excluded by the rule {excluded!r}. An "
             "exclusion beats any range that would otherwise cover it.",
         )
     if not c.engagement.scope.host_included(host):
         return Decision(
             Verdict.DENY,
             "scope.host.unlisted",
-            f"{host} is not in the engagement's host scope. "
+            f"{where}{host} is not in the engagement's host scope. "
             + (
                 "Only the loopback interface is in scope while no engagement is "
                 "loaded."
@@ -138,22 +166,46 @@ def _r_scope_host(c: _Ctx) -> Decision | None:
     return None
 
 
+def _scoped_paths(c: _Ctx) -> list[tuple[str, str]]:
+    """Every path this action would touch — target and path-typed params.
+
+    ``harden.permissions`` takes a ``path`` parameter and its target is not a
+    path, so before this the verb could be pointed at any file on the machine
+    and the scope rule would never look. Blue verbs write too.
+    """
+    seen: list[tuple[str, str]] = []
+    if c.verb.target is TargetKind.PATH:
+        seen.append(("target", c.action.target or ""))
+    for param in c.verb.params:
+        if param.type != "path":
+            continue
+        value = c.action.params.get(param.name)
+        if isinstance(value, str) and value:
+            seen.append((param.name, value))
+    return seen
+
+
 def _r_scope_path(c: _Ctx) -> Decision | None:
-    if c.verb.target is not TargetKind.PATH:
-        return None
-    path = c.action.target or ""
+    for label, path in _scoped_paths(c):
+        if (d := _path_in_scope(c, label, path)) is not None:
+            return d
+    return None
+
+
+def _path_in_scope(c: _Ctx, label: str, path: str) -> Decision | None:
+    where = "" if label == "target" else f"parameter {label!r}: "
     excluded = c.engagement.scope.path_excluded(path)
     if excluded:
         return Decision(
             Verdict.DENY,
             "scope.path.excluded",
-            f"{path} is under the excluded prefix {excluded!r}.",
+            f"{where}{path} is under the excluded prefix {excluded!r}.",
         )
     if not c.engagement.scope.path_included(path):
         return Decision(
             Verdict.DENY,
             "scope.path.unlisted",
-            f"{path} is outside the engagement's path scope"
+            f"{where}{path} is outside the engagement's path scope"
             + (
                 "."
                 if not c.engagement.scope.paths

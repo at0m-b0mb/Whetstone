@@ -863,7 +863,15 @@ def _lab_worlds(root: Path) -> dict[str, _World]:
             name=name,
             authorization="LAB — self-contained sandbox, no real host in scope",
             operator="whetstone",
-            scope=Scope(paths=(str(root),), allow_loopback=True),
+            # "sandbox-collector" is named explicitly because the gate now
+            # scope-checks host-typed PARAMETERS, not just the target, and
+            # postex.exfil_probe's sink is one. That is the correct shape for
+            # an exfiltration exercise: an engagement authorising a probe to a
+            # collector has to say which collector. Before the gate was fixed
+            # this line was unnecessary, which was the bug — the sink went
+            # unchecked and any host would have been accepted.
+            scope=Scope(paths=(str(root),), hosts=("sandbox-collector",),
+                        allow_loopback=True),
             authorize=Authorization(
                 red_team=red, max_intent=ceiling,
                 techniques=techniques if red else (),
