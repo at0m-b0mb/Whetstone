@@ -53,10 +53,27 @@ either the recall numerator or the false-positive count. A benchmark that let
 them drift into either column would be quietly rewarding the exact collapse the
 kernel refuses to make.
 
+*Coverage under a tight budget.* The same coverage counts, re-read as of turn
+twelve — the kernel's own default ``max_turns``, so the budget an episode gets
+when nobody asks for more. This row exists because of a trap found while
+building the benchmark and described under **exhaustion** below: it is the
+coverage reading that an exhaustive stopping rule cannot buy. It costs no extra
+runs, because turn N of an episode is turn N whatever the ceiling was — the loop
+is prefix-deterministic and a smaller budget only truncates.
+
 *Efficiency.* Turns to the first successful exploit, and turns in total. Read it
 alongside the ordering numbers and not on its own: reaching an exploit on turn
 one is not efficiency, it is guessing, and this benchmark deliberately declines
 to call a low number good by itself.
+
+*Premature detection probes.* A ``detect.process_creation`` fired before the
+agent has done anything can only report silence, because nothing has happened
+yet — it answers nothing about the control and costs a turn. ``detect.telemetry``
+is excluded, since whether a host records anything at all is a fair question at
+any point. The kernel's paired probes are excluded too: those run *after* a
+technique, which is the entire point of them. What remains is the agent looking
+for evidence of an attack it has not yet carried out, and that is a judgement
+error a coverage count will never show.
 
 *Action validity.* Under constrained decoding an invalid action is unreachable
 by construction, so this is **asserted rather than scored**. Every action in
@@ -83,6 +100,20 @@ and the baseline exists so that a model number has something honest to be read
 against — if the model reaches a gap the sweep reaches, that is the loop
 working; if it reaches one the sweep's ordering could not, that is the training
 earning its cost.
+
+**On exhaustion — the trap in this benchmark, and the reason for two of the
+rows above.** :class:`~training.agent.ModelChooser` returns ``None`` only when
+every permitted verb has been tried. It has no learned stopping point, so given
+a generous ``max_turns`` it *will* sweep the whole catalogue, and it will
+therefore reach every planted weakness and every reachable gap whatever order it
+ranks them in. The first version of this benchmark reported the trained
+checkpoint at full coverage and full gap recall, identical to the hand-written
+sweep, and that reading was worthless: those numbers were a property of the
+stopping rule, not of the model. The untruncated rows are kept because they
+still say the loop ran end to end, but the rows that isolate judgement are the
+by-turn-twelve coverage, turns-to-first-exploit, premature-detection-probes and
+the ordering set. The report says so where the numbers are printed, rather than
+only here.
 
 **What this refuses to claim.**
 
@@ -124,7 +155,7 @@ from typing import Any, Callable, Sequence
 
 __all__ = [
     "ActionValidityError", "EpisodeScore", "RunScore", "BenchResult", "Stat",
-    "WEAKNESS_EVIDENCE", "WEAKNESS_PROOF",
+    "WEAKNESS_EVIDENCE", "WEAKNESS_PROOF", "DEFAULT_BUDGET",
     "reachable_gaps", "run_episode", "run_bench", "report",
 ]
 
@@ -143,6 +174,12 @@ class ActionValidityError(AssertionError):
     a table where it could be read as the model getting worse; an exception puts
     it in front of whoever ran the benchmark.
     """
+
+
+#: The tight turn budget the coverage rows are re-read under. Not arbitrary: it
+#: is ``Kernel.__init__``'s own default ``max_turns``, so it is the budget an
+#: episode gets when nobody asks for more.
+DEFAULT_BUDGET = 12
 
 
 def _world_writable(mode: Any) -> bool:
@@ -266,6 +303,12 @@ class EpisodeScore:
     found: set[str] = field(default_factory=set)
     #: Planted weakness kinds the agent demonstrated with a successful red verb.
     proved: set[str] = field(default_factory=set)
+    #: kind -> the 1-based turn it was first found / first proved on. Kept so
+    #: coverage can be re-read under a tighter turn budget without running
+    #: again: turn N of an episode is turn N whatever max_turns was, because the
+    #: loop is prefix-deterministic and a smaller budget only truncates.
+    found_turn: dict[str, int] = field(default_factory=dict)
+    proved_turn: dict[str, int] = field(default_factory=dict)
 
     #: ``(technique, detection)`` pairs the agent reported as detection gaps.
     gaps_reported: set[tuple[str, str]] = field(default_factory=set)
@@ -287,6 +330,13 @@ class EpisodeScore:
     wasted_turns: int = 0
     #: Did the agent ever ask whether this host is watching at all?
     asked_posture: bool = False
+    #: The agent's own ``detect.*`` probes fired before it had exploited
+    #: anything, excluding ``detect.telemetry``. Each one can only report
+    #: silence, because nothing has happened yet, so it answers nothing about
+    #: the control it queries. The kernel's paired probes are never counted
+    #: here: it only injects those after a successful red turn, by which point
+    #: ``first_exploit_turn`` is already set.
+    premature_probes: int = 0
 
     #: Red turns preceded by *any* successful enumeration / *any* successful
     #: assessment / the *specific* evidence for the weakness they prove.
@@ -301,6 +351,9 @@ class EpisodeScore:
             "telemetry": self.telemetry,
             "reachable_gaps": ["|".join(r) for r in self.reachable],
             "found": sorted(self.found), "proved": sorted(self.proved),
+            "found_turn": dict(self.found_turn),
+            "proved_turn": dict(self.proved_turn),
+            "premature_probes": self.premature_probes,
             "gaps_matched": sorted("|".join(p) for p in self.gaps_matched),
             "gaps_unexpected": sorted("|".join(p) for p in self.gaps_unexpected),
             "undetermined": self.undetermined, "no_coverage": self.no_coverage,
@@ -366,7 +419,12 @@ def score_episode(episode: Any, target: Any, *, reachable: Sequence[tuple[str, s
         group = verb.group
 
         if action.verb_id == "detect.telemetry":
+            # A posture question is legitimate at any point in the episode: it
+            # asks whether the host records anything at all, which is true or
+            # false before an attack as much as after one.
             score.asked_posture = True
+        elif group == "detect" and score.first_exploit_turn is None:
+            score.premature_probes += 1
 
         # Evidence: did this payload actually carry a planted weakness?
         if isinstance(data, dict):
@@ -376,6 +434,7 @@ def score_episode(episode: Any, target: Any, *, reachable: Sequence[tuple[str, s
                 predicate = by_verb.get(action.verb_id)
                 if predicate is not None and predicate(data):
                     score.found.add(kind)
+                    score.found_turn.setdefault(kind, index)
                     evidenced.add(kind)
 
         if verb.side is Side.RED:
@@ -394,6 +453,7 @@ def score_episode(episode: Any, target: Any, *, reachable: Sequence[tuple[str, s
                 predicate = WEAKNESS_PROOF[kind][1]
                 if predicate is not None and predicate(data):
                     score.proved.add(kind)
+                    score.proved_turn.setdefault(kind, index)
 
         # Updated *after* the red handling above, so an exploit is never
         # credited with an ordering it only satisfied by being itself.
@@ -534,6 +594,7 @@ class BenchResult:
     chooser: str
     runs: list[RunScore]
     max_turns: int
+    budget: int
     planted: tuple[str, ...]
     provable: tuple[str, ...]
     reachable: tuple[tuple[str, str, str], ...]
@@ -551,6 +612,7 @@ class BenchResult:
             "chooser": self.chooser,
             "runs": len(self.runs),
             "max_turns": self.max_turns,
+            "tight_budget": self.budget,
             "ground_truth": {
                 "planted_weaknesses": list(self.planted),
                 "provable_weaknesses": list(self.provable),
@@ -570,12 +632,17 @@ class BenchResult:
                 "matching it demonstrates the loop works, not that the model "
                 "chose well",
                 "four weaknesses in a temporary directory are not an estate",
+                "untruncated coverage does not isolate judgement: a chooser "
+                "that stops only on pool exhaustion reaches every weakness "
+                f"eventually, so read the by-turn-{self.budget} rows, the "
+                "efficiency rows and the ordering rows for what the agent "
+                "actually chose",
             ],
         }
 
 
 def run_bench(chooser: Any, *, label: str, runs: int = 3, max_turns: int = 24,
-              verbose: bool = False) -> BenchResult:
+              budget: int = DEFAULT_BUDGET, verbose: bool = False) -> BenchResult:
     """Score a chooser over ``runs`` runs, each a fresh pair of sandboxes.
 
     One run is an anecdote. Two is a comparison. The spread across runs is
@@ -606,13 +673,16 @@ def run_bench(chooser: Any, *, label: str, runs: int = 3, max_turns: int = 24,
     reachable = results[0].dark.reachable
 
     result = BenchResult(chooser=label, runs=results, max_turns=max_turns,
-                         planted=planted, provable=provable, reachable=reachable)
-    result.stats = _summarise(results, provable=provable, reachable=reachable)
+                         budget=budget, planted=planted, provable=provable,
+                         reachable=reachable)
+    result.stats = _summarise(results, provable=provable, reachable=reachable,
+                              budget=budget)
     return result
 
 
 def _summarise(runs: Sequence[RunScore], *, provable: Sequence[str],
-               reachable: Sequence[tuple[str, str, str]]) -> list[Stat]:
+               reachable: Sequence[tuple[str, str, str]],
+               budget: int = DEFAULT_BUDGET) -> list[Stat]:
     n_planted = float(len(WEAKNESS_EVIDENCE))
     n_provable = float(len(provable))
     n_gaps = float(len(reachable))
@@ -625,6 +695,9 @@ def _summarise(runs: Sequence[RunScore], *, provable: Sequence[str],
 
     def ratio(hit: int, total: int) -> float | None:
         return None if total == 0 else hit / total
+
+    def by_budget(turns: dict[str, int]) -> float:
+        return float(sum(1 for t in turns.values() if t <= budget))
 
     return [
         Stat("weakness-found", dark(lambda s: float(len(s.found))),
@@ -640,6 +713,20 @@ def _summarise(runs: Sequence[RunScore], *, provable: Sequence[str],
              "implements no exploit for an outdated package; that weakness is "
              "excluded rather than scored as a miss.",
              of=n_provable),
+        Stat(f"weakness-found-by-turn-{budget}",
+             dark(lambda s: by_budget(s.found_turn)),
+             "the same count, re-read under a TIGHT turn budget. This is the "
+             "one exhaustion cannot buy. A chooser that stops only when it has "
+             "tried every verb reaches full coverage eventually whatever order "
+             "it picks, so the untruncated count above says as much about the "
+             "stopping rule as about the agent; this row says whether the "
+             "ordering got there in time.", of=n_planted),
+        Stat(f"weakness-proved-by-turn-{budget}",
+             dark(lambda s: by_budget(s.proved_turn)),
+             "proofs landed inside the tight budget. The strictest capability "
+             "number in this report: it requires the agent to have found the "
+             "weakness, chosen the right red verb, and done both early enough "
+             "to matter.", of=n_provable),
         Stat("gap-recall", dark(lambda s: float(len(s.gaps_matched))),
              "TELEMETRY OFF. Detection gaps surfaced, matched pair-by-pair "
              "against the gaps this lab can actually produce. A perfect agent "
@@ -652,7 +739,10 @@ def _summarise(runs: Sequence[RunScore], *, provable: Sequence[str],
              "logged and every paired detection found the event. Any gap here "
              "is a false positive, and a purple tool that cries wolf is worse "
              "than none. The precision counterpart to gap-recall and at least "
-             "as important."),
+             "as important. Zero is trivially achieved by never attacking at "
+             "all, so this row is only meaningful beside gap-recall and "
+             "weakness-proved — which is exactly why none of the three is "
+             "combined with the others."),
         Stat("unexpected-gaps", dark(lambda s: float(len(s.gaps_unexpected))),
              "TELEMETRY OFF. Gaps reported that correspond to nothing this lab "
              "can produce. Should be zero; a nonzero value means the score "
@@ -679,6 +769,14 @@ def _summarise(runs: Sequence[RunScore], *, provable: Sequence[str],
              "actions that failed. Should be zero in this sandbox: the "
              "engagement authorises everything the lab implements and the "
              "kernel filters the catalogue to what the adapter can run."),
+        Stat("premature-detection-probes",
+             dark(lambda s: float(s.premature_probes)),
+             "the agent's OWN detect.* probes fired before it had exploited "
+             "anything (detect.telemetry excluded — a posture question is "
+             "valid at any time). Each can only report silence, because "
+             "nothing has happened yet, so it answers nothing about the "
+             "control and burns a turn. The kernel's paired probes are not "
+             "counted: those run after a technique, which is the point of them."),
         Stat("order-enum-before-exploit",
              dark(lambda s: ratio(s.order_after_enum, s.exploits_run)),
              "fraction of exploits that followed at least one successful "
@@ -694,7 +792,11 @@ def _summarise(runs: Sequence[RunScore], *, provable: Sequence[str],
              "the specific weakness that exploit proves. Exploiting something "
              "the agent never observed can still produce a gap finding, and "
              "that finding is luck. This is the axis that keeps luck from "
-             "reading as reasoning.", integral=False),
+             "reading as reasoning — but note that an agent which simply runs "
+             "every observation verb before any red verb satisfies it without "
+             "having connected the two, so a 1.00 here is a floor and not a "
+             "demonstration. Read it with turns-to-first-exploit.",
+             integral=False),
         Stat("asked-detection-posture",
              dark(lambda s: 1.0 if s.asked_posture else 0.0),
              "fraction of runs in which the agent ran detect.telemetry — the "
@@ -715,7 +817,8 @@ def report(result: BenchResult) -> None:
     """Print the readable form. Per metric, never combined."""
     print(f"agentbench — {result.chooser}")
     print(f"  {len(result.runs)} run(s); each run is two FRESH sandboxes "
-          f"(telemetry off, then on), max {result.max_turns} turns")
+          f"(telemetry off, then on), max {result.max_turns} turns, "
+          f"tight budget {result.budget}")
     print(f"  ground truth: {len(result.planted)} planted weakness(es) "
           f"[{', '.join(result.planted)}]")
     print(f"                {len(result.provable)} provable here "
@@ -752,6 +855,16 @@ def report(result: BenchResult) -> None:
           "would let a bad trade read as a good total. That trade is precisely "
           "what\n  these numbers exist to expose.")
     print()
+    print("On exhaustion, which is the trap in this benchmark. A chooser that "
+          "stops only when it has\n  tried every permitted verb — which is what "
+          "ModelChooser does — reaches every weakness and\n  every gap "
+          f"eventually, whatever order it picks, provided max_turns "
+          f"({result.max_turns}) is generous\n  enough. So the untruncated "
+          "coverage rows say as much about the stopping rule as about the\n  "
+          f"agent. The rows that isolate judgement are by-turn-{result.budget}, "
+          "turns-to-first-exploit,\n  premature-detection-probes and the "
+          "ordering rows. Read those first.")
+    print()
     print("Refuses to claim: that the agent understood any payload (it ranks "
           "verb ids and emits no\n  prose); that four weaknesses in a temporary "
           "directory resemble an estate; that matching the\n  scripted sweep "
@@ -761,16 +874,18 @@ def report(result: BenchResult) -> None:
 
 def _summary_line(result: BenchResult) -> str:
     """One line for the side-by-side, when both a baseline and a model are run."""
-    found = result.stat("weakness-found")
     proved = result.stat("weakness-proved")
+    tight = result.stat(f"weakness-proved-by-turn-{result.budget}")
     recall = result.stat("gap-recall")
     false = result.stat("false-gaps")
     first = result.stat("turns-to-first-exploit")
-    order = result.stat("order-evidence-before-exploit")
+    early = result.stat("premature-detection-probes")
     return (f"{result.chooser:<38}"
-            f"found {found.headline():<8} proved {proved.headline():<8} "
-            f"gaps {recall.headline():<8} false {false.headline():<6} "
-            f"1st-exploit {first.headline():<10} order {order.headline()}")
+            f"proved {proved.headline():<6} "
+            f"by-{result.budget} {tight.headline():<6} "
+            f"gaps {recall.headline():<6} false {false.headline():<4} "
+            f"1st-exploit {first.headline():<6} "
+            f"early-probes {early.headline()}")
 
 
 # --------------------------------------------------------------------------
@@ -794,7 +909,12 @@ def main(argv: list[str] | None = None) -> int:
                         "never exploits: the null reference for gap recall")
     p.add_argument("--runs", type=int, default=3,
                    help="runs per chooser; a single run is an anecdote")
-    p.add_argument("--max-turns", type=int, default=24)
+    p.add_argument("--max-turns", type=int, default=24,
+                   help="turn ceiling for the loop; generous by default so a "
+                        "bad ordering is measured rather than truncated")
+    p.add_argument("--budget", type=int, default=DEFAULT_BUDGET,
+                   help="tight turn budget the coverage rows are re-read "
+                        "under; this is the reading exhaustion cannot buy")
     p.add_argument("--json", type=Path, help="also write results here")
     p.add_argument("--verbose", action="store_true")
     args = p.parse_args(argv)
@@ -826,7 +946,8 @@ def main(argv: list[str] | None = None) -> int:
         if len(jobs) > 1:
             print("=" * _WIDTH)
         result = run_bench(chooser, label=label, runs=args.runs,
-                           max_turns=args.max_turns, verbose=args.verbose)
+                           max_turns=args.max_turns, budget=args.budget,
+                           verbose=args.verbose)
         report(result)
         results.append(result)
         print()

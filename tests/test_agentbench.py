@@ -79,6 +79,56 @@ class TriggerHappy:
         return None
 
 
+class Dawdler:
+    """Every observation verb first, red verbs last. Full coverage, far too late.
+
+    The mirror image of :class:`TriggerHappy`, and the reason the coverage rows
+    are re-read under a tight budget. This chooser has no judgement at all — it
+    sorts by side and nothing else — yet it reaches every weakness and every gap,
+    because like ``ModelChooser`` it stops only when the verb pool is empty. An
+    untruncated coverage count cannot tell it apart from an agent that chose
+    well. The turn it got there on can.
+    """
+
+    def choose(self, episode, permitted, *, exclude, target):
+        from whetstone.actions import Side
+
+        done = {t.action.verb_id for t in episode.turns} | set(exclude)
+        pool = [v for v in permitted if v.id not in done]
+        if not pool:
+            return None
+        observe = [v for v in pool if v.side is not Side.RED]
+        verb = (observe or pool)[0]
+        extra = ({"service": "acme-agent"}
+                 if verb.id == "exploit.service_permissions" else {})
+        return verb.bind(_bind(verb, extra), target=target)
+
+
+class EarlyProbes:
+    """Hunts for evidence of an attack it has not carried out yet.
+
+    Two detection probes before any exploit. Neither can return anything but
+    silence, because nothing has happened, so both are turns spent learning
+    nothing — the judgement error that no coverage count will ever show.
+    """
+
+    ORDER = ("detect.process_creation", "detect.persistence_change",
+             "exploit.service_permissions", "postex.credential_dump",
+             "postex.persistence_install")
+
+    def choose(self, episode, permitted, *, exclude, target):
+        done = {t.action.verb_id for t in episode.turns} | set(exclude)
+        by_id = {v.id: v for v in permitted}
+        for verb_id in self.ORDER:
+            if verb_id in done or verb_id not in by_id:
+                continue
+            verb = by_id[verb_id]
+            extra = ({"service": "acme-agent"}
+                     if verb_id == "exploit.service_permissions" else {})
+            return verb.bind(_bind(verb, extra), target=target)
+        return None
+
+
 class OneBadAction:
     """Emits an action carrying a parameter the verb does not have.
 
@@ -240,6 +290,34 @@ class TestMetricsDoNotCollapse:
         assert score.found == set(), "it never looked at anything"
         assert score.first_exploit_turn == 1
 
+    def test_a_tight_budget_is_what_exhaustion_cannot_buy(self):
+        """The trap this benchmark was nearly fooled by, closed by a test.
+
+        A chooser that stops only on pool exhaustion reaches every weakness
+        eventually. ``Dawdler`` does exactly that — it works through every
+        observation verb in the catalogue before touching a red one — so its
+        untruncated coverage is perfect and its coverage as of turn twelve is
+        nothing. If those two ever report the same number, the tight reading
+        has stopped doing its job.
+        """
+        _ep, score = run_episode(Dawdler(), telemetry=False, max_turns=30)
+        assert score.proved == set(provable_weaknesses()), "it gets there"
+        assert min(score.proved_turn.values()) > 12, "but not before turn 12"
+        by_twelve = [k for k, t in score.proved_turn.items() if t <= 12]
+        assert by_twelve == [], "the tight budget must show nothing proved"
+
+    def test_premature_probes_are_counted_but_paired_ones_are_not(self):
+        """A detection probe before any attack can only report silence."""
+        _ep, sweep = run_episode(ScriptedSweep(), telemetry=False)
+        assert sweep.premature_probes == 0, (
+            "the sweep runs detect.telemetry, which is a posture question, and "
+            "no other detection until after it has attacked")
+
+        _ep, early = run_episode(EarlyProbes(), telemetry=False, max_turns=30)
+        assert early.premature_probes == 2, (
+            "two detect.* probes before the first exploit; the three the "
+            "kernel pairs with the exploits afterwards are not the agent's")
+
     def test_cannot_tell_is_not_counted_as_a_gap(self):
         """The distinction the kernel refuses to collapse, and neither does this.
 
@@ -312,9 +390,14 @@ class TestHarness:
             provable_weaknesses())
         assert len(payload["ground_truth"]["reachable_detection_gaps"]) == 3
         assert payload["not_claimed"], "the report must carry its own limits"
+        assert any("exhaust" in claim for claim in payload["not_claimed"]), (
+            "the exhaustion caveat is the one a reader most needs and is the "
+            "one this benchmark was nearly fooled by")
         names = {m["metric"] for m in payload["metrics"]}
         assert {"weakness-found", "weakness-proved", "gap-recall", "false-gaps",
                 "undetermined", "turns-to-first-exploit",
+                "premature-detection-probes",
+                f"weakness-proved-by-turn-{payload['tight_budget']}",
                 "order-evidence-before-exploit"} <= names
 
     def test_no_metric_is_an_average_of_the_others(self):
