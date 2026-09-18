@@ -216,6 +216,21 @@ class SourceSpec:
     #: — usually an upstream layout change — and should be loud about it.
     expect_min_docs: int = 1
     notes: str = ""
+    #: Wall-clock budget in seconds for this source's ``fetch`` plus
+    #: ``documents``, overriding the build-wide ``--source-timeout``. ``None``
+    #: means "use the build-wide budget", and that is the right answer for
+    #: almost every adapter.
+    #:
+    #: It exists because the legitimate budgets here differ by two orders of
+    #: magnitude. ``lolbas`` parses a 1 MB cache in well under a second; the
+    #: ``rfc`` fetch is a ten-thousand-file download that on its own runs past
+    #: eight minutes. The build-wide default has to clear the slowest of those,
+    #: which leaves every fast source with a budget thousands of times larger
+    #: than it needs. A source that knows it is slow — or knows it should be
+    #: instant — says so here instead of dragging the global number around
+    #: behind it. Nothing sets it today; it is the pressure valve for the first
+    #: adapter that needs one.
+    timeout: float | None = None
 
     def __post_init__(self) -> None:
         if not self.license.strip():

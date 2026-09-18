@@ -8,12 +8,22 @@ the properties that matter here are pinned down rather than assumed.
 
 from __future__ import annotations
 
+import importlib
+import itertools
 import json
+import time
 from pathlib import Path
 
 import pytest
 
-from training.corpus.build import BuildStats, balance_report, read_documents
+import training.corpus.build as build_mod
+from training.corpus.build import (
+    DEFAULT_SOURCE_TIMEOUT,
+    BuildStats,
+    balance_report,
+    build,
+    read_documents,
+)
 from training.corpus.source import (
     REGISTER_TARGETS,
     Document,
@@ -480,3 +490,221 @@ class TestEverySourceModuleCompiles:
             except SyntaxError as exc:
                 failures.append(f"{path.name}: {exc}")
         assert not failures, "source modules that do not compile:\n" + "\n".join(failures)
+
+
+# The watchdog's synthetic adapters have to live in a real, importable module.
+# The child process is *spawned*, not forked, so it re-imports whatever owns
+# fetch/documents by qualified name; a spec built from closures or from
+# functions defined in this file's body cannot cross that boundary. Writing the
+# adapter to disk is therefore not ceremony — a test that dodged the boundary
+# would be testing something other than the mechanism.
+_ADAPTER_PREAMBLE = """
+import re
+from pathlib import Path
+
+from training.corpus.source import Document, Register, Side, SourceSpec
+
+"""
+
+_adapter_seq = itertools.count()
+
+
+def _adapter(tmp_path: Path, monkeypatch, body: str, **spec_kwargs):
+    """Materialise a throwaway adapter module and return its SPEC."""
+    name = f"_whetstone_probe_{next(_adapter_seq)}"
+    kwargs = dict(
+        name=name,
+        license="throwaway",
+        url="https://example.invalid/probe",
+        register="Register.PROSE",
+        side="Side.NEUTRAL",
+        expect_min_docs=1,
+    )
+    kwargs.update(spec_kwargs)
+    extra = "".join(f"    {k}={v},\n" for k, v in kwargs.items()
+                    if k not in {"name", "license", "url", "register", "side"})
+    module = _ADAPTER_PREAMBLE + body + f"""
+
+SPEC = SourceSpec(
+    name={kwargs["name"]!r},
+    license={kwargs["license"]!r},
+    url={kwargs["url"]!r},
+    register={kwargs["register"]},
+    side={kwargs["side"]},
+    fetch=_fetch,
+    documents=_documents,
+{extra})
+"""
+    (tmp_path / f"{name}.py").write_text(module, encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    importlib.invalidate_caches()
+    return importlib.import_module(name).SPEC
+
+
+#: Fetches instantly, yields two documents, then wedges forever inside a single
+#: C-level re.sub — the outage, reproduced. The except clause is the one an
+#: adapter legitimately writes and is exactly what swallows a SIGALRM-raised
+#: TimeoutError, which is why the enforcement has to be a kill.
+_HANGING = """
+_EVIL = re.compile(r"(a+)+$")
+_SUBJECT = "a" * 40 + "b"
+
+
+def _fetch(cache_dir: Path) -> Path:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def _documents(path: Path):
+    for i in range(2):
+        yield Document(text="a real document, long enough to clear min_chars, no %d" % i,
+                       source=__name__.rsplit(".", 1)[-1],
+                       register=Register.PROSE, side=Side.NEUTRAL, ident=str(i))
+    while True:
+        try:
+            _EVIL.sub("x", _SUBJECT)
+        except (OSError, UnicodeDecodeError):
+            continue
+"""
+
+#: Well-behaved: three documents whose text deliberately carries the surface
+#: structure this corpus exists to preserve.
+_HEALTHY = """
+_ROWS = [
+    "tcp        0      0 0.0.0.0:445             0.0.0.0:*    LISTEN",
+    "detection:\\n    selection:\\n        EventID: 4698\\n    condition: selection",
+    "col1\\tcol2\\tcol3  —  naïve ünicode, ATT&CK T1547.001, CVE-2024-21412",
+]
+
+
+def _fetch(cache_dir: Path) -> Path:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def _documents(path: Path):
+    for i, row in enumerate(_ROWS):
+        yield Document(text=row, source=__name__.rsplit(".", 1)[-1],
+                       register=Register.SHELL, side=Side.RED, ident=str(i))
+"""
+
+
+class TestSourceWatchdog:
+    """A source that never returns must not be able to hang the build.
+
+    The build already survived a source that *raises*. It had no answer for one
+    that simply never comes back: an adapter hit catastrophic regex backtracking
+    and held a core at 99.7% for seven and a half hours with no output, taking
+    the overnight training run with it.
+
+    An in-process signal timeout does not fix this, and the reason is worth
+    keeping written down. On CPython 3.13 a backtracking ``re.sub`` on the main
+    thread *is* interruptible — SRE polls for signals inside its own loop — so
+    the usual explanation is out of date. What actually defeats it is that
+    ``TimeoutError`` is an ``OSError``, so the exception lands in the adapter's
+    own ``except (OSError, UnicodeDecodeError): continue`` and is discarded;
+    measured, that ran 52s under a 2s alarm. Enforcement has to be somewhere the
+    adapter cannot catch it, which means another process and a kill.
+    """
+
+    def _build(self, tmp_path, monkeypatch, specs, **kwargs):
+        monkeypatch.setattr(build_mod, "discover_sources", lambda: list(specs))
+        kwargs.setdefault("max_source_share", 0.0)   # a 1-source corpus is 100%
+        return build(tmp_path / "out", tmp_path / "cache", **kwargs)
+
+    def test_hanging_source_is_killed_and_the_build_completes(self, tmp_path, monkeypatch):
+        """The whole point: the build returns at all, and says why."""
+        spec = _adapter(tmp_path, monkeypatch, _HANGING)
+        started = time.monotonic()
+        stats = self._build(tmp_path, monkeypatch, [spec], source_timeout=2.0)
+        elapsed = time.monotonic() - started
+
+        # Left alone this source runs for hours. Anything that returns has killed it.
+        assert elapsed < 90, f"the watchdog did not stop the source ({elapsed:.0f}s)"
+        assert len(stats) == 1
+        assert "TIMED OUT" in stats[0].error, stats[0].error
+
+    def test_timed_out_source_contributes_nothing(self, tmp_path, monkeypatch):
+        """A truncated prefix is worse than an absent source.
+
+        The hanging adapter yields two perfectly good documents before it
+        wedges. Admitting them would quietly change the corpus composition by
+        however far a source happened to get before the clock ran out, and the
+        balance report would describe that as though it were the source.
+        """
+        spec = _adapter(tmp_path, monkeypatch, _HANGING)
+        stats = self._build(tmp_path, monkeypatch, [spec], source_timeout=2.0)
+        assert stats[0].docs == 0 and stats[0].chars == 0
+        assert not (tmp_path / "out" / f"{spec.name}.jsonl").exists()
+
+    def test_timeout_is_relisted_after_the_balance_report(self, tmp_path, monkeypatch, capsys):
+        """Follows the _IMPORT_FAILURES precedent, for the same reason.
+
+        In the report above, a source that was killed at the deadline and a
+        source whose upstream is empty look identical, and they have nothing in
+        common as fixes.
+        """
+        spec = _adapter(tmp_path, monkeypatch, _HANGING)
+        self._build(tmp_path, monkeypatch, [spec], source_timeout=2.0)
+        out = capsys.readouterr().out
+
+        assert "EXCEEDED THE TIME BUDGET" in out
+        # After the report, not buried in the scroll above it.
+        assert out.index("EXCEEDED THE TIME BUDGET") > out.index("register coverage")
+        assert spec.name in out.split("EXCEEDED THE TIME BUDGET", 1)[1]
+
+    def test_healthy_source_is_unaffected(self, tmp_path, monkeypatch):
+        """The watchdog must be invisible when nothing times out."""
+        spec = _adapter(tmp_path, monkeypatch, _HEALTHY)
+        stats = self._build(tmp_path, monkeypatch, [spec], min_chars=1)
+        assert stats[0].error == ""
+        assert stats[0].docs == 3, stats[0]
+
+    def test_isolated_and_in_process_paths_agree_exactly(self, tmp_path, monkeypatch):
+        """Same documents, same bytes, whether or not the watchdog is armed.
+
+        ``--source-timeout 0`` keeps the pre-watchdog path for debugging, and
+        two code paths that can disagree are a bug waiting to happen. They share
+        the dedup loop; this pins the rest.
+        """
+        out = {}
+        for label, timeout in (("isolated", DEFAULT_SOURCE_TIMEOUT), ("in_process", 0.0)):
+            root = tmp_path / label
+            spec = _adapter(tmp_path, monkeypatch, _HEALTHY)
+            monkeypatch.setattr(build_mod, "discover_sources", lambda s=spec: [s])
+            build(root / "out", root / "cache", min_chars=1, max_source_share=0.0,
+                  source_timeout=timeout)
+            out[label] = [dict(r, source="") for r in read_documents(root / "out")]
+        assert out["isolated"] == out["in_process"] != []
+
+    def test_structure_survives_the_process_boundary(self, tmp_path, monkeypatch):
+        """Horizontal whitespace is signal, and now it crosses a JSONL hop.
+
+        Column alignment scored +47% against gpt2 and YAML indentation carries
+        Sigma rule depth. The child serialises documents to a temporary JSONL
+        rather than a Queue, so this is the one place the new machinery could
+        quietly mangle text that ``normalise`` went to such lengths to keep.
+        """
+        spec = _adapter(tmp_path, monkeypatch, _HEALTHY)
+        self._build(tmp_path, monkeypatch, [spec], min_chars=1)
+        texts = [r["text"] for r in read_documents(tmp_path / "out")]
+
+        assert any("tcp        0      0 0.0.0.0:445" in t for t in texts), texts
+        assert any("\n        EventID: 4698" in t for t in texts), texts
+        assert any("col1\tcol2\tcol3" in t and "naïve ünicode" in t for t in texts), texts
+
+    def test_per_source_override_beats_the_build_wide_budget(self, tmp_path, monkeypatch):
+        """SourceSpec.timeout exists so a slow source need not raise everyone's."""
+        spec = _adapter(tmp_path, monkeypatch, _HANGING, timeout=2.0)
+        assert spec.timeout == 2.0
+        started = time.monotonic()
+        stats = self._build(tmp_path, monkeypatch, [spec], source_timeout=36_000.0)
+        elapsed = time.monotonic() - started
+        assert "TIMED OUT" in stats[0].error
+        assert elapsed < 90, "the spec's own budget was ignored"
+
+    def test_default_budget_clears_the_slowest_healthy_source(self):
+        """rfc's fetch alone runs past eight minutes; a watchdog that fires on a
+        healthy source silently removes a register and the report cannot tell
+        you which of the two happened."""
+        assert DEFAULT_SOURCE_TIMEOUT >= 3 * 8 * 60
