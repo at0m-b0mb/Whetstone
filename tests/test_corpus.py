@@ -450,3 +450,33 @@ class TestTldrParser:
         from training.corpus.sources.tldr import parse_page
         for junk in ("", "```", "- dangling intent:", "`unclosed", "#\n>\n-\n`x`"):
             parse_page(junk, platform="linux", name="j")
+
+
+class TestEverySourceModuleCompiles:
+    """Every module under sources/ must COMPILE, not merely parse.
+
+    ``ast.parse`` builds a tree without enforcing the rules the compiler adds
+    on top of the grammar, and the one that bites here is that ``from
+    __future__`` must be the first statement in a file. A disabled adapter in
+    this package was given an explanatory banner above its existing docstring,
+    which turned the original docstring into a bare expression and pushed the
+    future import down the file. ``ast.parse`` reported it as fine; importing
+    it raised SyntaxError.
+
+    Leading-underscore modules are the point rather than an exception. Source
+    discovery skips them, and discovery also guards import errors now, so a
+    broken disabled adapter is invisible twice over — until someone sweeps the
+    package with ``import_module`` and it is suddenly not.
+    """
+
+    def test_all_source_modules_compile(self):
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parents[1] / "training/corpus/sources"
+        failures = []
+        for path in sorted(root.glob("*.py")):
+            try:
+                compile(path.read_text(encoding="utf-8"), str(path), "exec")
+            except SyntaxError as exc:
+                failures.append(f"{path.name}: {exc}")
+        assert not failures, "source modules that do not compile:\n" + "\n".join(failures)

@@ -22,9 +22,8 @@ rediscovers the same dead end, and so that it can be enabled by renaming this
 file the moment upstream publishes terms.
 
 The original module docstring follows.
-"""
 
-"""InternalAllTheThings — the half of the engagement after the shell. ADVERSARY/RED.
+InternalAllTheThings — the half of the engagement after the shell. ADVERSARY/RED.
 
 This adapter exists because a measurement said the corpus had a hole in it, not
 because the repository looked useful. Its sibling
