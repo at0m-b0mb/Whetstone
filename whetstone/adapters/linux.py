@@ -1820,6 +1820,41 @@ def _detect_telemetry(self: LinuxAdapter, verb: Verb, action: Action) -> dict[st
     )
 
 
+def query_failed(res: CommandResult) -> str:
+    """Why a log query did not produce an answer, or "" if its output is one.
+
+    The distinction this draws is the one the whole detect.* family rests on, and
+    it is narrower than ``not res.ok`` on purpose. A detection verb has three
+    possible outcomes, not two: the control fired, the control was silent, and we
+    never managed to ask. Only the third may reach the kernel as "cannot tell" —
+    widening it would swallow real silences, which is how a purple tool stops
+    reporting the gaps it exists to report.
+
+    So a non-zero exit alone is not enough. ``grep``-shaped tools, and
+    ``journalctl -g`` among them, exit non-zero on some builds for the perfectly
+    ordinary reason that nothing matched, and that is a genuine negative. Two
+    things are unambiguous instead:
+
+    ``returncode == -1``
+        Never a real exit code. :func:`run` synthesises it for the family of
+        failures where no process produced output at all — ``TimeoutExpired``,
+        ``FileNotFoundError``, ``PermissionError``, ``OSError`` — so it means
+        precisely "the command did not run".
+
+    a non-zero exit that wrote a diagnostic to stderr and nothing to stdout
+        A tool that found nothing says so on stdout (``-- No entries --``); a
+        tool that could not look explains itself on stderr. Requiring both halves
+        keeps a noisy-but-successful query out of this branch.
+    """
+    if res.timed_out:
+        return f"timed out after {res.duration_ms}ms"
+    if res.returncode == -1:
+        return res.stderr.strip()[:160] or "the command did not run"
+    if not res.ok and res.stderr.strip() and not res.stdout.strip():
+        return f"exited {res.returncode}: {res.stderr.strip()[:160]}"
+    return ""
+
+
 def _ausearch_window(
     since_seconds: int, *, key: str = "", image: str = "", record_type: str = ""
 ) -> tuple[bool, dict[str, Any]]:
@@ -1850,6 +1885,20 @@ def _ausearch_window(
     if "<no matches>" in (res.stdout + res.stderr):
         return True, {"logged": False, "count": 0, "source": "auditd",
                       "window_seconds": since_seconds}
+    if (why := query_failed(res)):
+        # Checked after "<no matches>", which is ausearch's own way of exiting
+        # non-zero to mean a real, empty answer, and before the count, which is
+        # taken from stdout. A timed-out or permission-denied ausearch has an
+        # empty stdout and therefore counted zero records — indistinguishable
+        # from "auditd was watching and saw nothing", which is what the kernel
+        # turns into a detection_gap. This is the shared helper behind
+        # detect.process_creation, detect.persistence_change,
+        # detect.credential_access and detect.rule, so the fabricated finding
+        # was reachable from four verbs, not one. `source: "none"` is what
+        # Kernel._source_unqueryable reads to keep it at "cannot tell".
+        return True, {"logged": False, "source": "none",
+                      "window_seconds": since_seconds,
+                      "reason": f"ausearch {why}; the audit log was not queried"}
     count = count_ausearch_records(res.stdout, key=key, image=image,
                                    record_type=record_type)
     return True, {"logged": count > 0, "count": count, "source": "auditd",
@@ -1933,6 +1982,25 @@ def _detect_authentication(self: LinuxAdapter, verb: Verb, action: Action) -> di
                 "source": "auth.log", "window_seconds": since}
     res = run(["journalctl", "--since", f"{since} seconds ago", "--no-pager",
                "-o", "short", "SYSLOG_FACILITY=10"])
+    if (why := query_failed(res)):
+        # The mirror of the two branches above, which was missed when they were
+        # fixed. `run()` turns a timeout or a missing/refusing journalctl into
+        # rc=-1 with an EMPTY stdout, and parse_auth_events("") tallies zero — so
+        # a query that never ran came back indistinguishable from "journald was
+        # asked and saw no authentication", and the kernel wrote a detection_gap
+        # out of it. The auth.log fallback twenty lines up was taught to say
+        # "cannot tell"; this path, which is the one that runs on every systemd
+        # host, was left saying "the control was silent".
+        #
+        # `source: "none"` is the marker Kernel._source_unqueryable reads, so
+        # this reaches detection_fired() as None. A journalctl that ran and had
+        # nothing to report still falls through to logged=False below, because
+        # that is a real negative and suppressing it would be the same bug
+        # pointing the other way.
+        return {"logged": False, "source": "none", "window_seconds": since,
+                "reason": (f"journalctl {why}; the journal was not queried, so "
+                           "nothing here is evidence about authentication "
+                           "logging")}
     counts = parse_auth_events(res.stdout)
     return {"logged": counts["total"] > 0, "counts": counts,
             "source": "journald", "window_seconds": since,
@@ -1956,6 +2024,19 @@ def _detect_rule(self: LinuxAdapter, verb: Verb, action: Action) -> dict[str, An
     if which("journalctl"):
         res = run(["journalctl", "--since", f"{since} seconds ago",
                    "--no-pager", "-g", re.escape(rule)])
+        if (why := query_failed(res)):
+            # Same omission as the branch in _detect_authentication: `hits` is
+            # counted from stdout, and a journalctl that never ran has an empty
+            # stdout, so a timeout read as "the rule did not fire" and the kernel
+            # turned that into a detection_gap against a rule nobody had checked.
+            # `query_failed` is deliberately used rather than `not res.ok` here,
+            # because on some builds `-g` exits non-zero when it simply matched
+            # nothing — and that IS the rule not firing.
+            return {"rule": rule, "logged": False, "source": "none",
+                    "window_seconds": since,
+                    "reason": (f"journalctl -g {why}; the journal was not "
+                               "searched, so silence here says nothing about "
+                               "the rule")}
         hits = len([ln for ln in res.stdout.splitlines() if ln.strip()])
         return {"rule": rule, "logged": hits > 0, "count": hits,
                 "source": "journald-grep", "window_seconds": since,

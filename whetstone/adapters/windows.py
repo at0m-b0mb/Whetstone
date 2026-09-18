@@ -1609,6 +1609,12 @@ def _detect_process_creation(self: WindowsAdapter, verb: Verb, action: Action) -
         "enabled": enabled,
         "sources": ["Security/4688", "Sysmon/1"],
         "count": len(matched),
+        # A query that could not run must never read as a silent control:
+        # `telemetry_available: False` is the payload marker the kernel
+        # treats as "cannot tell", which keeps it out of BOTH the gap
+        # column and the "detection fired" column.
+        "telemetry_available": not getattr(events, "unqueryable", False),
+        "query_error": getattr(events, "error", None),
         "matched": matched[:50],
         "note": (
             "process-creation auditing is off; absence of events here is a "
@@ -1633,6 +1639,12 @@ def _detect_persistence_change(self: WindowsAdapter, verb: Verb, action: Action)
         "window_seconds": since,
         "sources": ["Security/4698-4702", "Security/4657", "Sysmon/11-13"],
         "count": len(events),
+        # A query that could not run must never read as a silent control:
+        # `telemetry_available: False` is the payload marker the kernel
+        # treats as "cannot tell", which keeps it out of BOTH the gap
+        # column and the "detection fired" column.
+        "telemetry_available": not getattr(events, "unqueryable", False),
+        "query_error": getattr(events, "error", None),
         "matched": events[:50],
     }
 
@@ -1652,6 +1664,12 @@ def _detect_credential_access(self: WindowsAdapter, verb: Verb, action: Action) 
         "window_seconds": since,
         "sources": ["Security/4656", "Security/4663", "Sysmon/10"],
         "count": len(events),
+        # A query that could not run must never read as a silent control:
+        # `telemetry_available: False` is the payload marker the kernel
+        # treats as "cannot tell", which keeps it out of BOTH the gap
+        # column and the "detection fired" column.
+        "telemetry_available": not getattr(events, "unqueryable", False),
+        "query_error": getattr(events, "error", None),
         "lsass_access": len(lsass),
         "matched": events[:50],
     }
@@ -1668,6 +1686,12 @@ def _detect_authentication(self: WindowsAdapter, verb: Verb, action: Action) -> 
         "window_seconds": since,
         "sources": ["Security/4624", "Security/4625", "Security/4648", "Security/4672"],
         "count": len(events),
+        # A query that could not run must never read as a silent control:
+        # `telemetry_available: False` is the payload marker the kernel
+        # treats as "cannot tell", which keeps it out of BOTH the gap
+        # column and the "detection fired" column.
+        "telemetry_available": not getattr(events, "unqueryable", False),
+        "query_error": getattr(events, "error", None),
         "failures": len(failures),
         "matched": events[:50],
     }
@@ -1701,6 +1725,12 @@ def _detect_rule(self: WindowsAdapter, verb: Verb, action: Action) -> Any:
         "window_seconds": since,
         "fired": len(events) > 0,
         "count": len(events),
+        # A query that could not run must never read as a silent control:
+        # `telemetry_available: False` is the payload marker the kernel
+        # treats as "cannot tell", which keeps it out of BOTH the gap
+        # column and the "detection fired" column.
+        "telemetry_available": not getattr(events, "unqueryable", False),
+        "query_error": getattr(events, "error", None),
         "matched": events[:50],
     }
 
@@ -2740,6 +2770,33 @@ _RULE_LOG_ALIASES = {
 }
 
 
+class _Events(list):
+    """Query results that remember whether the query could be answered at all.
+
+    Seven call sites concatenate these with ``+``, so the flag has to survive
+    concatenation or the information is lost exactly where it is combined —
+    ``__add__`` therefore ORs it. A ``list`` subclass rather than a tuple for
+    that reason alone: every existing caller keeps working unchanged, and a
+    caller that forgets to look at ``unqueryable`` behaves exactly as it did
+    before rather than crashing, which is the right failure mode for a change
+    made to a platform that cannot be exercised on this machine.
+    """
+
+    def __init__(self, iterable=(), *, unqueryable: bool = False,
+                 error: str | None = None) -> None:
+        super().__init__(iterable)
+        self.unqueryable = unqueryable
+        self.error = error
+
+    def __add__(self, other):
+        merged = _Events(list(self) + list(other))
+        merged.unqueryable = self.unqueryable or getattr(other, "unqueryable", False)
+        merged.error = self.error or getattr(other, "error", None)
+        return merged
+
+    __radd__ = __add__
+
+
 def _query_events(logname: str, ids: Sequence[int], since_seconds: int) -> list[dict[str, Any]]:
     """Query a log for event ids in a window and return parsed event rows.
 
@@ -2747,7 +2804,11 @@ def _query_events(logname: str, ids: Sequence[int], since_seconds: int) -> list[
     projection is parsed by :func:`parse_winevent_events`, which the tests cover.
     """
     if _powershell() is None:
-        return []
+        # The same trap as the failed-query branch below, one step earlier and
+        # reached far more often: no PowerShell means the log was never asked,
+        # which is not the same as a log that answered "nothing". Returning a
+        # bare [] here made a host without pwsh report every control as silent.
+        return _Events(unqueryable=True, error="PowerShell is not available")
     if not _is_valid_logname(logname):
         raise AdapterError(
             f"refusing to query log name {logname!r}: it contains characters no "
@@ -2767,7 +2828,17 @@ def _query_events(logname: str, ids: Sequence[int], since_seconds: int) -> list[
         " provider=$_.ProviderName; log=$_.LogName; data=$d } } | ConvertTo-Json -Depth 4"
     )
     res = _run_ps(script, timeout=45)
-    return parse_winevent_events(res.stdout) if res.ok else []
+    if not res.ok:
+        # A query that FAILED is not a log that was silent, and returning []
+        # here made those two indistinguishable. Get-WinEvent hitting its 45s
+        # timeout on a busy Security log produced `count: 0`, the kernel read
+        # that as "the control did not fire", and the episode reported a
+        # detection gap that never happened. Fabricating a gap is the single
+        # worst thing this project can do — it is the failure the whole
+        # three-way finding split exists to prevent — so the emptiness is
+        # tagged and every handler stamps it into its payload.
+        return _Events(unqueryable=True, error=(res.stderr or "").strip()[:200])
+    return _Events(parse_winevent_events(res.stdout))
 
 
 def _filter_events_by_image(events: Sequence[Mapping[str, Any]], image: str) -> list[dict[str, Any]]:

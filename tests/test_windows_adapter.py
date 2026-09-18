@@ -536,3 +536,159 @@ class TestRuleResolver:
 
     def test_unknown(self):
         assert w._resolve_rule("no-such-rule") is None
+
+
+class TestWindowsDetectionHonesty:
+    """A Windows query that could not run must not read as a silent control.
+
+    `_query_events` returned a bare `[]` on failure, which is the same value a
+    successful query over a quiet log returns. A `Get-WinEvent` hitting its 45s
+    timeout on a busy Security log therefore produced `count: 0`, the kernel
+    read that as "the control did not fire", and the episode reported a
+    detection gap that never happened.
+
+    Fabricating a gap is the worst outcome this project has — a purple tool
+    that invents findings is worse than no tool — and it is precisely what the
+    three-way split between detection_gap, no_coverage and observation exists
+    to prevent. The Linux adapter was repaired for this; Windows was not in any
+    reviewer's scope, which is the third time on this codebase that a
+    protection has turned out to be a property of which file someone was
+    reading rather than a property of the system.
+    """
+
+    @staticmethod
+    def _observation(payload):
+        import whetstone.verbs  # noqa: F401  (registers the catalogue)
+        from whetstone.actions import REGISTRY, Observation
+
+        action = REGISTRY.bind("detect.process_creation",
+                               {"since_seconds": 300}, target="127.0.0.1")
+        return Observation(action=action, ok=True, data=payload, platform="windows")
+
+    def test_an_unanswerable_query_is_undetermined_not_a_gap(self):
+        from whetstone.kernel import detection_fired
+
+        verdict = detection_fired(self._observation(
+            {"count": 0, "enabled": True, "telemetry_available": False,
+             "query_error": "the operation has timed out"}))
+        assert verdict is None, (
+            "a query that timed out says nothing about the control; reporting "
+            "False here manufactures a detection gap out of a broken query")
+
+    def test_a_genuine_silence_is_still_a_gap(self):
+        """The fix must not buy honesty by making every answer inconclusive."""
+        from whetstone.kernel import detection_fired
+
+        assert detection_fired(self._observation(
+            {"count": 0, "enabled": True, "telemetry_available": True})) is False
+
+    def test_a_real_hit_still_fires(self):
+        from whetstone.kernel import detection_fired
+
+        assert detection_fired(self._observation(
+            {"count": 3, "enabled": True, "telemetry_available": True})) is True
+
+    def test_the_unqueryable_flag_survives_concatenation(self):
+        """Seven call sites join these with `+`; the flag must survive that.
+
+        This is where the information would otherwise be lost — precisely at
+        the point two logs are combined, which is the only place the handlers
+        ever see it.
+        """
+        from whetstone.adapters.windows import _Events
+
+        good = _Events([{"id": 4688}])
+        bad = _Events(unqueryable=True, error="timed out")
+
+        assert (good + bad).unqueryable is True
+        assert (bad + good).unqueryable is True
+        assert (good + good).unqueryable is False
+        assert len(good + bad) == 1, "events must still concatenate normally"
+
+    def test_every_windows_detect_payload_reports_its_provenance(self):
+        """The general property, so the next detect verb cannot omit it.
+
+        A handler that queries the event log and does not say whether the query
+        worked is one the kernel cannot read honestly, no matter what the
+        kernel does.
+        """
+        import inspect
+        import re
+
+        from whetstone.adapters import windows
+
+        src = inspect.getsource(windows)
+        for match in re.finditer(r"@WindowsAdapter\.implements\(\"(detect\.[\w.]+)\"\)",
+                                 src):
+            verb_id = match.group(1)
+            body = src[match.end():]
+            body = body[:body.find("@WindowsAdapter.implements")] if \
+                "@WindowsAdapter.implements" in body else body
+            if "_query_events(" not in body:
+                continue
+            assert "telemetry_available" in body, (
+                f"{verb_id} queries the event log but never reports whether "
+                "the query could be answered, so a failed query is "
+                "indistinguishable from a silent control")
+
+    def test_a_failed_query_is_tagged_at_the_source(self, monkeypatch):
+        """The fix itself, driven — not the kernel's reading of a payload.
+
+        An earlier version of this class asserted only on `detection_fired`
+        given a hand-built payload, and on the presence of a string in the
+        module source. Both PASSED with the fix reverted, because neither ever
+        called the function that was broken. That is the second can't-fail test
+        written on this codebase while fixing can't-fail tests, so this one
+        drives `_query_events` with a failing PowerShell result and asserts on
+        what it returns.
+        """
+        from whetstone.adapters import windows
+        from whetstone.adapters.base import CommandResult
+
+        timed_out = CommandResult(
+            argv=("pwsh", "-Command", "..."), returncode=1,
+            stderr="the operation has timed out", timed_out=True)
+        # This Mac has no pwsh, so without this the earlier no-PowerShell
+        # guard short-circuits and the branch under test is never reached.
+        monkeypatch.setattr(windows, "_powershell", lambda: "/usr/bin/pwsh")
+        monkeypatch.setattr(windows, "_run_ps", lambda *a, **k: timed_out)
+
+        events = windows._query_events("Security", [4688], 300)
+        assert events.unqueryable is True, (
+            "a Get-WinEvent that timed out returned an untagged empty list, "
+            "which the kernel reads as a silent control and reports as a "
+            "detection gap that never happened")
+        assert not events, "a failed query yields no events"
+        assert "timed out" in (events.error or "")
+
+    def test_a_successful_empty_query_is_not_tagged(self, monkeypatch):
+        """The other half: a quiet log must stay a quiet log.
+
+        Without this, tagging everything would buy honesty by making every
+        answer inconclusive, which destroys the finding the tool exists to
+        produce.
+        """
+        from whetstone.adapters import windows
+        from whetstone.adapters.base import CommandResult
+
+        quiet = CommandResult(argv=("pwsh",), returncode=0, stdout="")
+        monkeypatch.setattr(windows, "_powershell", lambda: "/usr/bin/pwsh")
+        monkeypatch.setattr(windows, "_run_ps", lambda *a, **k: quiet)
+
+        events = windows._query_events("Security", [4688], 300)
+        assert events.unqueryable is False
+        assert not events
+
+    def test_a_host_without_powershell_is_undetermined_not_silent(self, monkeypatch):
+        """No pwsh means the log was never asked, not that it answered nothing.
+
+        This is the branch reached most often off-Windows, and it returned a
+        bare [] — so every control on such a host reported as silent, which the
+        kernel turns into a detection gap for every red action in the episode.
+        """
+        from whetstone.adapters import windows
+
+        monkeypatch.setattr(windows, "_powershell", lambda: None)
+        events = windows._query_events("Security", [4688], 300)
+        assert events.unqueryable is True
+        assert "PowerShell" in (events.error or "")

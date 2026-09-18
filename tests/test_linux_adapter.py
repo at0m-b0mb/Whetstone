@@ -252,3 +252,107 @@ class TestScheduledTaskMarker:
         # The marker is its own fresh file, never the pre-existing victim.
         assert os.path.realpath(marker) != os.path.realpath(str(victim))
         assert victim.read_text() == "do not truncate me"
+
+
+# ===========================================================================
+# every detect.* query path: "could not ask" must never read as "nobody saw it"
+# ===========================================================================
+
+
+class TestAQueryThatDidNotRunIsNotSilence:
+    """The mirror that was missed when the auth.log fallback was repaired.
+
+    ``detect.authentication``'s FILE fallback was taught to say "cannot tell"
+    when it could not apply its window, and the two ``ausearch``-absent branches
+    were given ``source: "none"``. The paths that actually run on an ordinary
+    systemd host were left alone: ``_ausearch_window`` counted records out of a
+    timed-out ``ausearch``'s empty stdout, and ``_detect_authentication`` /
+    ``_detect_rule`` tallied a timed-out ``journalctl``'s empty stdout the same
+    way. Each produced ``logged: False`` with a source naming a log that was
+    never read, which ``Kernel.detection_fired`` believes, and the kernel writes
+    ``detection_gap`` — "the technique succeeded unobserved" — out of a query
+    that never happened. A fabricated indictment of a control nobody asked.
+
+    The half of this that has to keep working is asserted alongside each case: a
+    query that DID run and found nothing is still a gap, because suppressing a
+    real silence is the same bug facing the other way.
+    """
+
+    @staticmethod
+    def _dead(argv, **kw):
+        """What ``run()`` returns for a command that never produced output."""
+        return CommandResult(argv=tuple(argv), returncode=-1, stdout="",
+                             stderr=f"timed out after {kw.get('timeout', 30)}s",
+                             timed_out=True)
+
+    @staticmethod
+    def _silent(argv, **kw):
+        """A query that ran cleanly and had nothing to report."""
+        return CommandResult(argv=tuple(argv), returncode=0, stdout="")
+
+    def _fired(self, result):
+        """Read the payload the way the kernel reads it."""
+        from whetstone.actions import Observation
+        from whetstone.kernel import detection_fired
+
+        return detection_fired(Observation(action=None, ok=True,
+                                           platform="linux", data=result))
+
+    def test_a_timed_out_ausearch_is_not_a_detection_gap(self, monkeypatch):
+        monkeypatch.setattr(L, "which", lambda name: "/sbin/ausearch")
+        monkeypatch.setattr(L, "run", self._dead)
+        result = L._detect_process_creation(
+            LinuxAdapter(), None, _Action(since_seconds=300))
+        assert result["source"] == "none", result
+        assert self._fired(result) is None, result
+
+    def test_a_working_ausearch_that_saw_nothing_still_is_a_gap(self, monkeypatch):
+        monkeypatch.setattr(L, "which", lambda name: "/sbin/ausearch")
+        monkeypatch.setattr(L, "run", self._silent)
+        result = L._detect_process_creation(
+            LinuxAdapter(), None, _Action(since_seconds=300))
+        assert result["source"] == "auditd"
+        assert self._fired(result) is False, result
+
+    def test_a_timed_out_journalctl_is_not_an_authentication_gap(self, monkeypatch):
+        monkeypatch.setattr(L, "which", lambda name: "/bin/journalctl")
+        monkeypatch.setattr(L, "run", self._dead)
+        result = L._detect_authentication(
+            LinuxAdapter(), None, _Action(since_seconds=300))
+        assert result["source"] == "none", result
+        assert self._fired(result) is None, result
+
+    def test_a_working_journalctl_that_saw_nothing_still_is_a_gap(self, monkeypatch):
+        monkeypatch.setattr(L, "which", lambda name: "/bin/journalctl")
+        monkeypatch.setattr(L, "run", self._silent)
+        result = L._detect_authentication(
+            LinuxAdapter(), None, _Action(since_seconds=300))
+        assert result["source"] == "journald"
+        assert self._fired(result) is False, result
+
+    def test_a_timed_out_grep_is_not_a_rule_that_failed_to_fire(self, monkeypatch):
+        monkeypatch.setattr(L, "which", lambda name: "/bin/journalctl")
+        monkeypatch.setattr(L, "run", self._dead)
+        result = L._detect_rule(
+            LinuxAdapter(), None, _Action(rule="sigma:whatever", since_seconds=300))
+        assert result["source"] == "none", result
+        assert self._fired(result) is None, result
+
+    def test_a_grep_that_matched_nothing_is_still_a_verdict(self, monkeypatch):
+        """``-g`` exiting non-zero on an empty match must NOT become "cannot tell".
+
+        This is why ``query_failed`` asks for a stderr diagnostic *and* an empty
+        stdout rather than trusting the exit code on its own: on builds where a
+        no-match grep exits 1 and says nothing, reading that as a broken query
+        would delete every real detection gap this verb can report — the same
+        fabrication as the tests above, pointing the other way. A non-zero exit
+        with nothing to explain it is a negative, not a failure.
+        """
+        monkeypatch.setattr(L, "which", lambda name: "/bin/journalctl")
+        monkeypatch.setattr(
+            L, "run", lambda argv, **kw: CommandResult(
+                argv=tuple(argv), returncode=1, stdout="", stderr=""))
+        result = L._detect_rule(
+            LinuxAdapter(), None, _Action(rule="sigma:whatever", since_seconds=300))
+        assert result["source"] == "journald-grep", result
+        assert self._fired(result) is False, result
