@@ -47,8 +47,8 @@ by defenders, for defenders, and ends in a list of things to go and fix.
   and its ``<description>`` elements *do* carry the full advisory body — but the
   feed is fixed at the most recent 30 items and honours neither ``page`` nor the
   facet query string (all four variants return byte-identical XML). Thirty
-  documents is not an archive, so the index walk is the only route to the ~180
-  ``aa##-###`` joint advisories and the ~90 ``ar##-###`` analysis and malware
+  documents is not an archive, so the index walk is the only route to the 178
+  ``aa##-###`` joint advisories and the 132 ``ar##-###`` analysis and malware
   reports, and the HTML is parsed with :mod:`html.parser` from the stdlib.
 * The SCuBA baselines from ``cisagov/ScubaGear`` on GitHub, as raw Markdown.
 
@@ -57,7 +57,7 @@ ICS advisory back to 2010 as structured CSAF JSON, thousands of files, trivially
 fetchable. It is left out on purpose. Those are vendor vulnerability advisories —
 product tree, CVE, CVSS vector, remediation — which is precisely the shape
 :mod:`~training.corpus.sources.nvd` already contributes 40,000 of. Adding several
-thousand more would swamp the 260 narrative documents this source exists for
+thousand more would swamp the 308 narrative documents this source exists for
 inside the same source's own share cap, which is the opposite of the point.
 
 ---
@@ -125,7 +125,7 @@ cache that is missing its KEV file or has no advisory pages in it.
 **Politeness.** One request per :data:`_DELAY` seconds to ``www.cisa.gov``,
 serialised through a module-level clock, with the corpus's descriptive
 User-Agent from :mod:`..net`. Everything is cached to disk and nothing already
-cached is re-fetched: a cold run costs ~280 requests and about six minutes, and
+cached is re-fetched: a cold run costs ~340 requests and about seven minutes, and
 every run after that costs the index pages only, and those only once their cache
 is :data:`_INDEX_TTL_DAYS` days old — enough to pick up new advisories without
 re-walking the archive. ``WHETSTONE_CISA_REFRESH=1`` forces the lot.
@@ -214,7 +214,7 @@ _BASELINE_DIR = "baselines"
 _MANIFEST = "cisa.meta.json"
 
 #: Seconds between requests to www.cisa.gov. One federal web server, a few
-#: hundred pages, no hurry; a cold fetch takes about six minutes and every later
+#: hundred pages, no hurry; a cold fetch takes about seven minutes and every later
 #: fetch takes none.
 _DELAY = float(os.environ.get("WHETSTONE_CISA_DELAY", "1.2"))
 #: Multiplied by the attempt number after a transient failure.
@@ -616,7 +616,7 @@ def _fetch(cache_dir: Path) -> Path:
     ``build.py`` hands each source ``<cache>/<name>``, while a hand-run fetch
     from a shell one-liner almost always passes the cache root itself. Anchoring
     on a ``cisa/`` directory either way means both land in the same place, so a
-    build after a manual verification run does not re-download 280 pages.
+    build after a manual verification run does not re-download 340 pages.
     """
     root = cache_dir if cache_dir.name == "cisa" else cache_dir / "cisa"
     root.mkdir(parents=True, exist_ok=True)
@@ -1257,7 +1257,7 @@ SPEC = SourceSpec(
     fetch=_fetch,
     documents=_documents,
     #: KEV alone is over 1,700 entries and has only grown since 2022; the
-    #: advisories add ~260 and the baselines ~100. A floor of 1,500 refuses a
+    #: advisories add 308 and the baselines 79. A floor of 1,500 refuses a
     #: run that lost the catalogue or lost the narrative half without noticing,
     #: while leaving room for CISA to retire advisories.
     expect_min_docs=1500,
