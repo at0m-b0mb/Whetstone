@@ -66,9 +66,9 @@ other is the only non-open one.
   included knowingly: :mod:`~training.corpus.sources.lolbas` already establishes
   that a strong-copyleft source is acceptable here (it is GPL-3.0-only), and the
   obligation GPL-2.0 imposes — say where it came from, keep the notice — is what
-  this module and ``provenance.json`` do anyway. It is listed last in
-  :data:`_COLLECTIONS` for a reason given under dedup below.
-
+  this module and ``provenance.json`` do anyway. Its position in
+  :data:`_COLLECTIONS` — after the permissive sets, before the Elastic one —
+  is deliberate, for a reason given under dedup below.
 * ``elastic/protections-artifacts`` — **Elastic License 2.0**, ``yara/rules/``
   only, and it is the one licence here that is not open. ELv2 is
   source-available: it grants copying, distribution and derivative works, but
@@ -86,9 +86,9 @@ other is the only non-open one.
 
 **Splitting: brace matching, not a regex.** A ``.yar`` file usually holds many
 rules — signature-base averages seven and one file holds 624 — and a rule is
-the natural document, so files have to be cut apart. The tempting way to do that is
-to split on ``^rule `` and read to the next ``}``, and it is wrong on this
-corpus in four separate ways, all of which occur in the real files:
+the natural document, so files have to be cut apart. The tempting way to do
+that is to split on ``^rule `` and read to the next ``}``, and it is wrong on
+this corpus in four separate ways, all of which occur in the real files:
 
 1. Hex strings are written ``$a = { 4D 5A 90 00 }``. Those braces nest inside
    the rule and a naive matcher closes the rule on the first one.
@@ -132,20 +132,26 @@ does, and nothing else.
 **One consequence is measured and then accepted, not worked around.**
 :mod:`training.corpus.boilerplate` strips any mostly-alphabetic line of 40+
 characters that recurs across 25+ documents. Run against this source alone that
-is 75 lines and 0.9 MB, about 7% of what the adapter emits, and it is exactly
-the furniture you would expect: signature-base's DRL
+is 114 lines and 1.1 MB, 6.6% of what the adapter emits, and it is exactly the
+furniture you would expect: signature-base's DRL
 ``license = "Detection Rule License 1.1 …"`` line in 2,869 documents, its
-``author = "Florian Roth (Nextron Systems)"`` credit in 2,845, and a handful of
-report URLs that a few hundred rules cite in common (the LOLDrivers repository
-in 529, one FireEye post in 156). Those lines will be cut out of the rule bodies
+``author = "Florian Roth (Nextron Systems)"`` credit in 2,845, and a scatter of
+report URLs that a few hundred rules cite in common — the LOLDrivers repository
+in 529, one FireEye post in 156. Those lines will be cut out of the rule bodies
 corpus-wide, and that is left alone on purpose: a source that reshapes its own
 text to slip past a corpus-wide filter is a source whose output no longer means
 what the build report says it means, and the filter is right — an identical
 credit line in three thousand documents is furniture that a model this size
-would spend capacity memorising. The rendered header restates author and date as
-one sentence, which is how a person writes them and which incidentally keeps the
-line distinct per rule, so the attribution the DRL asks for survives in the
-register that actually reads as attribution.
+would spend capacity memorising.
+
+The header restates author and date as one sentence because that is how a person
+writes them, and for signature-base the per-rule date incidentally keeps the line
+unique, so the attribution the DRL asks for survives in the register that reads
+as attribution. That does *not* generalise, and checking rather than assuming is
+the only reason it is known: 611 Elastic rules share both an author and a
+creation date, so ``Written by Elastic Security on 2021-09-16.`` is furniture by
+the filter's definition and will go. The claim is therefore "sometimes", not
+"always", and it is written down that way.
 
 **Dedup, and why the order of the table matters.** These repositories copy each
 other relentlessly: 2,014 of Yara-Rules' rules are already in
@@ -707,7 +713,14 @@ _DATE_KEYS = ("date", "created", "last_modified", "modified", "version_date")
 _REFERENCE_KEYS = ("reference", "references", "ref", "url", "report")
 _FAMILY_KEYS = ("malware", "malware_family", "family", "tc_detection_name",
                 "malware_type", "threat_name")
+#: Sample-hash keys are matched at both ends, because upstream puts the noun
+#: on either side of the underscore: signature-base writes ``hash1``/``hash2``
+#: and Elastic writes ``reference_sample``. A prefix test alone silently
+#: dropped the sample hash from all three thousand Elastic rules — which are
+#: the ones where it matters most, since they carry no description and the
+#: hash is the only concrete artefact in the block.
 _HASH_PREFIXES = ("hash", "sample", "md5", "sha1", "sha256")
+_HASH_SUFFIXES = ("_sample", "_hash", "_md5", "_sha1", "_sha256")
 _LICENSE_KEYS = ("license", "licence")
 
 
@@ -766,10 +779,17 @@ def _all(fields: list[tuple[str, str]], keys: tuple[str, ...]) -> list[str]:
 
 
 def _hashes(fields: list[tuple[str, str]]) -> list[str]:
-    """Sample hashes, from keys spelled ``hash``, ``hash1``, ``sha256`` and so on."""
+    """Sample hashes, from keys spelled ``hash1``, ``sha256``, ``reference_sample``…
+
+    Elastic's ``fingerprint`` is deliberately not matched: it identifies the
+    *rule*, not a sample, and rendering it as "written from sample …" would put
+    a confident false statement in the corpus.
+    """
     out: list[str] = []
     for name, value in fields:
-        if name.startswith(_HASH_PREFIXES) and value not in out:
+        if not (name.startswith(_HASH_PREFIXES) or name.endswith(_HASH_SUFFIXES)):
+            continue
+        if value not in out:
             out.append(value)
     return out
 

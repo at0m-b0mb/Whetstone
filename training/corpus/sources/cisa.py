@@ -240,10 +240,14 @@ _KEV_MIN_ENTRIES = 500
 _MAX_FAILURE_RATE = 0.25
 
 #: A rendered advisory shorter than this is a stub or a parse that found the
-#: wrong div. Real joint advisories run from a few thousand to sixty thousand
-#: characters.
-_MIN_ADVISORY_CHARS = 700
-#: KEV entries render to ~700 characters; well below that means missing fields.
+#: wrong div. Real joint advisories average 29,000 characters and run to sixty
+#: thousand; measured across the whole archive the smallest genuine one renders
+#: to 597, an advisory that is a single ATT&CK technique table and nothing else,
+#: and the only page below that is a revision-history stub whose actual content
+#: was a downloadable file. 500 sits in that gap.
+_MIN_ADVISORY_CHARS = 500
+#: KEV entries average 1,067 characters and the shortest carry a one-sentence
+#: description with no references; well below this means missing fields.
 _MIN_KEV_CHARS = 200
 #: A baseline section below this is a heading with a link under it.
 _MIN_BASELINE_CHARS = 400
@@ -298,14 +302,20 @@ _FORBIDDEN = (
     "trust failure and turning verification off would not fix it."
 )
 
+#: Used for 404 and for 403 on the static asset path, because that path has no
+#: handshake quirk to confuse the reading: a missing file under
+#: ``/sites/default/files/`` is answered 403 by CISA's edge, not 404, so
+#: treating only 404 as "this moved" would report a URL that no longer exists as
+#: a mysterious permission problem.
 _MOVED = (
-    "{url}: HTTP 404.\n"
-    "CISA has moved this endpoint. This source refuses to fall back to yielding "
-    "zero documents quietly — a corpus that silently loses a source is worse "
-    "than a build that stops, because nobody notices until a tokenizer "
-    "comparison months later says a register is empty.\n"
-    "Re-derive the URL from https://www.cisa.gov/cybersecurity-advisories and "
-    "update the constant at the top of this module."
+    "{url}: HTTP {code}.\n"
+    "That endpoint is gone or is no longer served. This source refuses to fall "
+    "back to yielding zero documents quietly — a corpus that silently loses a "
+    "source is worse than a build that stops, because nobody notices until a "
+    "tokenizer comparison months later says a register is empty.\n"
+    "Re-derive the URL from https://www.cisa.gov/cybersecurity-advisories (or, "
+    "for the baselines, from github.com/cisagov/ScubaGear) and update the "
+    "constant at the top of this module."
 )
 
 _derived: ssl.SSLContext | None = None
@@ -389,7 +399,8 @@ def _get(url: str, *, timeout: int = 60, fatal_404: bool = True) -> bytes:
                 raise SourceError(_FORBIDDEN.format(url=url)) from None
             if exc.code == 404:
                 if fatal_404:
-                    raise SourceError(_MOVED.format(url=url)) from None
+                    raise SourceError(
+                        _MOVED.format(url=url, code=404)) from None
                 raise NetworkError(f"{url}: HTTP 404 Not Found") from None
             last = f"HTTP {exc.code} {exc.reason}"
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
@@ -412,8 +423,9 @@ def _plain_get(url: str, *, timeout: int = 90) -> bytes:
                                     context=ssl_context()) as response:
             return response.read()
     except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            raise SourceError(_MOVED.format(url=url)) from None
+        if exc.code in (403, 404):
+            raise SourceError(
+                _MOVED.format(url=url, code=exc.code)) from None
         raise NetworkError(f"{url}: HTTP {exc.code} {exc.reason}") from None
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise NetworkError(f"{url}: {exc}") from None
@@ -423,16 +435,21 @@ def _plain_get(url: str, *, timeout: int = 90) -> bytes:
 # fetch
 # ---------------------------------------------------------------------------
 
-def _fetch_kev(root: Path) -> None:
+def _fetch_kev(root: Path) -> str:
     """The KEV catalogue, validated before it is allowed into the cache.
 
     Validated rather than merely downloaded because the failure this guards is
     not a network error — it is a 200 carrying CISA's HTML "page not found",
-    which writes cleanly to disk and parses to zero vulnerabilities.
+    which writes cleanly to disk and parses to zero vulnerabilities. Returns the
+    catalogue version, for the manifest.
     """
     target = root / _KEV_FILE
     if target.exists() and not _REFRESH:
-        return
+        try:
+            return str(json.loads(
+                target.read_text(encoding="utf-8")).get("catalogVersion", ""))
+        except (OSError, ValueError):
+            pass  # unreadable cache: fall through and fetch it again
 
     payload = _plain_get(_KEV_URL, timeout=120)
     try:
@@ -440,8 +457,7 @@ def _fetch_kev(root: Path) -> None:
     except json.JSONDecodeError as exc:
         raise SourceError(
             f"{_KEV_URL} did not return JSON ({exc}). The catalogue has moved "
-            f"or the request was intercepted; the first {len(payload[:120])} "
-            f"bytes were {payload[:120]!r}."
+            f"or the response was intercepted; it began {payload[:120]!r}."
         ) from None
 
     entries = data.get("vulnerabilities")
@@ -456,6 +472,7 @@ def _fetch_kev(root: Path) -> None:
     tmp = target.with_suffix(".json.part")
     tmp.write_bytes(payload)
     tmp.replace(target)
+    return str(data.get("catalogVersion", ""))
 
 
 def _harvest(page_html: str) -> list[str]:
@@ -536,7 +553,10 @@ def _fetch_advisories(root: Path, paths: list[str]) -> int:
             body = _get(f"https://www.cisa.gov{path}", timeout=90,
                         fatal_404=False)
         except SourceError:
-            raise            # 403/404 is structural; it has its own message
+            # Only a 403 reaches here, and a 403 is never about one page: the
+            # edge has started refusing the handshake. Let it out with its own
+            # message rather than counting it as a missing advisory.
+            raise
         except NetworkError as exc:
             failures.append(f"{slug}: {exc}")
             continue
@@ -601,7 +621,7 @@ def _fetch(cache_dir: Path) -> Path:
     root = cache_dir if cache_dir.name == "cisa" else cache_dir / "cisa"
     root.mkdir(parents=True, exist_ok=True)
 
-    _fetch_kev(root)
+    version = _fetch_kev(root)
     paths = _fetch_index(root)
     advisories = _fetch_advisories(root, paths)
     baselines = _fetch_baselines(root)
@@ -609,6 +629,7 @@ def _fetch(cache_dir: Path) -> Path:
     (root / _MANIFEST).write_text(json.dumps({
         "fetched": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "kev_url": _KEV_URL,
+        "kev_catalog_version": version,
         "advisory_index": _INDEX_URL.format(facet="94", page=0),
         "advisory_paths_known": len(paths),
         "advisory_pages_cached": advisories,
@@ -665,7 +686,7 @@ _DROP = {"script", "style", "noscript", "svg", "form", "button", "select",
 _FOOTNOTE = re.compile(r"^\s*[\d,\s]*\s*$")
 
 
-def _render_table(rows: list[list[str]]) -> str:
+def _render_table(rows: list[list[str]], labelled: bool) -> str:
     """One HTML table as text, aligned when alignment can carry meaning.
 
     An indicator table — file name, hash, description — is a grid, and the grid
@@ -678,15 +699,31 @@ def _render_table(rows: list[list[str]]) -> str:
     with the text of one cell scattered across them, so past
     :data:`_TABLE_MAX_WIDTH` each row is written out as labelled fields instead
     — which loses nothing, because there was no column structure to lose.
+
+    ``labelled`` says whether the table declared a header row with ``<th>``, and
+    it has to be asked rather than assumed. The obvious shortcut — treat row
+    zero as the header — produces nonsense on CISA's "Advisory at a Glance"
+    panel, which is a two-column key/value table with no header at all: its
+    first row is ``Executive Summary | CISA began incident response efforts…``,
+    and using that as a header labels the *next* row's bullet list with a whole
+    paragraph of summary text. A two-column table with no header is exactly a
+    key/value list and is rendered as one.
     """
-    flat = [[" ".join(cell.split()) for cell in row] for row in rows]
-    flat = [row for row in flat if any(cell for cell in row)]
-    if not flat:
+    # Two views of the same cells. ``kept`` preserves the line structure inside
+    # a cell — CISA builds its "Advisory at a Glance" panels out of table cells
+    # containing whole bulleted lists, and flattening those turns three
+    # recommendations into one run-on sentence. ``flat`` is the one-line form,
+    # which is the only form a padded column can use.
+    kept = [[re.sub(r"[ \t]*\n[ \t]*", "\n", cell).strip() for cell in row]
+            for row in rows]
+    kept = [row for row in kept if any(row)]
+    if not kept:
         return ""
+    flat = [[" ".join(cell.split()) for cell in row] for row in kept]
 
     columns = max(len(row) for row in flat)
     if columns == 1:
-        return "\n".join(row[0] for row in flat)
+        return "\n".join(row[0] for row in kept)
 
     widths = [
         max((len(row[i]) if i < len(row) else 0) for row in flat)
@@ -702,15 +739,43 @@ def _render_table(rows: list[list[str]]) -> str:
             ).rstrip())
         return "\n".join(lines)
 
-    header = flat[0]
-    lines = []
-    for row in flat[1:]:
-        for i, cell in enumerate(row):
-            if not cell:
+    def _field_lines(label: str, cell: str) -> list[str]:
+        """``label: first line``, with any further lines of the cell under it."""
+        first, _, rest = cell.partition("\n")
+        if label and first.startswith("- "):
+            # The cell is a list. Its first item does not belong on the label's
+            # line, where it would read as "Key Actions: - Prevent compromise".
+            return [f"{label}:"] + [f"  {line}" for line in cell.split("\n") if line]
+        out = [f"{label}: {first}" if label else first]
+        out.extend(f"  {line}" for line in rest.split("\n") if line)
+        return out
+
+    lines: list[str] = []
+    if labelled:
+        header = flat[0]
+        for row in kept[1:]:
+            for i, cell in enumerate(row):
+                if not cell:
+                    continue
+                label = (header[i] if i < len(header) and header[i]
+                         else f"Column {i + 1}")
+                lines += _field_lines(label, cell)
+            lines.append("")
+    elif columns == 2:
+        for row in kept:
+            key = " ".join(row[0].split()) if row else ""
+            value = row[1] if len(row) > 1 else ""
+            if not (key or value):
                 continue
-            label = header[i] if i < len(header) and header[i] else f"Column {i + 1}"
-            lines.append(f"{label}: {cell}")
-        lines.append("")
+            lines += _field_lines(key, value)
+            lines.append("")
+    else:
+        # No header and not a key/value pair: nothing names these columns, so
+        # each row becomes its own small block rather than inventing labels.
+        for row in kept:
+            lines += [cell for cell in row if cell]
+            lines.append("")
+
     return "\n".join(lines).strip() or "\n".join("  ".join(r) for r in flat)
 
 
@@ -740,7 +805,11 @@ class _Article(HTMLParser):
         self._drop = 0
         self._pre = 0
         self._sup: list[str] | None = None
-        self._tables: list[list[list[str]]] = []
+        #: A stack, because an advisory occasionally nests a table inside a
+        #: cell. Each entry is the table's rows and whether it ever used a
+        #: ``<th>``, which is what tells :func:`_render_table` that row zero is
+        #: a header and not data.
+        self._tables: list[tuple[list[list[str]], list[bool]]] = []
         self._cell: list[str] | None = None
 
     # -- sinks ------------------------------------------------------------
@@ -754,16 +823,23 @@ class _Article(HTMLParser):
             self._out.append(text)
 
     def _newline(self) -> None:
-        """A line break in the page body only — never inside a table cell."""
-        if self._cell is not None or self._sup is not None:
+        """A line break into whichever sink is current.
+
+        Table cells get them too. :func:`_render_table` decides per table
+        whether to keep them — a padded column cannot, a labelled row can — and
+        it can only make that choice if the breaks are still there to discard.
+        A superscript is always one inline run and never takes a break.
+        """
+        if self._sup is not None:
             return
-        if self._out and self._out[-1] == "- ":
+        sink = self._out if self._cell is None else self._cell
+        if sink and sink[-1] == "- ":
             # CISA writes list items as <li><p>text</p></li>. The <p> would
             # otherwise put a line break between the bullet and its own text,
             # leaving every list in every advisory as alternating "-" and
             # orphaned sentences.
             return
-        self._out.append("\n")
+        sink.append("\n")
 
     # -- parsing ----------------------------------------------------------
 
@@ -792,17 +868,18 @@ class _Article(HTMLParser):
         elif tag == "sup":
             self._sup = []
         elif tag == "table":
-            self._tables.append([])
+            self._tables.append(([], []))
             self._newline()
         elif tag == "tr" and self._tables:
-            self._tables[-1].append([])
-        elif tag in ("td", "th") and self._tables and self._tables[-1]:
+            rows, headers = self._tables[-1]
+            rows.append([])
+            headers.append(False)
+        elif tag in ("td", "th") and self._tables and self._tables[-1][0]:
+            if tag == "th":
+                self._tables[-1][1][-1] = True
             self._cell = []
         elif tag == "br":
-            if self._cell is not None:
-                self._emit("\n")
-            else:
-                self._newline()
+            self._newline()
         elif tag == "li":
             self._newline()
             self._emit("- ")
@@ -845,12 +922,13 @@ class _Article(HTMLParser):
             if content and not _FOOTNOTE.match(content):
                 self._emit(content)
         elif tag in ("td", "th"):
-            if self._cell is not None and self._tables and self._tables[-1]:
-                self._tables[-1][-1].append("".join(self._cell))
+            if self._cell is not None and self._tables and self._tables[-1][0]:
+                self._tables[-1][0][-1].append("".join(self._cell))
             self._cell = None
         elif tag == "table":
             if self._tables:
-                rendered = _render_table(self._tables.pop())
+                rows, headers = self._tables.pop()
+                rendered = _render_table(rows, bool(headers) and headers[0])
                 if rendered:
                     # Into whatever sink is now current: a nested table belongs
                     # inside its enclosing cell, not at the top of the page.
@@ -868,7 +946,8 @@ class _Article(HTMLParser):
         if not data.strip():
             # Pure inter-tag indentation, but it may still be the single space
             # separating two inline elements, so it is not discarded outright.
-            if data and self._out and not self._out[-1].endswith((" ", "\n")):
+            sink = self._out if self._cell is None else self._cell
+            if self._sup is None and sink and not sink[-1].endswith((" ", "\n")):
                 self._emit(" ")
             return
         self._emit(re.sub(r"\s+", " ", data))
@@ -940,7 +1019,10 @@ def _kev_documents(root: Path) -> Iterator[Document]:
             "floor. The cached catalogue is truncated; delete it and re-fetch."
         )
 
-    version = str(data.get("catalogVersion", "")).strip()
+    # The catalogue version is deliberately not written into the documents. It
+    # is identical across all 1,713 of them, which makes it 1,713 copies of one
+    # date — too short for ..boilerplate's 40-character floor to remove, and
+    # provenance the cache manifest already records properly.
     for entry in entries:
         cve = str(entry.get("cveID", "")).strip()
         if not cve:
@@ -982,8 +1064,6 @@ def _kev_documents(root: Path) -> Iterator[Document]:
             lines.append(f"Remediation due: {due}")
         if ransomware:
             lines.append(f"Known ransomware campaign use: {ransomware}")
-        if version:
-            lines.append(f"KEV catalogue version: {version}")
 
         lines += ["", lead]
         if description:

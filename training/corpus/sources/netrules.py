@@ -233,7 +233,15 @@ _MIN_SURICATA_FILES = 20
 
 #: Written last and only on success, so a half-populated cache re-fetches rather
 #: than being mistaken for a complete one.
-_MARKER = ".fetched.json"
+#:
+#: Named after the source rather than the bare ``.fetched.json`` the older
+#: adapters use. ``build.py`` hands every source its own ``cache/<name>/``
+#: directory, so a generic name is safe there — but a person verifying one
+#: adapter by hand passes the cache *root*, several sources in this package
+#: already drop files there, and two of them claiming ``.fetched.json`` would
+#: have one reading the other's marker and skipping its own download. Cheap to
+#: avoid, unpleasant to diagnose.
+_MARKER = ".netrules.fetched.json"
 
 
 # ---------------------------------------------------------------------------
