@@ -169,13 +169,17 @@ pretrain() {
 # Trajectories are regenerated against the real agent loop first, so the model
 # is fine-tuned on what the current code actually does, not a stale capture.
 run_sft() {
-    python3 -m training.trajectories --out "$D/corpus/trajectories-$VER.jsonl" || return 1
+    # --out is a DIRECTORY: the generator writes trajectory-NNNNN.txt into it and
+    # sft globs that pattern. Handing it a .jsonl path would silently create a
+    # directory with that name and leave sft with nothing to read.
+    local traj="$D/corpus/trajectories-$VER"
+    python3 -m training.trajectories --out "$traj" || return 1
     local base="$D/models/checkpoints-$VER/$MODEL"
     [[ -d "$base/best" ]] && base="$base/best"   # prefer best over last
     log "   SFT base: $base"
     python3 -m training.sft --checkpoint "$base" \
         --tokenizer "$D/models/tokenizer-$VER/tokenizer.json" \
-        --trajectories "$D/corpus/trajectories-$VER.jsonl" \
+        --trajectories "$traj" \
         --out "$D/models/checkpoints-$VER/$MODEL-sft" \
         --replay "$D/corpus/tokenized-$VER"
 }
@@ -183,14 +187,40 @@ run_sft() {
 # ── 6. verify ────────────────────────────────────────────────────────────────
 verify() {
     local tok="$D/models/tokenizer-$VER/tokenizer.json"
-    local ck="$D/models/checkpoints-$VER/$MODEL-sft"
-    echo "=== whetbench: $MODEL-sft ==="
+    local root="$D/models/checkpoints-$VER"
+    # Pick the best checkpoint that actually exists. Stage 5 is allowed to fail
+    # without stopping the night, so hardcoding the SFT path would make a failed
+    # SFT look like a failed verification — two very different mornings.
+    local ck name
+    if   [[ -d "$root/$MODEL-sft" ]];  then ck="$root/$MODEL-sft";  name="$MODEL-sft"
+    elif [[ -d "$root/$MODEL/best" ]]; then ck="$root/$MODEL/best"; name="$MODEL/best"
+    elif [[ -d "$root/$MODEL" ]];      then ck="$root/$MODEL";      name="$MODEL"
+    else log "   no checkpoint to verify under $root"; return 1
+    fi
+    log "   verifying $name"
+
+    echo "=== whetbench: $name (the language model) ==="
     python3 -m bench.whetbench --checkpoint "$ck" --tokenizer "$tok" \
-        --json "$RUN/bench-$MODEL-sft.json"
+        --json "$RUN/bench-whet.json"
+
+    echo; echo "=== agentbench: $name (the AGENT — does it purple-team?) ==="
+    # The metric that actually answers the question. Baseline first, so the
+    # model's numbers are read against the scripted sweep rather than in a
+    # vacuum -- the sweep is a reference point, not an opponent.
+    python3 -m bench.agentbench --baseline --runs 3 \
+        --json "$RUN/agent-baseline.json"
+    python3 -m bench.agentbench --runs 3 --model "$ck" --tokenizer "$tok" \
+        --json "$RUN/agent-model.json"
+
     echo; echo "=== test suite ==="
     python3 -m pytest tests/ -q
+
     echo; echo "=== lab: the model driving the real loop ==="
     python3 -m lab.run --both --model "$ck" --tokenizer "$tok"
+
+    echo; echo "=== captured example run (committable artifact) ==="
+    python3 -m lab.record_run --checkpoint "$ck" --tokenizer "$tok" \
+        --out examples/runs --name "sandbox-$MODEL-v5" || true
 }
 
 log "════ overnight $VER starting — model=$MODEL ════"
