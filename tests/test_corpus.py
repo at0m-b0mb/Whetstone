@@ -11,6 +11,10 @@ from __future__ import annotations
 import importlib
 import itertools
 import json
+import os
+import re
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -460,6 +464,339 @@ class TestTldrParser:
         from training.corpus.sources.tldr import parse_page
         for junk in ("", "```", "- dangling intent:", "`unclosed", "#\n>\n-\n`x`"):
             parse_page(junk, platform="linux", name="j")
+
+
+
+#: The battery runs in a process the parent is able to kill, and that is the
+#: whole point rather than ceremony. A regex that has gone exponential cannot be
+#: interrupted: CPython does not check for signals while ``sre`` is matching, so
+#: an in-process wall clock never gets the chance to fire and the assertion
+#: never runs. That is exactly how the build failed — it did not report a slow
+#: source, it stopped existing — and a test suite that reproduced the hang
+#: instead of reporting it would have inherited the same defect. The progress
+#: line is flushed before every call so the parent can name what wedged it.
+_BATTERY_RUNNER = """
+import importlib.util
+import json
+import sys
+import time
+
+tests_path, progress_path, budget = sys.argv[1], sys.argv[2], float(sys.argv[3])
+
+spec = importlib.util.spec_from_file_location("_whetstone_corpus_tests", tests_path)
+tests = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(tests)
+
+from training.corpus.sources import windocs
+
+case = tests.TestWindocsBacktracking
+inputs = list(case.adversarial().items())
+progress = open(progress_path, "w", buffering=1)
+over = []
+
+
+def run(name, call, label, text):
+    progress.write(name + " on " + repr(label) + chr(10))
+    start = time.perf_counter()
+    call(text)
+    spent = time.perf_counter() - start
+    if spent > budget:
+        over.append(name + " on " + repr(label) + ": " + format(spent, ".2f") + "s")
+
+
+for name, pattern in sorted(case._patterns().items()):
+    for label, text in inputs:
+        run(name, lambda t, p=pattern: p.sub(case._blank, t), label, text)
+for label, text in inputs:
+    run("_strip_comments", windocs._strip_comments, label, text)
+
+progress.write("finished" + chr(10))
+print(json.dumps(over))
+"""
+
+
+class TestWindocsBacktracking:
+    r"""No regex in the windocs adapter may go superlinear. This one cost a night.
+
+    The adapter was left to build a corpus overnight and instead spun at 99.7%
+    of a core for seven and a half hours without yielding a document. Every
+    stack sample landed in ``sre_search`` underneath one ``re.sub``. The cause
+    was the link-text alternation, written ``(?:\\.|[^\[\]])*`` — two branches
+    that can both consume a backslash, so every backslash in range doubles the
+    number of ways the star can match the same span. The page it died on is
+    ``sysinternals/downloads/newsid.md``, which writes a literal escaped
+    bracket (``**newsid /a \[newname\]**``) and then 6,139 characters of
+    ordinary Windows documentation holding 27 backslashes and no ``](``
+    anywhere: 2**27 paths to exhaust before the match is allowed to fail. Four
+    more cached pages are shaped the same way.
+
+    Disjoint branches fixed that one. **This test exists because inspection did
+    not find the other two — measurement did.** ``_HTML_COMMENT`` and
+    ``_HTML_TAG`` were each quadratic for their own reason, and neither had
+    fired yet, which is the only kind of luck a build ever gets. So the rule is
+    mechanical now rather than a matter of review: every compiled pattern in
+    the module meets a wall clock, against input built to look like the worst
+    thing a Windows documentation page could plausibly say.
+    """
+
+    #: Large enough that a quadratic pattern needs seconds where a linear one
+    #: needs milliseconds — measured, the gap is three orders of magnitude — and
+    #: small enough that a regression fails the suite in seconds instead of
+    #: hanging it the way the build hung.
+    N = 16_000
+
+    #: The whole battery runs in 0.4 s today and its worst single case is 10 ms,
+    #: so half a second is a 50x margin on the passing side, while the three
+    #: spellings this replaced are 5-11x over it.
+    BUDGET = 0.5
+
+    @classmethod
+    def adversarial(cls) -> dict[str, str]:
+        """Text shaped like the things that actually break Markdown cleaners.
+
+        Every entry is a real shape from this corpus taken to an unreasonable
+        length, not random noise: Windows paths are why the backslash branches
+        matter, escaped brackets are how a manual page writes a literal ``[``,
+        and a long unbroken line is what a generated API table looks like. A
+        fuzzer would have found none of these, because each one has to be *well
+        formed enough* to make the pattern start matching and then never let it
+        finish.
+        """
+        n = cls.N
+        return {
+            "backslash run": "\\" * n,
+            "windows paths": "C:\\Windows\\System32\\drivers\\etc " * (n // 8),
+            "escaped brackets": "\\[" * n,
+            "escaped bracket pairs": "\\[x\\] " * (n // 4),
+            "unclosed brackets": "[" * n,
+            "closing brackets": "]" * n,
+            "nested brackets": "[" * n + "]" * n,
+            "bracket runs": "[a" * n,
+            "image opens": "![" * n,
+            "link opens": "[a](" * n,
+            "unclosed target": "[a](" + "b\\c" * n,
+            "nested parens": "[a](" + "(x)" * n,
+            "paren run": "(" * n,
+            "angle run": "<" * n + ">" * n,
+            "tag then long line": "<a" + " " * n + "z" * n,
+            "tag opens": "<a " * n,
+            "comment opens": "<!--" * n,
+            "comment opens then tail": "<!--x" * n + "y" * n,
+            "ampersands": "&" * n,
+            "entity prefixes": "&amp" * n,
+            # The page that ate the night, at its real shape.
+            "newsid": ("**newsid /a \\[newname\\]**\n"
+                       + "SECURITY\\\\SAM\\\\Domains\\\\Account " * (n // 8)),
+        }
+
+    @staticmethod
+    def _patterns() -> dict[str, re.Pattern[str]]:
+        """Every compiled pattern in the module, found rather than listed.
+
+        Enumerated out of the module's own namespace on purpose. A hand-written
+        list is a list somebody forgets to extend, and forgetting is the exact
+        failure this class is here to make impossible: the pattern that hung the
+        build was one nobody had thought to check.
+        """
+        from training.corpus.sources import windocs
+
+        found = {name: value for name, value in vars(windocs).items()
+                 if isinstance(value, re.Pattern)}
+        found.update({f"_FAMILIES[{key}]": value
+                      for key, value in windocs._FAMILIES.items()})
+        return found
+
+    @staticmethod
+    def _seconds(call, *args, repeats: int = 5) -> float:
+        """Best-of-N wall clock, because the minimum is the robust estimator.
+
+        Scheduling noise only ever ADDS time — a process descheduled mid-call
+        cannot finish sooner than it would have — so the fastest of several
+        runs is the closest estimate of the real cost, and the mean is not.
+        That matters here because these ratios get compared against a fixed
+        threshold while the machine may be saturated by a training run in
+        another process, and a timing test that fails on contention is an
+        instrument that cries wolf. Measured: this test passes alone and failed
+        under a concurrent pretrain until the estimator was changed.
+        """
+        best = float("inf")
+        for _ in range(repeats):
+            start = time.perf_counter()
+            call(*args)
+            best = min(best, time.perf_counter() - start)
+        return best
+
+    @staticmethod
+    def _blank(match: re.Match[str]) -> str:
+        """A replacement that is valid for every pattern, group count aside."""
+        return ""
+
+    #: Comfortably more than the 1.5 s the battery needs today, and far less
+    #: than the seven and a half hours it is here to prevent.
+    TIMEOUT = 60
+
+    def test_every_pattern_and_the_scanner_meet_the_clock(self, tmp_path):
+        """The whole battery, in a process that can be killed if it will not stop.
+
+        Two failures are reported differently on purpose. A pattern that is
+        merely quadratic finishes and is named with its time, which is the
+        common regression and the one worth a precise message. A pattern that
+        has gone exponential never finishes at all, and then the timeout fires
+        and the last progress line names it instead — the diagnosis the original
+        hang needed a process sample to produce.
+        """
+        runner = tmp_path / "battery.py"
+        runner.write_text(_BATTERY_RUNNER, encoding="utf-8")
+        progress = tmp_path / "progress.txt"
+        root = Path(__file__).resolve().parents[1]
+        env = dict(os.environ, PYTHONPATH=str(root))
+
+        try:
+            done = subprocess.run(
+                [sys.executable, str(runner), __file__, str(progress),
+                 str(self.BUDGET)],
+                cwd=root, env=env, capture_output=True, text=True,
+                timeout=self.TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            seen = progress.read_text(encoding="utf-8").strip().split("\n")
+            pytest.fail(
+                f"the battery did not finish within {self.TIMEOUT}s. It was "
+                f"still inside {seen[-1] if seen else '(nothing started)'} — "
+                "that pattern is exponential, not merely slow"
+            )
+
+        assert done.returncode == 0, f"battery crashed:\n{done.stderr}"
+        over = json.loads(done.stdout.strip().split("\n")[-1])
+        assert not over, (
+            f"patterns that went superlinear (budget {self.BUDGET}s at "
+            f"n={self.N}):\n" + "\n".join(over)
+        )
+
+    def test_the_battery_covers_every_pattern_in_the_module(self):
+        """A battery that silently stopped finding patterns would prove nothing."""
+        patterns = self._patterns()
+        assert len(patterns) >= 12, f"found only {len(patterns)} patterns"
+        for required in ("_LINK", "_IMAGE", "_HTML_TAG", "_ENTITY", "_UNESCAPE"):
+            assert required in patterns, f"{required} is not being exercised"
+
+    #: The three spellings this module used to carry, kept verbatim so the clock
+    #: above can be shown to have teeth. Quadrupling the input costs a linear
+    #: pattern 4x and a quadratic one 16x, a gap wide enough to assert on
+    #: without the flakiness of an absolute time on a loaded machine.
+    PRE_FIX = {
+        "_HTML_COMMENT": (
+            re.compile(r"<!--.*?-->", re.DOTALL),
+            lambda n: "<!--" * n,
+        ),
+        "_LINK": (
+            re.compile(r"\[((?:\\.|[^\[\]])*)\]" + r"\((?:\\.|[^()\\])*\)"),
+            lambda n: "\\[" * n,
+        ),
+        "_HTML_TAG": (
+            re.compile(r"</?(?:span|a|p|b|i|u|br|div|code)(?:\s+[^<>]*?)?/?>",
+                       re.IGNORECASE),
+            lambda n: "<a" + " " * n + "z" * n,
+        ),
+    }
+
+    def test_the_spellings_this_replaced_are_superlinear(self):
+        """Proof the clock above is not measuring an empty room.
+
+        Each of these is the pattern as the module actually shipped it. If a
+        future edit reverts one, the test above catches it; this one checks that
+        the thing being caught is real, by showing the old spelling growing with
+        the square of its input where the current spelling grows with the input.
+        """
+        from training.corpus.sources import windocs
+
+        current = {
+            "_HTML_COMMENT": windocs._strip_comments,
+            "_LINK": lambda text: windocs._LINK.sub(self._blank, text),
+            "_HTML_TAG": lambda text: windocs._HTML_TAG.sub(self._blank, text),
+        }
+        for name, (stale, build) in self.PRE_FIX.items():
+            small, large = build(1_000), build(4_000)
+            was = (self._seconds(stale.sub, self._blank, large)
+                   / max(self._seconds(stale.sub, self._blank, small), 1e-9))
+            now = (self._seconds(current[name], large)
+                   / max(self._seconds(current[name], small), 1e-9))
+            assert was > 8, f"{name}: the pre-fix spelling no longer misbehaves"
+            assert now < 8, (
+                f"{name}: quadrupling the input cost {now:.1f}x, not ~4x — "
+                "this pattern has gone superlinear again"
+            )
+
+    def test_the_link_pattern_that_hung_the_build_was_exponential(self):
+        """The newsid.md shape, at a size that still finishes either way.
+
+        Twenty-two backslashes rather than the page's twenty-seven: the old
+        pattern needs 3x for every two added, so the real page is minutes and
+        this is a fifteenth of a second. The current pattern does not care how
+        many there are.
+        """
+        from training.corpus.sources import windocs
+
+        stale = self.PRE_FIX["_LINK"][0]
+        page = "**newsid /a \\[newname\\]**\n" + "SECURITY\\\\SAM " * 11
+        was = self._seconds(stale.sub, self._blank, page)
+        now = self._seconds(windocs._LINK.sub, self._blank, page)
+        assert was > 100 * max(now, 1e-9), (
+            f"the pre-fix link pattern took {was:.4f}s and the current one "
+            f"{now:.6f}s — the exponential blowup is no longer reproducible, "
+            "so this test has stopped proving anything"
+        )
+
+    def test_the_comment_scanner_is_the_regex_it_replaced(self):
+        """Linear is only worth having if it still does the same thing."""
+        from training.corpus.sources import windocs
+
+        stale = self.PRE_FIX["_HTML_COMMENT"][0]
+        for text in (
+            "a<!--b-->c",
+            "a<!--b-->c<!--d-->e",
+            "a<!--b\nc-->d",                   # spans lines: the DOTALL case
+            "a<!-- --><!-- -->b",
+            "a<!--b",                          # opener with no closer: kept
+            "a<!--b-->c<!--d",                 # one closed, one not
+            "a-->b",                           # closer alone: kept
+            "<!---->",
+            "<!--<!--x-->y",                   # no nesting: the first closer wins
+            "plain text with no comment at all",
+        ):
+            assert windocs._strip_comments(text) == stale.sub("", text), text
+
+    def test_an_escaped_bracket_does_not_open_a_link(self):
+        """``\\[`` is how these pages write a literal bracket. It is not markup.
+
+        This is the behaviour the lookbehind adds, and it is the more faithful
+        reading: the whole reason ``_clean_prose`` unescapes last is that an
+        escaped bracket is deliberately not markup. Checked against the cache
+        before it landed — all 5,187 pages render byte-for-byte unchanged.
+        """
+        from training.corpus.sources import windocs
+
+        assert windocs._LINK.search("**newsid /a \\[newname\\]**") is None
+        assert windocs._LINK.sub(r"\1", "see \\[x](y)") == "see \\[x](y)"
+
+    def test_ordinary_links_and_images_still_collapse(self):
+        from training.corpus.sources import windocs
+
+        assert windocs._LINK.sub(r"\1", "see [the docs](/a/b) now") == "see the docs now"
+        assert windocs._IMAGE.sub("", "x ![alt](media/a.png) y") == "x  y"
+        # MSDN conversion escapes the parentheses inside its own targets.
+        assert windocs._LINK.sub(r"\1", "[T](hh832958\\(v=vs.85\\))") == "T"
+        # One level of unescaped nesting, for MSDN-era filenames.
+        assert windocs._IMAGE.sub("", "![a](media/Dn783423(MSDN.10).jpg)") == ""
+
+    def test_a_tag_still_needs_whitespace_before_its_attributes(self):
+        """The rewrite kept the guard that stops e-mail addresses being eaten."""
+        from training.corpus.sources import windocs
+
+        assert windocs._HTML_TAG.sub(" ", "<p.zabel@example.com>") == "<p.zabel@example.com>"
+        assert windocs._HTML_TAG.sub(" ", "<p>x</p>") == " x "
+        assert windocs._HTML_TAG.sub(" ", '<a href="/x">y</a>') == " y "
+        assert windocs._HTML_TAG.sub(" ", "<br/>") == " "
 
 
 class TestEverySourceModuleCompiles:
