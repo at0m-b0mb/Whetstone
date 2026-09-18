@@ -24,6 +24,7 @@ RUN="$D/runs/overnight-$VER"
 MARK="$RUN/markers"
 MODEL=${MODEL:-small}
 MAX_RETRIES=${MAX_RETRIES:-20}
+HOURS=${HOURS:-9}          # wall-clock budget for pretraining
 
 mkdir -p "$RUN" "$MARK"
 cd "$REPO" || exit 1
@@ -62,8 +63,15 @@ stage() {                 # stage <n> <name> <command...>
 
 # ── 1. corpus ────────────────────────────────────────────────────────────────
 build_corpus() {
+    # NOT --balance: its own help records that scaling every register down to
+    # the scarcest cost 78% of the corpus. --max-register-multiple trims only
+    # what is over-represented. And NOT --report in the same call: --report
+    # describes an existing build and returns without fetching anything.
+    # --max-source-share matters more than usual now that rfc fetches properly:
+    # it is 9,825 documents and was 64% of the corpus on its own before the cap.
     python3 -m training.corpus.build --out "$D/corpus/clean-$VER" \
-        --cache "$D/cache" --balance --max-source-share 0.18 --report
+        --cache "$D/cache" --max-register-multiple 1.6 --max-source-share 0.15 \
+        && python3 -m training.corpus.build --out "$D/corpus/clean-$VER" --report
 }
 
 # ── 2. tokenizer ─────────────────────────────────────────────────────────────
@@ -72,9 +80,14 @@ build_corpus() {
 # surface forms it never saw. Training from scratch here is cheap and the model
 # is being trained from scratch anyway, so there is no checkpoint to invalidate.
 build_tokenizer() {
+    # --clean (not --corpus) is the mode that trains on the training side of a
+    # held-out split and then measures per-register compression against gpt2 --
+    # the measurement that settled the domain-tokenizer question at +29%. Do NOT
+    # pass --compare: with a tokenizer already on disk it measures and exits
+    # without training, which would silently leave stage 3 using the old vocab.
     python3 -m training.tokenizer.train_tokenizer \
-        --corpus "$D/corpus/clean-$VER" --out "$D/models/tokenizer-$VER" \
-        --vocab-size 16384 --compare
+        --clean "$D/corpus/clean-$VER" --out "$D/models/tokenizer-$VER" \
+        --vocab-size 16384
 }
 
 # ── 3. shards ────────────────────────────────────────────────────────────────
@@ -95,13 +108,52 @@ PY
 # ── 4. pretrain, with retries ────────────────────────────────────────────────
 # The retry loop is the point. --resume restores weights, optimizer AND the data
 # position, so a restart continues the stream rather than replaying it.
+# How many steps to run is not a constant: it depends on how big the corpus
+# turned out, how fast this machine actually is, and how much night is left.
+# Three ceilings, and the lowest wins:
+#   * the wall-clock budget, so the run finishes before morning;
+#   * Chinchilla (20 tokens per parameter), past which more steps buy little;
+#   * an epoch cap, because repeating a small corpus many times is how `tiny`
+#     ended up with a val curve that turned around and rose.
+plan_steps() {
+    python3 - "$D/corpus/tokenized-$VER" "$MODEL" "$HOURS" <<'PY'
+import json, sys
+from pathlib import Path
+from training.config import STAIRCASE, TrainConfig
+
+data, model, hours = Path(sys.argv[1]), sys.argv[2], float(sys.argv[3])
+cfg, t = STAIRCASE[model], TrainConfig()
+total = json.loads((data / "index.json").read_text())["total_tokens"]
+
+TPS = 9300                      # measured on this machine for `small` at bf16
+budget = int(hours * 3600 * TPS) // t.batch_tokens
+chinchilla = t.total_steps(cfg)
+epoch = max(1, total // t.batch_tokens)
+epoch_cap = epoch * 4
+
+steps = max(1, min(budget, chinchilla, epoch_cap))
+why = min((budget, "wall-clock budget"), (chinchilla, "Chinchilla 20 tok/param"),
+          (epoch_cap, "4-epoch cap"), key=lambda x: x[0])[1]
+print(f"corpus {total:,} tokens = {total/65536:,.0f} steps/epoch", file=sys.stderr)
+print(f"budget {budget:,} | chinchilla {chinchilla:,} | 4 epochs {epoch_cap:,}",
+      file=sys.stderr)
+print(f"-> {steps:,} steps ({steps/epoch:.1f} epochs), bound by {why}",
+      file=sys.stderr)
+print(steps)
+PY
+}
+
 pretrain() {
     local try=1 resume=""
+    local steps; steps=$(plan_steps)
+    [[ -z "$steps" ]] && { log "   could not plan steps"; return 1; }
+    log "   planned $steps steps for a ${HOURS}h budget"
     while (( try <= MAX_RETRIES )); do
         log "   pretrain attempt $try/$MAX_RETRIES $resume"
         if python3 -m training.pretrain --model "$MODEL" \
                 --data "$D/corpus/tokenized-$VER" \
-                --out "$D/models/checkpoints-$VER" $resume; then
+                --out "$D/models/checkpoints-$VER" \
+                --max-steps "$steps" $resume; then
             return 0
         fi
         # Anything after the first attempt resumes; the checkpoint is written

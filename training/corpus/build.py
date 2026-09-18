@@ -60,11 +60,24 @@ def discover_sources() -> list[SourceSpec]:
     """
     from . import sources as sources_pkg
 
+    _IMPORT_FAILURES.clear()
     specs: list[SourceSpec] = []
     for info in pkgutil.iter_modules(sources_pkg.__path__):
         if info.name.startswith("_"):
             continue
-        module = importlib.import_module(f"{sources_pkg.__name__}.{info.name}")
+        try:
+            module = importlib.import_module(f"{sources_pkg.__name__}.{info.name}")
+        except Exception as exc:
+            # A source that will not import is a real bug and says so loudly,
+            # but it must not take the other twenty-three down with it. An
+            # unattended build that dies at 2am because one adapter has a typo
+            # costs a night; one that reports the casualty and carries on costs
+            # that source's share. The failures are re-listed after the build
+            # so they cannot scroll past unnoticed.
+            _IMPORT_FAILURES.append((info.name, f"{type(exc).__name__}: {exc}"))
+            print(f"  ! {info.name} failed to import — skipped: "
+                  f"{type(exc).__name__}: {exc}", file=sys.stderr)
+            continue
         spec = getattr(module, "SPEC", None)
         if spec is None:
             print(f"  ! {info.name} defines no SPEC — skipped", file=sys.stderr)
@@ -73,6 +86,10 @@ def discover_sources() -> list[SourceSpec]:
             raise SourceError(f"{info.name}.SPEC is not a SourceSpec")
         specs.append(spec)
     return sorted(specs, key=lambda s: s.name)
+
+
+#: Sources that could not be imported this run, reported again after the build.
+_IMPORT_FAILURES: list[tuple[str, str]] = []
 
 
 @dataclass
@@ -184,6 +201,14 @@ def build(
 
     _write_provenance(out_dir, specs, stats)
     print("\n" + balance_report(stats))
+    if _IMPORT_FAILURES:
+        # Last thing printed, because it is the thing most worth acting on: a
+        # source missing from the balance report above looks like a source that
+        # contributed nothing, and those two have very different fixes.
+        print(f"\n{len(_IMPORT_FAILURES)} source(s) FAILED TO IMPORT and are "
+              f"absent from the report above:")
+        for name, err in _IMPORT_FAILURES:
+            print(f"  ! {name}: {err}")
     return stats
 
 

@@ -350,18 +350,33 @@ def main(argv: list[str] | None = None) -> int:
     # below is genuinely held out rather than a memorisation check.
     if args.clean:
         tok, trainer = build_tokenizer(args.vocab_size)
-        texts = [t for _reg, t in iter_split(args.clean, holdout=False)]
-        if not texts:
+        # Stream rather than materialise. Collecting the training side into a
+        # list held the whole corpus in memory as Python strings, which was
+        # survivable at 30M tokens and is not at ten times that — and an OOM
+        # here kills a tokenizer that a night of pretraining is waiting on.
+        # `train_from_iterator` consumes an iterator directly; counting as it
+        # passes keeps the document total honest without a second read.
+        seen = 0
+
+        def _training_texts():
+            nonlocal seen
+            for _reg, text in iter_split(args.clean, holdout=False):
+                seen += 1
+                yield text
+
+        print(f"training on the corpus under {args.clean} "
+              f"(every {HOLDOUT_EVERY}th document held out for measurement)")
+        tok.train_from_iterator(_training_texts(), trainer=trainer)
+        if not seen:
             raise SystemExit(f"no documents under {args.clean}")
-        print(f"training on {len(texts):,} documents "
-              f"(every {HOLDOUT_EVERY}th held out for measurement)")
-        tok.train_from_iterator(texts, trainer=trainer)
+        print(f"trained on {seen:,} documents")
+        texts = None  # noqa: F841  — nothing below may rely on the materialised list
         args.out.mkdir(parents=True, exist_ok=True)
         tok.save(str(args.out / "tokenizer.json"))
         (args.out / "meta.json").write_text(json.dumps({
             "vocab_size": tok.get_vocab_size(),
             "special_tokens": list(SPECIAL_TOKENS),
-            "documents": len(texts),
+            "documents": seen,
             "holdout_every": HOLDOUT_EVERY,
         }, indent=2), encoding="utf-8")
         print(f"wrote {args.out/'tokenizer.json'} ({tok.get_vocab_size()} tokens)")
