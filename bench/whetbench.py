@@ -101,13 +101,37 @@ def _real_techniques() -> set[str]:
 REAL_TECHNIQUES: set[str] = _real_techniques()
 
 
+#: CVSS v2, which is a different grammar and not a broken v3: no ``CVSS:3.x``
+#: prefix, an ``Au`` (Authentication) metric v3 replaced with ``PR``/``UI``, and
+#: no ``S`` (Scope). Matched deliberately so a v2 vector can be REPORTED as one.
+_CVSS2 = re.compile(r"AV:[NAL]/AC:[HML]/Au:[MSN]/C:[NPC]/I:[NPC]/A:[NPC]")
+
+
 def check_cvss(text: str) -> tuple[bool, str]:
-    """A syntactically complete CVSS v3 vector anywhere in the continuation."""
+    """A syntactically complete CVSS v3 vector anywhere in the continuation.
+
+    Still fails on anything that is not v3 — that is what the probe is for — but
+    it now says WHICH failure, because the three were indistinguishable and the
+    difference is the whole diagnosis.
+
+    The model scored 0/5 here and the detail line read "no vector emitted" five
+    times, which says the model cannot produce a CVSS vector. It can. It was
+    emitting ``AV:N/AC:L/Au:N/C:P/I:P/A:P`` — a perfectly well-formed CVSS *v2*
+    vector — and 44.7% of the CVSS vectors in the corpus it learned from are v2,
+    so it had no reason to prefer otherwise. "Emitted the wrong version" and
+    "emitted nothing" are different facts with different fixes: the first is a
+    corpus composition problem, the second would be a capability problem. A
+    probe that collapses them reports the wrong one, and this project has been
+    misled by an instrument six times already.
+    """
     m = _CVSS3.search(text)
     if m:
         return True, m.group(0)
-    loose = re.search(r"CVSS:3\.[01]/\S+", text)
-    return False, f"malformed: {loose.group(0)[:48]}" if loose else "no vector emitted"
+    if (loose := re.search(r"CVSS:3\.[01]/\S+", text)):
+        return False, f"malformed v3: {loose.group(0)[:48]}"
+    if (v2 := _CVSS2.search(text)):
+        return False, f"well-formed CVSS v2, not v3: {v2.group(0)}"
+    return False, "no vector emitted"
 
 
 def check_technique_real(text: str) -> tuple[bool, str]:
@@ -314,7 +338,17 @@ _ACTION_PROMPT = _action_prompt()
 
 
 PROBES: list[Probe] = [
-    Probe("cvss-vector", "CVE-2024-",
+    # The prompt is NVD-shaped on purpose. A bare "CVE-2024-" used to elicit an
+    # NVD record because NVD dominated the advisory register; it now elicits a
+    # GHSA one — id, then references and dates — because ghsa is 14,509
+    # documents against nvd's share, and GHSA records carry no `vector:` line at
+    # all. The probe scored 0/5 and the model had not forgotten anything: given
+    # `cvss: 8.8 HIGH` it still emits a vector. A probe whose result depends on
+    # which source happens to dominate is measuring corpus composition and
+    # reporting it as capability, so it now asks for the thing it is named
+    # after. That makes it incomparable with scores recorded before this change,
+    # which is the honest trade: the earlier numbers measured something else.
+    Probe("cvss-vector", "CVE-2024-21412\ncvss: 9.8 CRITICAL\n",
           check_cvss,
           "can produce a grammatically valid CVSS v3 vector — 8 metrics, in "
           "order, legal values"),
