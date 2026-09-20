@@ -12,7 +12,8 @@ to move.
 is a pure function with no override and 175 tests over it; a 13-source corpus
 with every licence checked at source; a tokenizer that beats gpt2 by 29% on
 held-out text with every register winning; a from-scratch model that learned the
-CVE schema in 500 steps.
+CVE schema in 500 steps; an agent loop that finds a detection gap by exploiting
+a real weakness and then **closes it by fixing the host and attacking it again**.
 
 **The honest scoreboard** at 14.6M parameters, after pretraining and SFT:
 
@@ -35,17 +36,24 @@ the second is worth optimising.
 
 ## What is genuinely blocking, in order
 
-### 1. The agent loop does not exist
+### 1. ~~The agent loop does not exist~~ — built, and it now closes
 
-`whetstone/kernel/` is empty. Without it there is no plan-act-observe-critique
-cycle, so trajectories are **scripted verb sequences rather than decisions**. The
-model is trained to imitate a list someone else wrote, which teaches format and
-cannot teach choosing.
+`whetstone/kernel/` runs the plan-act-observe-critique cycle, pairs every red
+action with the detections it declares, and records silence as a
+`detection_gap`. The single most valuable artefact this project claims to
+produce is now produced by something.
 
-It is also what makes the detection pairing operational. `detected_by` is
-declared on every red verb and enforced at import, but nothing yet *runs the
-detection after the exploit and writes the gap*. The single most valuable
-artefact this project claims to produce is not yet produced by anything.
+It also runs the other half. For each gap the agent is offered a hardening
+measure, the kernel applies it, **performs the original attack a second time**
+and asks the same control the same question again — so `closed` means the
+re-attack happened and the silent control spoke, not that a fix exited zero.
+See [PURPLE-LOOP.md](PURPLE-LOOP.md); watch it with `python3 -m lab.run --cycle`.
+
+**What is left of this item:** nothing has taught a *model* to defend. The
+trajectory format carries remediation turns and their outcomes, so the training
+data exists as a format, but no corpus has been rebuilt on it and no checkpoint
+has seen one. Defending today is a deterministic proposer following declared
+`remediates` edges — the number a trained model has to beat.
 
 **Moves:** `verb-choice`, and it creates the loop that feeds everything else.
 
@@ -73,14 +81,21 @@ likely reason. Collection targets, best value first: Elastic detection-rules and
 Wazuh/Suricata/Zeek for DETECTION; `ss64`, busybox and coreutils usage text for
 SHELL; permissively-licensed threat-intel writeups for ADVERSARY.
 
-### 4. No lab
+### 4. ~~No lab~~ — two of them, and the second is a real machine
 
-The SSD has ~900 GB free and there is nothing on it. A Windows VM and a Linux VM
-with Sysmon, auditd and a Sigma pipeline would make three things real at once:
-multi-platform trajectories, red verbs that can actually be exercised end to end,
-and **the detection verifier** — *did rule X fire within N seconds of technique
-Y*. That last one is the mechanically checkable ground truth this whole project
-is built around, and it currently has nowhere to run.
+The self-contained sandbox (`lab/`) builds a real tree with real planted
+weaknesses and a real telemetry switch, so the detection verifier has somewhere
+to run on any laptop with nothing to download. The Lima Ubuntu VM
+(`python3 -m lab.vm.run --arm`) is the honest version: real auditd, real
+`ausearch`, a real root-owned binary really overwritten.
+
+**What is left of this item.** The VM exercises the *attacking* half only —
+`lab/vm/adapter.py` implements no `harden.*` verbs, so remediation against it is
+always `unavailable`, and every closed gap this project can currently show
+happened in a temporary directory. There is still no Windows VM, so Sysmon and
+the Windows adapter's detections have never been exercised end to end. And
+trajectories are still overwhelmingly single-host: `--vm` is the route to real
+Linux data, and the corpus has not been regenerated through it at volume.
 
 ### 5. The corpus caps model size
 
@@ -97,22 +112,24 @@ it is an expensive way to build a lookup table.
 
 ## The plan
 
-### Now — the agent loop
-Build `whetstone/kernel/`: plan → decode (constrained) → gate → adapter →
-observe → critique → retry, bounded. Wire the detection pairing so every red
-action is followed by its `detected_by` checks and silence becomes a
-`report.detection_gap`. Regenerate trajectories from *real loop decisions*
-rather than scripts.
+### Now — teach the model to defend
+The loop closes; nothing has trained on it closing. Rebuild the corpus from
+loop-generated episodes that include the remediation phase, so a checkpoint sees
+a fix proposed, applied, re-attacked and judged — and give `bench` a score for
+the defending half, built on `Turn.phase` and `Finding.remediation`.
 
-**Done when** trajectories contain decisions the loop made and recovered from,
-and `verb-choice` is measured on loop-generated data.
+**Done when** a trained chooser's `remediate` beats the deterministic proposer,
+measured, and the benchmark reports closures it verified against the lab's own
+ground truth rather than against the loop's word for it.
 
-### Next — the lab
-Two VMs on the SSD with real telemetry. Then the verifier works, red verbs can
-be exercised for real, and trajectories stop being single-host.
+### Next — remediation on a machine that is not a temp directory
+`lab/vm/adapter.py` implements no `harden.*` verbs, so every proven closure so
+far is a sandbox closure. Implement the three on the VM adapter and publish the
+remediation hints from the macOS and Windows adapters, which is mechanical.
 
-**Done when** `bench` can report *technique ran, rule fired* as an observed fact
-on a machine that is not this laptop.
+**Done when** `bench` can report *technique ran, nothing logged, fix applied,
+technique ran again, rule fired* as an observed fact on a machine that is not
+this laptop.
 
 ### Then — corpus to ~300M tokens
 Collection focused on SHELL, DETECTION and ADVERSARY. The register report is

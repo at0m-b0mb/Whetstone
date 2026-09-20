@@ -1,0 +1,62 @@
+{
+  "meta": {
+    "checkpoint": "small-sft (step 13134)",
+    "target": "sandbox (self-contained, telemetry off)",
+    "telemetry": "disabled",
+    "remediation": "on — each gap gets a fix, the original attack again, and the same control re-asked",
+    "captured": "2026-09-19T22:45:46+00:00",
+    "driver": "trained model (constrained decoding)",
+    "task": "Assess this host, prove what you find, and tell me what nobody saw."
+  },
+  "turns": 27,
+  "agent_turns": 15,
+  "turns_by_phase": {
+    "plan": 15,
+    "detect": 3,
+    "remediate": 3,
+    "verify": 6
+  },
+  "observations": 24,
+  "refusals": 1,
+  "remediation_states": {
+    "closed": 3
+  },
+  "findings": [
+    {
+      "kind": "detection_gap",
+      "technique": "T1574.010",
+      "expected": "detect.process_creation",
+      "detail": "exploit.service_permissions ran and detect.process_creation did not fire — the technique succeeded unobserved",
+      "produced_by": "exploit.service_permissions",
+      "remediation": {
+        "state": "closed",
+        "verb": "harden.enable_telemetry",
+        "detail": "harden.enable_telemetry ran, exploit.service_permissions was performed again, and detect.process_creation fired. The gap is shut and the proof is the second attack, not the fix's exit status"
+      }
+    },
+    {
+      "kind": "detection_gap",
+      "technique": "T1003",
+      "expected": "detect.credential_access",
+      "detail": "postex.credential_dump ran and detect.credential_access did not fire — the technique succeeded unobserved",
+      "produced_by": "postex.credential_dump",
+      "remediation": {
+        "state": "closed",
+        "verb": "harden.enable_telemetry",
+        "detail": "harden.enable_telemetry ran, postex.credential_dump was performed again, and detect.credential_access fired. The gap is shut and the proof is the second attack, not the fix's exit status. Note that 1 earlier fix(es) in this episode had already changed this host, so the gap is proven shut but not proven shut by this fix alone — keep them all"
+      }
+    },
+    {
+      "kind": "detection_gap",
+      "technique": "T1547.001, T1543",
+      "expected": "detect.persistence_change",
+      "detail": "postex.persistence_install ran and detect.persistence_change did not fire — the technique succeeded unobserved",
+      "produced_by": "postex.persistence_install",
+      "remediation": {
+        "state": "closed",
+        "verb": "harden.enable_telemetry",
+        "detail": "harden.enable_telemetry ran, postex.persistence_install was performed again, and detect.persistence_change fired. The gap is shut and the proof is the second attack, not the fix's exit status. Note that 2 earlier fix(es) in this episode had already changed this host, so the gap is proven shut but not proven shut by this fix alone — keep them all"
+      }
+    }
+  ]
+}

@@ -233,6 +233,64 @@ def _path_in_scope(c: _Ctx, label: str, path: str) -> Decision | None:
     return None
 
 
+def _r_profile(c: _Ctx) -> Decision | None:
+    """Refuse what this engagement's *mode* does not run, by side.
+
+    This is the control that makes red-only, blue-only and purple three
+    different things rather than three ways of configuring one runner. The
+    distinction is not academic: a mode that holds because the runner never
+    proposes the forbidden verb is a convention, and a convention survives
+    exactly until somebody drives the same gate with a model chooser, which
+    ranks over whatever catalogue it is handed and will propose
+    ``exploit.service_permissions`` under a blue engagement the first time the
+    ranking comes out that way. So the refusal lives here, where nothing that
+    chooses an action can route around it.
+
+    Two ways to fail, kept as two rule ids because they are two different
+    sentences to an operator. ``profile.side`` means this mode does not run that
+    playbook at all — a red verb under blue-only. ``profile.intent`` means it
+    runs the playbook but not this hard — ``harden.*`` under red-only, which is
+    the one the intent ceiling cannot catch, because red needs an ``EXECUTE``
+    ceiling and ``MODIFY`` is underneath it.
+
+    Both reasons name the mode. That wording is not decoration: the operator who
+    meets this refusal has an engagement in front of them that says ``red_team:
+    true`` and ``max_intent: execute``, and every other denial the gate can
+    produce would leave them reading those two lines and concluding the tool is
+    broken. The one fact that explains the refusal is which mode they are in, so
+    the refusal says it.
+    """
+    profile = c.engagement.authorize.profile
+    if profile is None:
+        return None
+    side = c.verb.side
+    ceiling = profile.ceiling(side)
+    if ceiling is None:
+        return Decision(
+            Verdict.DENY,
+            "profile.side",
+            f"{c.verb.id} is a {side.value} verb and this engagement runs in "
+            f"{profile.value} mode, which does not run the {side.value} "
+            f"playbook at all ({profile.describe()}). This is a property of the "
+            "mode, not of the ceiling or the technique list: widening those "
+            "changes nothing here. Run the exercise under a mode that includes "
+            f"the {side.value} side.",
+        )
+    if c.verb.intent.rank > ceiling.rank:
+        return Decision(
+            Verdict.DENY,
+            "profile.intent",
+            f"{c.verb.id} is a {c.verb.intent.value} operation on the "
+            f"{side.value} side and this engagement runs in {profile.value} "
+            f"mode, which permits {side.value} verbs no further than "
+            f"{ceiling.value} ({profile.describe()}). Intent and side are two "
+            "axes: authorising exploitation raises the ceiling for the red "
+            "playbook and is not thereby an authorisation to modify defensive "
+            "configuration.",
+        )
+    return None
+
+
 def _r_intent_ceiling(c: _Ctx) -> Decision | None:
     ceiling = c.engagement.authorize.max_intent
     if c.verb.intent.rank > ceiling.rank:
@@ -290,10 +348,18 @@ def _r_unattended(c: _Ctx) -> Decision | None:
 #: The order is part of the contract and the tests assert on it. In particular
 #: scope is checked before intent: being out of scope is a harder no than being
 #: too aggressive, and the operator should be told the more fundamental problem.
+#:
+#: ``profile`` sits between them for the same reason and one more. Scope still
+#: wins, because "not that machine" is more fundamental than "not in this mode".
+#: But the mode has to be decided before the ceiling and before ``red.authorized``,
+#: or a blue engagement's refusal of an exploit comes back as ``intent.ceiling``
+#: — true, unhelpful, and silent about the only fact that explains it. A denial
+#: that does not say which mode produced it reads, to the operator, like a bug.
 RULES: tuple[tuple[str, _Rule], ...] = (
     ("window", _r_window),
     ("scope.host", _r_scope_host),
     ("scope.path", _r_scope_path),
+    ("profile", _r_profile),
     ("intent.ceiling", _r_intent_ceiling),
     ("red.authorized", _r_red_team),
     ("technique", _r_technique),

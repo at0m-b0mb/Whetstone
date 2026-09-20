@@ -466,6 +466,20 @@ _v(
 
 # ---------------------------------------------------------------------------
 # harden — fix what the exercise proved was broken
+#
+# The only MODIFY verbs in the catalogue, and the only ones the defending half
+# owns. Each declares ``remediates``: the red verbs it closes. That field is how
+# the kernel's remediation phase decides which fix belongs to which detection
+# gap, so an omission here does not misfire — it makes the fix unreachable.
+#
+# Note what ``harden.enable_telemetry`` does *not* claim. It remediates every
+# red verb whose detection depends on a log being written, and nothing else.
+# ``postex.exfil_probe`` declares ``detect.nothing``: no control in this
+# catalogue watches egress volume, so switching on a source cannot make one
+# fire. Listing it would turn a genuine hole in the blue catalogue into a fix
+# that "ran successfully" and changed nothing — the claimed-fixed failure the
+# re-attack exists to catch, written into the schema where the re-attack cannot
+# reach it.
 # ---------------------------------------------------------------------------
 
 _v(
@@ -478,6 +492,10 @@ _v(
         Param("source", "string", "Telemetry source to enable."),
     ),
     caution="Changes audit policy. Increases log volume, sometimes considerably.",
+    remediates=("exploit.service_permissions", "exploit.unquoted_path",
+                "exploit.scheduled_task", "postex.credential_dump",
+                "postex.persistence_install", "postex.privilege_escalate",
+                "postex.lateral_move"),
 )
 
 _v(
@@ -493,6 +511,12 @@ _v(
         "Changes access control on a file or directory. The previous ACL is "
         "recorded in the audit log so it can be restored."
     ),
+    # Both of these turn on a caller being able to write something it should
+    # not: the service binary itself, or a directory earlier on an unquoted
+    # search path. Removing the write removes the technique — which is a
+    # different outcome from making it visible, and the remediation phase keeps
+    # the two apart rather than calling either one "closed".
+    remediates=("exploit.service_permissions", "exploit.unquoted_path"),
 )
 
 _v(
@@ -508,6 +532,7 @@ _v(
         "Deletes an autostart entry. Run enum.persistence first and confirm the "
         "entry is the one you mean — removing a legitimate one breaks software."
     ),
+    remediates=("exploit.scheduled_task", "postex.persistence_install"),
 )
 
 

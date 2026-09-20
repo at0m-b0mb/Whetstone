@@ -268,6 +268,18 @@ class Verb:
     #: directions: which attacks have no detection, and which detections guard
     #: nothing.
     detects: tuple[str, ...] = ()
+    #: The red verbs this blue verb *fixes*. ``detects`` says "I would notice
+    #: that"; this says "after me, that stops working or stops being invisible".
+    #:
+    #: It is the field the remediation phase associates a fix with a gap
+    #: through, and through nothing else. A detection gap names the red verb
+    #: that produced it; a harden verb names the red verbs it remediates; the
+    #: two meet on a declared id. Nothing is inferred from a verb's group, its
+    #: parameter names or its position in a list — pairing by adjacency is
+    #: exactly the correlation bug the detection side had to be fixed for, and
+    #: a fix credited to the wrong gap would let the loop report a hole closed
+    #: that is still open.
+    remediates: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not _VERB_ID_RE.match(self.id):
@@ -313,6 +325,28 @@ class Verb:
         if self.detects and self.side is not Side.BLUE:
             raise SchemaError(
                 f"verb {self.id!r} declares 'detects' but is not a blue verb"
+            )
+        # The blue mirror of the discipline above. A blue verb that changes
+        # state is a remediation by construction — there is no other reason for
+        # the defending half of the catalogue to modify a host — so it has to
+        # say what it fixes, for the same reason a red verb has to say what
+        # ought to catch it. Silence here does not produce a wrong answer; it
+        # produces a fix the remediation phase can never propose, which is how
+        # three harden verbs sat in this file implemented on three platforms
+        # and were never once called.
+        if self.side is Side.BLUE and self.intent is not Intent.OBSERVE:
+            if not self.remediates:
+                raise SchemaError(
+                    f"blue verb {self.id!r} is {self.intent.value} and declares "
+                    "no remediates. Name the red verb(s) it closes — a fix that "
+                    "names nothing can never be matched to a finding, so it is "
+                    "a fix nothing will ever run."
+                )
+        elif self.remediates:
+            raise SchemaError(
+                f"verb {self.id!r} declares 'remediates' but is not a "
+                "state-changing blue verb; only a hardening measure fixes "
+                "something."
             )
 
     @property
@@ -496,6 +530,18 @@ class VerbRegistry:
                         f"red verb {verb.id!r} names {ref!r} as its detection, "
                         f"but {ref!r} is a {self._verbs[ref].side.value} verb"
                     )
+            for ref in verb.remediates:
+                if ref not in self._verbs:
+                    raise SchemaError(
+                        f"blue verb {verb.id!r} claims to remediate {ref!r}, "
+                        "which is not a registered verb"
+                    )
+                if self._verbs[ref].side is not Side.RED:
+                    raise SchemaError(
+                        f"blue verb {verb.id!r} claims to remediate {ref!r}, "
+                        "which is not a red verb. A hardening measure closes an "
+                        "attack, not a detection."
+                    )
             for ref in verb.detects:
                 if ref not in self._verbs:
                     raise SchemaError(
@@ -527,6 +573,25 @@ class VerbRegistry:
             ]
             declared = [d for d in verb.detected_by if d != NO_DETECTION]
             out[verb.id] = tuple(sorted(set(claimed) | set(declared)))
+        return out
+
+    def remediation(self) -> dict[str, tuple[str, ...]]:
+        """Red verbs mapped to the hardening measures that claim to close them.
+
+        The sibling of :meth:`coverage`, and read the same way: a red verb whose
+        value is empty is one this tool can perform, may be able to prove went
+        unnoticed, and has nothing in the catalogue to offer as a fix. That is a
+        finding about *Whetstone* rather than about the target, and the point of
+        computing it is that the remediation phase silently does nothing for
+        exactly those verbs — a silence worth being able to see before an
+        exercise rather than inferring from an empty report after one.
+        """
+        out: dict[str, tuple[str, ...]] = {}
+        for verb in self:
+            if verb.side is not Side.RED:
+                continue
+            out[verb.id] = tuple(sorted(
+                blue.id for blue in self if verb.id in blue.remediates))
         return out
 
     @property

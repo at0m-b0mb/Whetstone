@@ -37,6 +37,7 @@ from .engagement import (
     Authorization,
     Engagement,
     EngagementError,
+    Profile,
     Scope,
     load_engagement,
     null_engagement,
@@ -55,6 +56,7 @@ __all__ = [
     "EngagementError",
     "Scope",
     "Authorization",
+    "Profile",
     "null_engagement",
     "load_engagement",
     "parse_engagement",
@@ -243,9 +245,28 @@ class Gate:
         Used to build the prompt handed to the model. Filtering here rather than
         relying on the model to avoid the red half is intentional: a temptation
         removed is cheaper than a refusal trained.
+
+        This is the convenience, never the control. Everything hidden here is
+        also refused by :func:`~.policy.decide`, which is where the separation
+        actually lives — a chooser that reaches past the catalogue, or a caller
+        that builds its own action list, still meets the same denial. Keep it
+        that way round: the day this filter and the policy rules disagree, the
+        policy rules are the ones that are right.
         """
         auth = self.engagement.authorize
         verbs = self.registry.select(max_intent=auth.max_intent)
+        if auth.profile is not None:
+            # The mode's per-side ceiling, applied to the same list the model is
+            # shown. Without this, a red-only run would be offered `harden.*` —
+            # every turn spent on one is a guaranteed refusal, and a model that
+            # keeps being offered a fix it may not apply is being taught that
+            # refusals are weather rather than rules.
+            profile = auth.profile
+            verbs = tuple(
+                v for v in verbs
+                if (limit := profile.ceiling(v.side)) is not None
+                and v.intent.rank <= limit.rank
+            )
         if not auth.red_team:
             return tuple(v for v in verbs if v.side is not Side.RED)
         return tuple(

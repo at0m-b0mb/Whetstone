@@ -227,6 +227,13 @@ def main(argv: list[str] | None = None) -> int:
                    help="drive with the fixed sweep instead of a model")
     p.add_argument("--telemetry", action="store_true",
                    help="the sandbox logs events, so the detections fire")
+    p.add_argument("--vm", action="store_true",
+                   help="drive the REAL Lima Ubuntu VM instead of the sandbox — "
+                        "the exploit really overwrites a root-owned binary and "
+                        "auditd is really asked whether it saw")
+    p.add_argument("--arm", action="store_true",
+                   help="with --vm: load the auditd watch first, so the blue "
+                        "side is actually watching")
     p.add_argument("--max-turns", type=int, default=20)
     p.add_argument("--prompt-chars", type=int, default=900)
     args = p.parse_args(argv)
@@ -242,6 +249,48 @@ def main(argv: list[str] | None = None) -> int:
     print()
     rule("WHETSTONE — the loop, traced", "c")
     print(f"   driver     {C['b']}{driver}{C['x']}")
+
+    if args.vm:
+        # The real thing: an Ubuntu guest over SSH, where the exploit overwrites
+        # a genuinely root-owned binary and the detection genuinely reads
+        # auditd. Nothing here is the sandbox's in-process imitation.
+        from lab.vm.adapter import VMAdapter
+        from lab.vm.run import _engagement as _vm_engagement
+        from lab.vm.run import arm_auditd, disarm_auditd, _vm as _vm_shell
+
+        print(f"   target     {C['b']}real Lima Ubuntu VM (whetstone-lab){C['x']}")
+        print(f"   auditd     {C['b']}"
+              f"{'ARMED — a file watch is loaded' if args.arm else 'no rules loaded — the common real-world state'}{C['x']}")
+        adapter = VMAdapter()
+        disarm_auditd()
+        # The audit log persists across runs, so a stale record from an earlier
+        # exercise would be counted as this run's exploit being seen — a false
+        # negative on the gap, which is the one error this must not make.
+        _vm_shell(["sudo", "truncate", "-s", "0", "/var/log/audit/audit.log"])
+        if args.arm:
+            arm_auditd()
+
+        gate = TracingGate(_vm_engagement(), registry=REGISTRY,
+                           confirmer=always_confirm)
+        chooser = TracingChooser(inner, prompt_chars=args.prompt_chars)
+        episode = Kernel(gate, adapter, chooser, max_turns=args.max_turns).run(
+            "Assess this Ubuntu host, prove the writable-service finding, and "
+            "tell me whether auditd saw it.", target="127.0.0.1")
+        disarm_auditd()
+
+        print()
+        rule("EPISODE", "c")
+        print()
+        block(episode.summary(), "dim", indent="   ")
+        for f in episode.findings:
+            head = {"detection_gap": f"{C['r']}DETECTION GAP{C['x']}",
+                    "no_coverage": f"{C['y']}NO COVERAGE{C['x']}",
+                    "observation": f"{C['y']}INCONCLUSIVE{C['x']}"}.get(f.kind, f.kind)
+            print(f"\n   {head}  {C['b']}{f.technique}{C['x']}")
+            print(f"      {C['dim']}{f.detail}{C['x']}")
+        print()
+        return 0
+
     print(f"   telemetry  {C['b']}{'ON — blue is watching' if args.telemetry else 'OFF — nothing is logging'}{C['x']}")
 
     with SandboxTarget(telemetry=args.telemetry) as target:

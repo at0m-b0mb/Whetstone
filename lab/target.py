@@ -73,11 +73,22 @@ class SandboxTarget:
     def __init__(self, *, telemetry: bool = False,
                  root: Path | None = None) -> None:
         self.telemetry = telemetry
+        #: What the switch was set to when the sandbox was built. A hardening
+        #: verb really flips :attr:`telemetry`, and a target whose posture
+        #: silently survived a revert would change the ground truth for whoever
+        #: reused it — "telemetry off produces three gaps" is an assertion about
+        #: a freshly reverted sandbox, and it has to stay one.
+        self._telemetry_at_build = telemetry
         self._owns_root = root is None
         self.root = (root or Path(tempfile.mkdtemp(prefix="whetstone-lab-"))).resolve()
         self.log_path = self.root / "var" / "telemetry.log"
         self.weaknesses: list[Weakness] = []
-        self._original: dict[str, bytes] = {}
+        #: path -> (contents, permission bits). The mode is snapshotted beside
+        #: the bytes because ``harden.fix_permissions`` changes the mode and
+        #: nothing else: a revert that put the contents back and left the file
+        #: at 0o755 would hand the next episode a sandbox with one of its four
+        #: planted weaknesses quietly missing.
+        self._original: dict[str, tuple[bytes, int]] = {}
         self._build()
 
     # ------------------------------------------------------------------ setup
@@ -129,8 +140,9 @@ class SandboxTarget:
         self.event("baseline", "lab", "sandbox built")
 
     def _remember(self, path: Path) -> None:
-        """Snapshot a file so an exploit that mutates it can be reverted."""
-        self._original[str(path)] = path.read_bytes()
+        """Snapshot a file so an exploit — or a fix — that mutates it can be reverted."""
+        self._original[str(path)] = (path.read_bytes(),
+                                     path.stat().st_mode & 0o777)
 
     # --------------------------------------------------------------- confinement
 
@@ -149,26 +161,60 @@ class SandboxTarget:
 
     # ------------------------------------------------------------------ telemetry
 
-    def event(self, kind: str, technique: str, detail: str) -> bool:
+    def set_telemetry(self, on: bool) -> bool:
+        """Flip the logging switch. Returns whether this call changed it.
+
+        The one thing ``harden.enable_telemetry`` does in this sandbox, and it
+        is a genuine change rather than a recorded intention: after it,
+        :meth:`event` really writes and the detection verbs really find what
+        they write. That is what makes the re-attack meaningful — the second
+        run of the same exploit is logged because the posture is different, not
+        because anything was told to report success.
+        """
+        changed = self.telemetry != on
+        self.telemetry = on
+        return changed
+
+    def event(self, kind: str, technique: str, detail: str,
+              *, image: str | None = None) -> bool:
         """Record a telemetry event — but only if telemetry is enabled.
 
         Returns whether it was actually written. This is the single switch the
         lab turns on: an exploit calls it after acting, and whether the paired
-        detection later finds anything depends entirely on the boolean set at
-        construction. Nothing else differs between the seen and unseen cases.
+        detection later finds anything depends entirely on the boolean the
+        target currently holds. Nothing else differs between the seen and
+        unseen cases.
+
+        ``image`` is the process a real process-creation record would name, and
+        it exists so the paired probe can be *aimed*. Without it
+        ``detect.process_creation`` runs with no ``image`` to match on, which
+        asks "was anything logged in the window" rather than "was this logged",
+        and the kernel — correctly — refuses to read the answer as a verdict.
+        A log with no discriminator in it cannot prove a control fired, so a
+        lab built that way can demonstrate a gap opening and never one closing.
         """
         if not self.telemetry:
             return False
-        line = json.dumps({
+        row: dict[str, Any] = {
             "ts": round(time.time(), 3), "kind": kind,
             "technique": technique, "detail": detail,
-        })
+        }
+        if image:
+            row["image"] = image
+        line = json.dumps(row)
         with self.log_path.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
         return True
 
-    def events(self, *, kind: str | None = None, since: float | None = None) -> list[dict[str, Any]]:
-        """Read telemetry back, the way a detection verb does."""
+    def events(self, *, kind: str | None = None, since: float | None = None,
+               image: str | None = None) -> list[dict[str, Any]]:
+        """Read telemetry back, the way a detection verb does.
+
+        ``image`` filters exactly, and a row with no ``image`` never matches a
+        request for one. A substring or a tolerant match would let an unrelated
+        record answer for the technique, which is the whole failure the aim is
+        there to prevent.
+        """
         out: list[dict[str, Any]] = []
         if not self.log_path.exists():
             return out
@@ -183,18 +229,29 @@ class SandboxTarget:
                 continue
             if since and row.get("ts", 0) < since:
                 continue
+            if image is not None and row.get("image") != image:
+                continue
             out.append(row)
         return out
 
     # ------------------------------------------------------------------ teardown
 
     def revert(self) -> None:
-        """Restore every file an exploit changed. Proves cleanup really works."""
-        for path_str, content in self._original.items():
+        """Restore every file an exploit or a fix changed, and the posture too.
+
+        Proves cleanup really works. Contents, permission bits and the telemetry
+        switch, because all three are now things a verb in this lab genuinely
+        changes, and a revert that restores two of them leaves a sandbox that
+        looks reverted and is not.
+        """
+        for path_str, (content, mode) in self._original.items():
+            path = Path(path_str)
             try:
-                Path(path_str).write_bytes(content)
+                path.write_bytes(content)
+                path.chmod(mode)
             except OSError:
                 pass
+        self.telemetry = self._telemetry_at_build
 
     def close(self) -> None:
         if self._owns_root and self.root.exists():

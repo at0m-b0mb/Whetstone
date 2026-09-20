@@ -19,9 +19,13 @@ maintainer's local account name is proof of something else as well.
 The substitution is `redact_identity()` in
 [`training/trajectories.py`](../../training/trajectories.py) — the same function
 that strips identity out of the training corpus, so there is one definition of
-what counts as identity rather than one per artifact. A re-capture has to run
-its three files through it before they are committed, and `identity_leaks()` in
-the same module is the check that says whether it did. The uid is left alone on
+what counts as identity rather than one per artifact. **It is no longer a step a
+re-capture has to remember.** `lab/capture.py` runs every byte of all three
+files through it on the way to disk and asks `identity_leaks()` afterwards
+whether the substitution took; a survivor raises and nothing is written. A step
+somebody has to remember between capturing and committing is a step that gets
+skipped on the day the run finally works, and the cost of skipping it here is
+public and permanent. The uid is left alone on
 purpose: `501` on a Linux VM says the VM is Lima on a Mac, which the target line
 at the top of the transcript already says in words, and it names nobody.
 
@@ -30,7 +34,7 @@ Each run produces three files:
 | file | what it is |
 |---|---|
 | `*.transcript.md` | the run for a human — every action, the real observation it returned, and the findings, with the verbs the model ranked *below* the one it chose |
-| `*.findings.json` | the machine-readable result — the detection gaps and what produced them |
+| `*.findings.json` | the machine-readable result — the detection gaps, what produced them, and (when the remediation phase ran) what was done about each one and whether it was proven closed |
 | `*.trajectory.txt` | the wire protocol, byte for byte — the exact format the model trains on, so this doubles as a worked training example |
 
 ---
@@ -44,6 +48,47 @@ disposable sandbox with planted weaknesses: it enumerates, assesses, exploits
 all three, and the kernel pairs each exploit with the detection that should have
 caught it. With the sandbox's telemetry switch **off**, the result is **three
 detection gaps** — the attacks succeeded and nothing logged them.
+
+### `sandbox-small-v5.*` — the trained model, attacking *and* defending
+
+Written by stage 6 of the overnight v5 pipeline, immediately after the `small`
+SFT run finished: the checkpoint drives the loop under constrained decoding,
+opens three detection gaps, and all three come back `closed` — fix applied,
+original attack repeated, silent control fired.
+
+One thing this does **not** show, and it is the thing you would want it to. The
+model chose the attacking; it did not choose the defending. There is no trained
+remediation yet, so the fix for each gap came from the kernel's deterministic
+proposer following declared `remediates` edges. The `plan` turns are the
+model's; the `remediate` and `verify` turns are not.
+
+### `sandbox-purple-cycle.*` — the full loop, attacking *and* defending
+
+The only capture here that runs past the finding. The agent enumerates,
+exploits all three planted weaknesses, and the kernel pairs each exploit with
+the control that should have caught it — **three detection gaps**, same as
+above. Then it does the other half: for each gap it applies a hardening
+measure, **runs the original attack again with the same parameters**, and asks
+the same control the same question a second time. All three gaps come back
+`closed`, and `closed` here means the re-attack happened and the control that
+had been silent answered — not that a fix returned success.
+
+The transcript's remediation section shows each fix, its re-attack and the
+control's second answer as three numbered steps, so the evidence can be read
+rather than taken on trust. Two of the three closures carry a note saying that
+earlier fixes had already changed the host, so the gap is proven shut but not
+proven shut by *that* fix alone. Read the note; it is the honest part.
+
+Driven by the **scripted sweep**, not a model — the header says so. The
+remediation phase's proposer is deterministic too, so this whole cycle
+reproduces on any laptop with no weights, no MLX and no download:
+
+```bash
+python3 -m lab.record_run --scripted --out examples/runs --name sandbox-purple-cycle
+```
+
+What it is *not* is evidence about the model's judgement. The plan is a list a
+human wrote. For that, read the two model-driven runs on either side of it.
 
 ### `vm-ubuntu-tiny-sft2.*` — the trained model vs a real Ubuntu VM
 
@@ -76,6 +121,24 @@ The findings distinguish three states, and the distinction matters:
 - 🔴 **detection gap** — the technique ran and the control saw nothing. Actionable.
 - ⚪ **no coverage** — the technique ran and nothing in the catalogue covers it. A disclosure, not a gap.
 - 🟡 **inconclusive** — the detection query itself failed, so nothing can be said about the control. Never counted as a gap.
+
+In a capture with remediation on, not every turn is the agent's. A turn marked
+`· _kernel probe_` is the detection the kernel paired with the attack above it;
+`· _kernel fix_` and `· _kernel evidence_` are the hardening measure and the
+re-attack that verifies it. Unmarked turns are the agent's own choices, and the
+`**Result**` line counts the two separately — a run of 24 turns can be 12
+decisions. Anything measuring the agent has to exclude the rest, or it is
+measuring the kernel replaying the agent's exploit and calling it initiative.
+
+The remediation outcome has six states and they do not collapse into two.
+`closed` is the only one that means the gap is shut, and it is earned: the fix
+ran, the original attack was performed again, and the control that had been
+silent fired. `ineffective` means the fix ran and the control was still silent.
+`undetermined` means closure could not be established — including the case where
+the technique no longer works at all, which is a good outcome and is *not*
+evidence about the control. `failed`, `refused` and `unavailable` mean no fix
+was applied, for three different reasons. Read the `detail`; the state is coarse
+on purpose.
 
 ---
 

@@ -27,11 +27,26 @@ import json
 from typing import Any
 
 from whetstone.actions import Action, Observation, Verb
-from whetstone.adapters.base import Adapter
+from whetstone.adapters.base import Adapter, AdapterError
 
 from .target import SandboxTarget
 
 __all__ = ["SandboxAdapter"]
+
+#: The sandbox's one telemetry source. Named in three places that have to agree
+#: — what ``detect.telemetry`` reports, what a silent probe suggests enabling,
+#: and what ``harden.enable_telemetry`` accepts — so it is a constant rather
+#: than a string typed out three times. A fix aimed at a source name that does
+#: not exist would be refused by the adapter, which is the right answer to the
+#: wrong question: the interesting failure is the one where the names drift and
+#: the fix quietly stops being proposable.
+_SOURCE = "sandbox-eventlog"
+
+#: The service binary, relative to the sandbox root. The planted weakness, the
+#: exploit, the permission fix and the process image in the telemetry record all
+#: refer to this one file.
+_SERVICE = "opt/acme/acme-agent"
+_SERVICE_IMAGE = "acme-agent"
 
 #: Versions below these are treated as vulnerable by the patch-gap check. Kept
 #: tiny and explicit rather than pulling a CVE feed: the lab's job is to exercise
@@ -149,15 +164,44 @@ def _vuln_patch(self: SandboxAdapter, verb: Verb, action: Action) -> Any:
 
 @T.implements("exploit.service_permissions")
 def _exploit_service(self: SandboxAdapter, verb: Verb, action: Action) -> Any:
-    """Really overwrite the writable service binary, then log (or not)."""
-    svc = self.target.resolve("opt/acme/acme-agent")
+    """Really overwrite the writable service binary, then log (or not).
+
+    The permission check at the top is what makes ``harden.fix_permissions``
+    mean something, and it is a *model* rather than a real ``EACCES`` — worth
+    being explicit about, because a model that pretends to be an enforcement
+    boundary is how a lab starts lying.
+
+    The weakness planted here is "a non-root user can write a binary a root
+    service executes". ``enum.privileges`` says so: uid 1000, not admin. But the
+    process running this adapter *owns* the file, so ``chmod go-w`` cannot stop
+    it from writing — the operating system would deny the foothold user and
+    cannot deny the owner. Asking the filesystem would therefore report the
+    exploit still working after a fix that genuinely worked, which is the
+    opposite of the error this project usually worries about and just as bad.
+
+    So the foothold's identity is modelled and the file's permissions are not:
+    the mode is read from the real file, which a real ``chmod`` really changed,
+    and the only invented part is "uid 1000 is not the owner". Everything a
+    verdict rests on — the mode, the write, the log — is genuine.
+    """
+    svc = self.target.resolve(_SERVICE)
+    mode = svc.stat().st_mode & 0o777
+    if not mode & 0o022:
+        raise AdapterError(
+            f"cannot write {svc}: mode is {oct(mode)}, and the foothold this "
+            "lab models is uid 1000, which neither owns the file nor is in its "
+            "group. The technique depended on the group/other write bit and "
+            "that bit is gone.")
+
     restore = bool(action.params.get("restore", True))
     original = svc.read_bytes()
 
     payload = b"#!/bin/sh\n# whetstone marker: execution as service account\n"
     svc.write_bytes(payload)
-    logged = self.target.event("process_creation", "T1574.010",
-                               "acme-agent binary replaced and would run as root")
+    logged = self.target.event(
+        "process_creation", "T1574.010",
+        "acme-agent binary replaced and would run as root",
+        image=_SERVICE_IMAGE)
 
     cleaned = None
     if restore:
@@ -167,7 +211,18 @@ def _exploit_service(self: SandboxAdapter, verb: Verb, action: Action) -> Any:
     return {"changed": str(svc), "bytes_written": len(payload),
             "ran_as": "root", "cleanup": "succeeded" if cleaned else
             ("failed" if restore else "not requested"),
-            "telemetry_written": logged}
+            "telemetry_written": logged,
+            # Named `image` because that is what `detect.process_creation`
+            # calls its own parameter, which is the exact-match convention the
+            # kernel aims a probe by. Without it the probe asks "was anything
+            # logged in the window" and the kernel — correctly — refuses to read
+            # the answer as a verdict on this technique, so a gap here could
+            # never be proven closed however good the fix was.
+            "image": _SERVICE_IMAGE,
+            # What would fix this, named under the key the kernel reads and
+            # under the harden verb's own parameter name. The red handler is the
+            # only thing that knows which file it just overwrote.
+            "remediation": {"harden.fix_permissions": {"path": str(svc)}}}
 
 
 @T.implements("postex.credential_dump")
@@ -200,10 +255,18 @@ def _postex_persist(self: SandboxAdapter, verb: Verb, action: Action) -> Any:
     if cleanup:
         cron.write_text(original, encoding="utf-8")
         removed = marker not in cron.read_text()
-    return {"installed_in": str(cron), "entry": marker,
-            "cleanup": "succeeded" if removed else
-            ("failed" if cleanup else "not requested"),
-            "telemetry_written": logged}
+    payload = {"installed_in": str(cron), "entry": marker,
+               "cleanup": "succeeded" if removed else
+               ("failed" if cleanup else "not requested"),
+               "telemetry_written": logged}
+    # Only offer the removal when the entry is actually still on disk. Cleanup
+    # usually took it away already, and a hint pointing at a line that is gone
+    # would send a MODIFY at nothing and come back "failed" — a true statement
+    # about a fix nobody should have attempted. A hint is a claim about the
+    # current state, so it is made only when the state supports it.
+    if not removed:
+        payload["remediation"] = {"harden.remove_persistence": {"entry": marker}}
+    return payload
 
 
 # ------------------------------------------------------------------- detect
@@ -213,10 +276,37 @@ def _window(action: Action) -> float:
     return time.time() - float(action.params.get("since_seconds", 300))
 
 
+def _silent(events: list[Any]) -> dict[str, Any]:
+    """The remediation hint a control publishes when it saw nothing.
+
+    Only when it saw nothing: a control that fired has nothing to remediate, and
+    a hint attached to a hit would be a fix offered for a gap that does not
+    exist.
+
+    This is the *control* naming its own remedy, which is why the kernel prefers
+    it over a hint from the red side. A detection gap is a statement about the
+    control: the fix that makes it see the next instance of the technique
+    answers the finding, and the fix that removes this one instance of the
+    weakness answers a different and narrower question. Both are offered; the
+    ordering says which one the finding asked for.
+
+    Note what this payload deliberately does **not** carry. Adding
+    ``enabled: false`` would be read by ``detection_fired`` as provenance —
+    "the source could not be queried" — and the honest reading here is the
+    opposite. The log is present, readable and really was read; it is empty
+    because nothing wrote to it while the technique ran. That is a queryable
+    control that saw nothing, which is a genuine gap, and dressing it up as
+    unknowable would suppress the one finding this lab exists to produce.
+    """
+    if events:
+        return {}
+    return {"remediation": {"harden.enable_telemetry": {"source": _SOURCE}}}
+
+
 @T.implements("detect.telemetry")
 def _detect_telemetry(self: SandboxAdapter, verb: Verb, action: Action) -> Any:
     on = self.target.telemetry
-    return {"sources": [{"source": "sandbox-eventlog", "enabled": on,
+    return {"sources": [{"source": _SOURCE, "enabled": on,
                          "records_process_creation": on}],
             "process_creation_auditing": on,
             "summary": ("telemetry is enabled; actions are being logged" if on
@@ -226,20 +316,126 @@ def _detect_telemetry(self: SandboxAdapter, verb: Verb, action: Action) -> Any:
 
 @T.implements("detect.process_creation")
 def _detect_proc(self: SandboxAdapter, verb: Verb, action: Action) -> Any:
-    events = self.target.events(kind="process_creation", since=_window(action))
+    # `image` is honoured rather than accepted and ignored. A probe whose
+    # discriminator the adapter throws away answers "was anything logged"
+    # while claiming to answer "was this logged", and the kernel has no way to
+    # tell the difference — it would read an unrelated record as proof that the
+    # control caught the technique.
+    image = action.params.get("image")
+    events = self.target.events(kind="process_creation", since=_window(action),
+                                image=image if isinstance(image, str) else None)
     return {"logged": bool(events), "count": len(events),
-            "events": [e["detail"] for e in events[:4]]}
+            "matched_image": image or "",
+            "events": [e["detail"] for e in events[:4]],
+            **_silent(events)}
 
 
 @T.implements("detect.persistence_change")
 def _detect_persist(self: SandboxAdapter, verb: Verb, action: Action) -> Any:
     events = self.target.events(kind="persistence_change", since=_window(action))
     return {"logged": bool(events), "count": len(events),
-            "events": [e["detail"] for e in events[:4]]}
+            "events": [e["detail"] for e in events[:4]],
+            **_silent(events)}
 
 
 @T.implements("detect.credential_access")
 def _detect_cred(self: SandboxAdapter, verb: Verb, action: Action) -> Any:
     events = self.target.events(kind="credential_access", since=_window(action))
     return {"logged": bool(events), "count": len(events),
-            "events": [e["detail"] for e in events[:4]]}
+            "events": [e["detail"] for e in events[:4]],
+            **_silent(events)}
+
+
+# -------------------------------------------------------------------- harden
+#
+# The half of the catalogue that had never run. Three verbs, implemented for
+# real against the sandbox: the switch really flips, the mode bits really
+# change, the crontab line really goes. Each is faithful to what the Linux
+# adapter does on a machine — strip group/other write and leave read/execute
+# alone; act only on an entry named exactly, never on a pattern — so that the
+# thing demonstrated here is the thing that would happen on a host.
+#
+# None of them writes a telemetry record under the kind of the technique it
+# remediates. A removal is not an installation, and a `persistence_change`
+# event emitted by the fix would sit in the same window as the re-attack and
+# could be counted as the control noticing the attack. The fix must not be able
+# to manufacture its own proof; that is the entire failure mode the re-attack
+# exists to catch, and it would be embarrassing to reintroduce it here. They
+# log under `harden`, which no detection verb reads.
+
+
+@T.implements("harden.enable_telemetry")
+def _harden_telemetry(self: SandboxAdapter, verb: Verb, action: Action) -> Any:
+    """Really switch the sandbox's logging on."""
+    source = action.params["source"]
+    if source != _SOURCE:
+        return Observation(
+            action=action, ok=False, unsupported=True, platform="sandbox",
+            error=(f"this sandbox has one telemetry source, {_SOURCE!r}; "
+                   f"{source!r} is not something it can turn on. Enabling a "
+                   "source that does not exist would report success and change "
+                   "nothing."))
+    changed = self.target.set_telemetry(True)
+    self.target.event("harden", "lab", f"telemetry source {source} enabled")
+    return {"source": source, "enabled": True, "changed": changed,
+            "was_already_on": not changed,
+            "restore_hint": "SandboxTarget.set_telemetry(False), or revert()"}
+
+
+@T.implements("harden.fix_permissions")
+def _harden_permissions(self: SandboxAdapter, verb: Verb, action: Action) -> Any:
+    """Really tighten the mode bits, confined to the sandbox like everything else.
+
+    Strips group and other write and touches nothing else, which is what the
+    Linux adapter does and for the reason it gives: loosening is never the fix,
+    and removing ``g+w``/``o+w`` addresses exactly what ``vuln.weak_permissions``
+    flags without guessing at intent.
+
+    The path arrives from the model or from a remediation hint and goes through
+    ``target.resolve``, so a parameter pointing at ``/etc/passwd`` raises rather
+    than chmod-ing the real host. That is the same boundary every other verb
+    here crosses; a blue verb gets no exemption for meaning well.
+    """
+    path = self.target.resolve(action.params["path"])
+    if not path.exists():
+        raise AdapterError(f"{path} does not exist, so there is no ACL to fix")
+    before = path.stat().st_mode & 0o777
+    after = before & ~0o022
+    path.chmod(after)
+    return {"path": str(path), "previous_mode": oct(before),
+            "new_mode": oct(after), "changed": before != after,
+            "restore_hint": f"chmod {oct(before)[2:]} {path}"}
+
+
+@T.implements("harden.remove_persistence")
+def _harden_remove_persistence(self: SandboxAdapter, verb: Verb, action: Action) -> Any:
+    """Really delete an autostart line from the sandbox crontab.
+
+    The match is on the whole line, exactly. ``enum.persistence`` hands out the
+    crontab line verbatim as the entry identifier, so an exact match is always
+    satisfiable by a caller that looked first — and a substring match would let
+    ``root`` remove every root entry on the box. The Linux adapter refuses raw
+    cron lines altogether for this reason; here the identifier is unambiguous,
+    so the removal is possible, but not looser than that.
+
+    A miss raises instead of reporting a no-op success. A fix that removed
+    nothing and said ``ok`` is precisely the claim this whole phase exists to
+    stop being believed.
+    """
+    entry = action.params["entry"].strip()
+    cron = self.target.resolve("etc/crontab")
+    lines = cron.read_text(encoding="utf-8").splitlines()
+    kept = [ln for ln in lines if ln.strip() != entry]
+    removed = len(lines) - len(kept)
+    if removed == 0:
+        raise AdapterError(
+            f"no line in {cron} is exactly {entry!r}; nothing was removed. Run "
+            "enum.persistence and pass an entry it reported verbatim — a "
+            "near-miss must not silently delete a different autostart entry.")
+    cron.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    self.target.event("harden", "T1053.003",
+                      f"autostart entry removed: {entry}")
+    return {"entry": entry, "removed": removed, "file": str(cron),
+            "remaining": len([ln for ln in kept
+                              if ln.strip() and not ln.startswith("#")]),
+            "restore_hint": f"re-add {entry!r} to {cron}"}

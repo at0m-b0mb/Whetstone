@@ -30,6 +30,16 @@ runs and pinning them would mean replaying recordings instead of reading a
 machine. Everything the generator itself decides — scenarios, phrasing,
 actions, rulings, findings — must not.
 
+**A claim of closure carries the evidence for it.** The remediation families
+teach the model to emit a hardening verb, and the ``<|find|>`` segment they end
+on is supervised text that says whether the gap is shut. A trajectory asserting
+``"state":"closed"`` without a second run of the attack and a second run of the
+control in the same document would be training the model to write the word —
+the same defect as the hand-assembled findings above, moved from the red half to
+the blue one and with worse consequences, because the output of that mistake is
+a hole reported fixed. :class:`TestRemediationFollowsEvidence` reads the claim
+out of the finding and looks for the actions behind it in the same document.
+
 The host adapter is stubbed throughout. Shelling out to ``ps``, ``launchctl``
 or PowerShell three times over in CI would be slow, flaky and would test the
 adapters rather than this module. The sandbox worlds are *not* stubbed: they
@@ -46,6 +56,7 @@ import pytest
 import whetstone.verbs  # noqa: F401  (registers the catalogue)
 from training import trajectories as T
 from whetstone.actions import REGISTRY, Action, Intent, Observation, Side
+from whetstone.kernel import REMEDIATION_STATES
 
 
 # --------------------------------------------------------------------------
@@ -78,7 +89,7 @@ class _StubHost:
 
 def _generate(**kw):
     defaults = dict(repeats=2, seed=99, observe=24, refusals=40, lab=40,
-                    clean=16, host_executor=_StubHost())
+                    clean=16, remediate=48, host_executor=_StubHost())
     defaults.update(kw)
     stats: dict = {}
     texts = list(T.generate_trajectories(stats=stats, **defaults))
@@ -92,6 +103,46 @@ def corpus():
 
 def _segments(text: str, marker: str) -> list[str]:
     return re.findall(re.escape(marker) + r"(\{.*?\})(?=<\|)", text)
+
+
+def _verbs(text: str) -> list[str]:
+    """The verb id of every action in a document, in order."""
+    return [json.loads(blob)["verb"] for blob in _segments(text, "<|act|>")]
+
+
+def _executed(text: str) -> list[str]:
+    """The verb id of every action that reached an adapter, in order.
+
+    An action is *proposed* whenever it appears; it is carried out only when the
+    segment after it is an ``<|obs|>`` rather than a ``<|gate|>``. The two are
+    worth separating because the refusal families deliberately propose MODIFY
+    verbs — including hardening ones — against engagements that deny them, so
+    "this trajectory contains a harden verb" and "this trajectory changed a
+    host" are different statements and only the second is the one that needs a
+    detection gap behind it.
+    """
+    parts = re.split(r"(<\|act\|>|<\|obs\|>|<\|gate\|>|<\|find\|>|<\|eos\|>)",
+                     text)
+    out = []
+    for i, part in enumerate(parts):
+        if part == "<|act|>" and parts[i + 2 : i + 3] == ["<|obs|>"]:
+            out.append(json.loads(parts[i + 1])["verb"])
+    return out
+
+
+def _remediated(texts):
+    """Every ``(text, finding)`` pair whose finding carries a remediation.
+
+    Yielding the whole document alongside the finding is the point: the claim
+    the finding makes is only checkable against the actions in the same
+    document, which is what makes these assertions about honesty rather than
+    about schema.
+    """
+    for text in texts:
+        for blob in _segments(text, "<|find|>"):
+            finding = json.loads(blob)
+            if finding.get("remediation"):
+                yield text, finding
 
 
 # --------------------------------------------------------------------------
@@ -137,15 +188,30 @@ class TestProtocol:
         The previous generator wrote its own finding dicts and omitted ``kind``,
         so the corpus taught one shape and the runtime produced another. At this
         model size there is no capacity to absorb that.
+
+        ``produced_by`` joined the required set when the remediation phase gave
+        a finding a reason to name the red verb behind it structurally rather
+        than in prose. ``remediation`` is the one optional key: it is present
+        only on a gap something was actually done about, and absent means
+        nothing was attempted — never "nothing worked".
         """
+        required = {"kind", "technique", "expected", "detail", "produced_by"}
         texts, _ = corpus
         kinds = set()
         for text in texts:
             for blob in _segments(text, "<|find|>"):
                 finding = json.loads(blob)
-                assert set(finding) == {"kind", "technique", "expected", "detail"}
+                assert required <= set(finding) <= required | {"remediation"}
                 assert finding["kind"] in {"detection_gap", "no_coverage",
                                            "observation"}
+                if "remediation" in finding:
+                    assert finding["kind"] == "detection_gap", (
+                        "only a gap is remediated; a remediation on any other "
+                        "kind would mean a fix was credited to a finding that "
+                        "never established there was anything to fix")
+                    assert set(finding["remediation"]) == {"state", "verb",
+                                                           "detail"}
+                    assert finding["remediation"]["state"] in REMEDIATION_STATES
                 kinds.add(finding["kind"])
         assert kinds, "the corpus contains no findings at all"
 
@@ -221,6 +287,194 @@ class TestFindingsFollowEvidence:
 
 
 # --------------------------------------------------------------------------
+# the defending half
+# --------------------------------------------------------------------------
+
+class TestRemediationFollowsEvidence:
+    """The blue-side twin of :class:`TestFindingsFollowEvidence`.
+
+    Both supervised segment types carry a remediation: the ``<|act|>`` for the
+    hardening verb, and the outcome inside the ``<|find|>``. So both are places
+    the corpus can teach the model to assert something the evidence does not
+    support, and the second is the dangerous one — a model that writes "closed"
+    after any harden verb produces a report that says the hole is shut.
+    """
+
+    def test_the_corpus_reaches_more_than_one_outcome(self, corpus):
+        """Five of the six states, or the lesson is "a fix always works".
+
+        This is the assertion the whole remediation family exists to satisfy. A
+        corpus in which every fix came back ``closed`` would train the model on
+        one word and the distinction between running a fix and shutting a hole —
+        the distinction the re-attack was built to enforce — would be absent
+        from the only place the model learns anything.
+
+        ``failed`` is deliberately not in the set: reaching it means emitting a
+        hardening action with a parameter the adapter rejects, and that action
+        is supervised. See :func:`training.trajectories._derived_remediation`.
+        """
+        texts, _ = corpus
+        states = {f["remediation"]["state"] for _t, f in _remediated(texts)}
+        missing = {"closed", "ineffective", "undetermined", "refused",
+                   "unavailable"} - states
+        assert not missing, (
+            f"the corpus never reaches {sorted(missing)}; a model trained on "
+            "the remaining states learns that outcome as what remediation is")
+
+    def test_a_closed_gap_carries_the_attack_that_proved_it(self, corpus):
+        """``closed`` means re-attacked and re-detected, in this document.
+
+        The state is the strongest claim this tool makes and the only one that
+        says a hole is shut. It is earned by performing the original technique a
+        second time and asking the control that was silent the same question
+        again, so both actions are in the trajectory: the red verb named in
+        ``produced_by`` twice, and the detection named in ``expected`` twice.
+
+        Checked on the rendered text rather than on the episode object because
+        the text is what the model is trained on. A closure whose evidence was
+        elsewhere would be indistinguishable, to the model, from one with no
+        evidence at all.
+        """
+        texts, _ = corpus
+        checked = 0
+        for text, finding in _remediated(texts):
+            if finding["remediation"]["state"] != "closed":
+                continue
+            verbs = _verbs(text)
+            assert verbs.count(finding["produced_by"]) >= 2, (
+                f"{finding['produced_by']} is reported closed but ran once; "
+                "the claim rests on a re-attack that is not in the document")
+            assert verbs.count(finding["expected"]) >= 2, (
+                f"{finding['expected']} is reported to have fired after the fix "
+                "but was only ever asked once")
+            checked += 1
+        assert checked, "no closed remediation was generated to check"
+
+    def test_a_refused_fix_is_never_followed_by_a_verification(self, corpus):
+        """The gate said no, so nothing was applied and nothing is re-run.
+
+        Worth pinning separately from the state name. The re-attack is a second
+        real execution of an exploit, and a loop that ran one after a fix the
+        gate had *denied* would be attacking a host to test a change that was
+        never made — the exact shape of unauthorised activity the engagement
+        exists to prevent, performed by the half of the loop that is supposed to
+        be defending.
+        """
+        texts, _ = corpus
+        checked = 0
+        for text, finding in _remediated(texts):
+            if finding["remediation"]["state"] != "refused":
+                continue
+            verbs = _verbs(text)
+            assert verbs.count(finding["produced_by"]) == 1, (
+                "the fix was refused and the technique was performed again "
+                "anyway")
+            checked += 1
+        assert checked, "no refused remediation was generated to check"
+
+    def test_a_host_is_never_changed_without_a_gap_behind_it(self, corpus):
+        """No fix *carried out* without something to fix.
+
+        A ``harden.*`` action that reached an adapter in a trajectory with no
+        ``detection_gap`` in it would teach the model to modify a host it had
+        established nothing about. That is the defending half of hallucinating a
+        finding and it is worse: a hallucinated finding is a wrong sentence, a
+        hallucinated fix is a change to somebody's machine.
+
+        Proposals are excluded rather than overlooked. The ``confirm.declined``
+        and ``intent.ceiling`` refusal families draw from the MODIFY half of the
+        catalogue and land on hardening verbs by design, and a proposal the gate
+        answered is a refusal lesson, not a change.
+        """
+        texts, _ = corpus
+        checked = 0
+        for text in texts:
+            if not any(v.startswith("harden.") for v in _executed(text)):
+                continue
+            assert '"kind":"detection_gap"' in text, (
+                "a hardening verb was carried out in an episode that never "
+                "established a detection gap")
+            checked += 1
+        assert checked, "no hardening verb was ever carried out"
+
+    def test_being_asked_to_fix_is_not_a_reason_to_fix(self, corpus):
+        """Episodes told to close the gaps that correctly close nothing.
+
+        The mirror of the clean-host family. Those episodes stop a model
+        inventing a finding on a healthy machine; these stop it inventing a fix
+        because the instruction mentioned one. The remediation phase is on and
+        the task asks for the holes to be shut; the control saw the attack, or
+        could not be established either way, or nothing in the catalogue covers
+        the technique — so there is nothing to remediate and the right answer is
+        to emit no hardening verb at all.
+        """
+        texts, _ = corpus
+        asked = [t for t in texts
+                 if any(ask.strip() in t.split("<|host|>")[0]
+                        for ask in T._REMEDIATE_ASK)]
+        assert asked, "no episode carried a remediation instruction"
+        # A gap must be absent as well as a fix. An episode that found a gap
+        # and had nothing in the catalogue to close it also ends without a
+        # hardening verb, and it is a different lesson — there was something to
+        # fix and no way to fix it. What this test is about is the episode where
+        # the instruction was the only reason to reach for a fix at all.
+        quiet = [t for t in asked
+                 if '"kind":"detection_gap"' not in t
+                 and not any(v.startswith("harden.") for v in _verbs(t))]
+        assert len(quiet) >= 8, (
+            f"only {len(quiet)} of {len(asked)} episodes were asked to fix "
+            "something, found nothing to fix, and correctly fixed nothing; the "
+            "model will learn that the instruction is the trigger")
+
+    def test_most_of_the_corpus_still_ends_at_the_finding(self, corpus):
+        """Hardening is a minority of the data and has to stay one.
+
+        The corpus is overwhelmingly reconnaissance, assessment and refusal,
+        because that is overwhelmingly the job. A model whose training set is
+        half remediation reaches for a MODIFY on a host it was asked to look at,
+        and the gate would stop it — but a model that has to be stopped that
+        often is one whose proposals an operator learns to ignore.
+        """
+        texts, _ = corpus
+        hardening = [t for t in texts
+                     if any(v.startswith("harden.") for v in _executed(t))]
+        assert len(hardening) < 0.30 * len(texts), (
+            f"{len(hardening)} of {len(texts)} trajectories harden something")
+
+    def test_the_families_produced_the_outcomes_they_claim(self, corpus):
+        """Intent against result, asserted rather than printed.
+
+        A remediation family names a world, a red verb and a preferred fix, and
+        then the sandbox decides what happens — a real chmod, a real gate
+        ruling, a real empty log. So the label and the outcome are joined by the
+        adapter's behaviour and nothing else, and a change there could turn the
+        ineffective family into a second batch of closures while every other
+        assertion in this file still passed: the documents would be well formed,
+        the actions would bind, and one whole state would have left the corpus.
+        """
+        _texts, stats = corpus
+        assert not stats["fix_mismatch"], stats["fix_mismatch"]
+
+    def test_remediation_is_absent_from_a_corpus_built_without_it(self):
+        """``--remediate 0`` reproduces the corpus as it was.
+
+        The flag is the seam an ablation runs through — the question "did seeing
+        defence help?" is only answerable if the no-defence corpus is still
+        buildable — so it has to actually remove every remediation rather than
+        merely stop adding the family.
+        """
+        texts, stats = _generate(remediate=0, observe=8, refusals=8, lab=24,
+                                 clean=8, repeats=1)
+        assert not stats["remediation"], stats["remediation"]
+        for text in texts:
+            # Proposals survive — the refusal families still put a MODIFY in
+            # front of a gate that denies it, and that is not remediation. What
+            # must be gone is every fix that ran and every outcome recorded.
+            assert not [v for v in _executed(text) if v.startswith("harden.")]
+            assert '"remediation":{"state"' not in text
+
+
+# --------------------------------------------------------------------------
 # safety
 # --------------------------------------------------------------------------
 
@@ -291,7 +545,9 @@ class TestCoverage:
 
     def test_every_scenario_family_produced_something(self, corpus):
         _texts, stats = corpus
-        for kind in ("observe", "refusal", "gap", "seen", "clean"):
+        for kind in ("observe", "refusal", "gap", "seen", "clean",
+                     "fix-closed", "fix-ineffective", "fix-undetermined",
+                     "fix-refused", "fix-unavailable", "fix-none"):
             assert stats["kind"].get(kind), f"{kind} produced nothing"
 
     def test_nothing_errored(self, corpus):

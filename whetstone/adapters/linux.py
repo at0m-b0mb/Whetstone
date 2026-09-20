@@ -1905,6 +1905,49 @@ def _ausearch_window(
                   "window_seconds": since_seconds}
 
 
+#: Which audit source each detection reads, so a probe that found nothing can
+#: say what would have to be switched on for it to find something. Every value
+#: must be a key ``_audit_rule_for`` knows, or the fix this offers is one
+#: ``harden.enable_telemetry`` refuses — a fix proposed and never applied, which
+#: is the quietest way for remediation to do nothing. A test pins the two tables
+#: together rather than a comment asking the next person to remember.
+_TELEMETRY_FOR = {
+    "detect.process_creation": "execve",
+    "detect.persistence_change": "cron",
+    "detect.credential_access": "credential_access",
+}
+
+
+def offer_telemetry(result: dict[str, Any], verb_id: str) -> dict[str, Any]:
+    """Attach the remediation hint for a control that was genuinely silent.
+
+    The kernel reads ``remediation`` off an observation to aim a hardening verb
+    at something an observation actually named — nothing is inferred from the
+    payload's shape, here or anywhere else. Without this the Linux adapter's
+    fixes have required parameters nothing supplies, so every detection gap on a
+    real host reports "a fix exists but the evidence did not say where to point
+    it". Honest, and not much use.
+
+    ``logged is False`` and nothing else. Not ``gap`` and not ``source: "none"``:
+    both of those mean the audit log could not be read or was not recording, so
+    :func:`~whetstone.kernel.detection_fired` answers "cannot tell" and the
+    kernel writes an ``observation`` rather than a ``detection_gap``. Only a gap
+    is remediated, so a hint on those payloads would be a fix offered for a
+    finding nobody established — and the case where auditd is running with no
+    execve rule is exactly the one where enabling the source feels most
+    obviously right and is least obviously *proven* necessary.
+    """
+    if result.get("logged") is not False:
+        return result
+    if result.get("source") == "none" or result.get("gap"):
+        return result
+    source = _TELEMETRY_FOR.get(verb_id)
+    if source is None:
+        return result
+    result["remediation"] = {"harden.enable_telemetry": {"source": source}}
+    return result
+
+
 @LinuxAdapter.implements("detect.process_creation")
 def _detect_process_creation(self: LinuxAdapter, verb: Verb, action: Action) -> dict[str, Any]:
     since = int(action.params.get("since_seconds", 300))
@@ -1920,7 +1963,7 @@ def _detect_process_creation(self: LinuxAdapter, verb: Verb, action: Action) -> 
     if not available:
         result["gap"] = ("no auditd execve auditing: process creation is not "
                          "recorded, so absence here is not evidence of no execution")
-    return result
+    return offer_telemetry(result, "detect.process_creation")
 
 
 @LinuxAdapter.implements("detect.persistence_change")
@@ -1936,7 +1979,7 @@ def _detect_persistence_change(self: LinuxAdapter, verb: Verb, action: Action) -
     if not available:
         result["gap"] = ("no auditd watch on cron/systemd autostart locations: "
                          "a new persistence entry would not be logged")
-    return result
+    return offer_telemetry(result, "detect.persistence_change")
 
 
 @LinuxAdapter.implements("detect.credential_access")
@@ -1952,7 +1995,7 @@ def _detect_credential_access(self: LinuxAdapter, verb: Verb, action: Action) ->
     if not available:
         result["gap"] = ("no auditd watch on /etc/shadow: a credential-store read "
                          "would not be logged")
-    return result
+    return offer_telemetry(result, "detect.credential_access")
 
 
 @LinuxAdapter.implements("detect.authentication")
@@ -2359,6 +2402,16 @@ def _exploit_service_permissions(self: LinuxAdapter, verb: Verb, action: Action)
     rec = _overwrite_binary(binpath, payload, restore=restore)
     rec["service"] = unit
     rec["exec_binary"] = binpath
+    # `image` is what detect.process_creation calls its own parameter, and the
+    # kernel aims a probe by exact name match. Without it the probe asks "was
+    # any execve logged in the window" instead of "was this one", so a hit can
+    # never be attributed and this control can never be shown to have started
+    # firing — which means a gap here could never be proven closed however good
+    # the fix was. The handler that overwrote the binary is the only thing that
+    # knows which image will run.
+    rec["image"] = os.path.basename(binpath)
+    # And what would fix it, under the harden verb's own parameter name.
+    rec["remediation"] = {"harden.fix_permissions": {"path": binpath}}
     if which("systemctl") and rec.get("ok"):
         run(["systemctl", "restart", unit])
         rec["service_restarted"] = True
@@ -2589,6 +2642,14 @@ def _postex_persistence_install(self: LinuxAdapter, verb: Verb, action: Action) 
     except OSError as exc:
         return Observation(action=action, ok=False, platform=self.platform,
                            error=f"persistence install failed ({mechanism}): {exc}")
+    # Offer the removal only while the entry is still on disk. Cleanup usually
+    # took it away already, and harden.remove_persistence moves a named file
+    # aside — pointed at a path that no longer exists it would fail, which is a
+    # true statement about a fix nobody should have attempted. A hint is a claim
+    # about the current state, so it is made only when the state supports it.
+    if rec.get("installed_path") and not rec.get("cleaned_up"):
+        rec["remediation"] = {
+            "harden.remove_persistence": {"entry": rec["installed_path"]}}
     return rec
 
 

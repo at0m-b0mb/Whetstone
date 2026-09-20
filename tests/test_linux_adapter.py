@@ -356,3 +356,102 @@ class TestAQueryThatDidNotRunIsNotSilence:
             LinuxAdapter(), None, _Action(rule="sigma:whatever", since_seconds=300))
         assert result["source"] == "journald-grep", result
         assert self._fired(result) is False, result
+
+
+# --------------------------------------------------------------------------
+# the remediation hint
+#
+# The channel a handler declares a fix through. Pure, so it is testable on a Mac
+# like the parsers above — and worth testing for the same reason: getting it
+# wrong does not produce a wrong answer, it produces a fix that is never
+# proposed, which looks exactly like a host with nothing to fix.
+# --------------------------------------------------------------------------
+
+
+class TestRemediationHint:
+    def test_genuine_silence_gets_a_hint(self):
+        out = L.offer_telemetry(
+            {"logged": False, "count": 0, "source": "auditd"},
+            "detect.process_creation")
+        assert out["remediation"] == {
+            "harden.enable_telemetry": {"source": "execve"}}
+
+    def test_an_unqueryable_source_gets_none(self):
+        """`source: "none"` means the log was never read, so detection_fired
+        answers "cannot tell" and the kernel writes an observation rather than a
+        gap. Only a gap is remediated; a hint here offers a fix for a finding
+        nobody established."""
+        out = L.offer_telemetry(
+            {"logged": False, "source": "none", "reason": "ausearch timed out"},
+            "detect.process_creation")
+        assert "remediation" not in out
+
+    def test_a_declared_gap_marker_gets_none(self):
+        """The same rule from the other direction: auditd running with no execve
+        rule is the case where enabling the source feels most obviously right
+        and is least obviously proven necessary."""
+        out = L.offer_telemetry(
+            {"logged": False, "count": 0, "source": "auditd",
+             "gap": "no auditd execve auditing"},
+            "detect.credential_access")
+        assert "remediation" not in out
+
+    def test_a_control_that_fired_gets_none(self):
+        out = L.offer_telemetry({"logged": True, "count": 3, "source": "auditd"},
+                                "detect.persistence_change")
+        assert "remediation" not in out
+
+    def test_every_source_offered_is_one_the_fix_can_enable(self):
+        """Two tables that have to agree, pinned rather than commented.
+
+        ``offer_telemetry`` names a source and ``harden.enable_telemetry``
+        refuses a source it has no audit rule for. A name in one and not the
+        other is a fix proposed on every silent probe and applied on none —
+        remediation that runs, reports ``unsupported``, and closes nothing.
+        """
+        for verb_id, source in L._TELEMETRY_FOR.items():
+            assert L._audit_rule_for(source) is not None, (
+                f"{verb_id} offers telemetry source {source!r}, which "
+                "harden.enable_telemetry does not know how to enable")
+
+    def test_the_exploit_names_the_image_it_will_run(self, tmp_path):
+        """Without it every Linux process-creation probe is unaimed, so a hit
+        can never be attributed and the control can never be shown to fire.
+
+        This drives the handler. The version this replaced asserted only that
+        ``detect.process_creation`` declares an ``image`` parameter — a fact
+        about ``whetstone/verbs.py`` that no change to this adapter can break —
+        under a name promising the exploit publishes one. Deleting the line that
+        publishes it left the whole suite green, which is the failure this file's
+        own docstring is about: the probe would go unaimed, every hit would read
+        as unattributable, and no Linux gap on that control could ever be proven
+        closed. Silence, where the tool's entire output is a claim about silence.
+
+        Service resolution is stubbed because it needs systemd; the payload
+        write is real, against a file in ``tmp_path``.
+        """
+        from whetstone.actions import REGISTRY
+
+        binary = tmp_path / "acme-agent"
+        binary.write_bytes(b"original service binary\n")
+        adapter = LinuxAdapter()
+        adapter._service_exec_paths = lambda: {"acme.service": str(binary)}
+
+        verb = REGISTRY.get("exploit.service_permissions")
+        action = verb.bind({"service": "acme", "restore": True},
+                           target="127.0.0.1")
+        rec = L._exploit_service_permissions(adapter, verb, action)
+
+        assert rec["ok"], rec
+        assert rec["image"] == "acme-agent", (
+            "the kernel aims a probe by EXACT parameter-name match, so the "
+            "handler that overwrote the binary — the only thing that knows "
+            "which image will run — has to publish it under the name "
+            "detect.process_creation gives its own parameter")
+        assert any(p.name == "image"
+                   for p in REGISTRY.get("detect.process_creation").params), (
+            "and the name on the other side of that match is `image` too; if "
+            "the probe ever renames it, publishing the old one aims nothing")
+        assert binary.read_bytes() == b"original service binary\n", (
+            "restore=True, and a test that leaves the payload behind is a test "
+            "that has not exercised the restore path")

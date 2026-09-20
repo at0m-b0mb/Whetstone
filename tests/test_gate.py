@@ -66,6 +66,10 @@ def _registry() -> VerbRegistry:
         id="harden.thing", summary="Change something for the better.",
         intent=Intent.MODIFY, side=Side.BLUE, target=TargetKind.HOST,
         caution="Changes configuration.",
+        # A state-changing blue verb has to name what it closes, the same way a
+        # red verb has to name what ought to catch it. Resolved at freeze, so
+        # the forward reference to a verb registered below is fine.
+        remediates=("exploit.thing",),
     ))
     r.register(Verb(
         id="exploit.thing", summary="Prove a weakness by using it.",
@@ -143,6 +147,47 @@ class TestSchema:
         with pytest.raises(SchemaError, match="declares no detected_by"):
             Verb(id="exploit.x", summary="x", intent=Intent.EXECUTE,
                  side=Side.RED, target=TargetKind.HOST, caution="runs code")
+
+    def test_a_hardening_verb_must_name_what_it_closes(self):
+        """The blue mirror of the rule above.
+
+        A ``harden.*`` verb that names nothing can never be matched to a
+        finding, which is not an error that shows up as a wrong answer — it
+        shows up as a fix that is never proposed. Three of them sat in the
+        catalogue for months being never proposed.
+        """
+        with pytest.raises(SchemaError, match="declares no remediates"):
+            Verb(id="harden.y", summary="y", intent=Intent.MODIFY,
+                 side=Side.BLUE, target=TargetKind.HOST,
+                 caution="changes configuration")
+
+    def test_only_a_state_changing_blue_verb_may_remediate(self):
+        """A detection does not fix anything and an exploit certainly does not."""
+        with pytest.raises(SchemaError, match="state-changing blue verb"):
+            Verb(id="detect.y", summary="y", intent=Intent.OBSERVE,
+                 side=Side.BLUE, target=TargetKind.HOST,
+                 remediates=("exploit.thing",))
+
+    def test_remediates_must_point_at_a_red_verb(self):
+        """Checked at freeze, like ``detected_by``, so the two halves of a pair
+        can be written in either order and still have to resolve."""
+        r = VerbRegistry()
+        r.register(Verb(id="detect.z", summary="z", intent=Intent.OBSERVE,
+                        side=Side.BLUE, target=TargetKind.HOST))
+        r.register(Verb(id="harden.z", summary="z", intent=Intent.MODIFY,
+                        side=Side.BLUE, target=TargetKind.HOST,
+                        caution="changes configuration",
+                        remediates=("detect.z",)))
+        with pytest.raises(SchemaError, match="not a red verb"):
+            r.freeze()
+
+        r2 = VerbRegistry()
+        r2.register(Verb(id="harden.z", summary="z", intent=Intent.MODIFY,
+                         side=Side.BLUE, target=TargetKind.HOST,
+                         caution="changes configuration",
+                         remediates=("exploit.nowhere",)))
+        with pytest.raises(SchemaError, match="not a registered verb"):
+            r2.freeze()
 
     def test_red_verb_may_admit_nothing_detects_it(self):
         v = Verb(id="exploit.x", summary="x", intent=Intent.EXECUTE,
@@ -610,6 +655,28 @@ class TestCatalogue:
         # postex.exfil_probe deliberately admits nothing detects it. If this
         # list grows, someone added an attack without a detection.
         assert uncovered == ["postex.exfil_probe"], uncovered
+
+    def test_remediation_reports_what_has_no_fix(self):
+        """The second axis, and the one that was invisible until the kernel
+        could remediate. "Would anything notice this?" and "could we do anything
+        about it?" are different questions, and a red verb can be answered yes
+        to the first and no to the second.
+
+        ``postex.exfil_probe`` is deliberately both: nothing watches egress
+        volume, so nothing can be switched on to make a control fire for it. If
+        this list grows, someone added an attack the blue half cannot answer.
+        """
+        import whetstone.verbs  # noqa: F401
+        from whetstone.actions import REGISTRY
+
+        fixes = REGISTRY.remediation()
+        assert set(fixes) == set(REGISTRY.coverage()), (
+            "both maps are keyed by every red verb, so a report can put them "
+            "side by side")
+        unfixable = [k for k, v in fixes.items() if not v]
+        assert unfixable == ["postex.exfil_probe"], unfixable
+        assert fixes["exploit.service_permissions"] == (
+            "harden.enable_telemetry", "harden.fix_permissions")
 
     def test_there_is_no_arbitrary_shell_verb(self):
         """The shortcut that would collapse the design. It must not exist."""

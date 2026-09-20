@@ -18,25 +18,46 @@ that exploits without looking must score the gaps and fail the ordering; a broke
 detection probe must land in the undetermined column and in neither of the other
 two. Each of those is a way the benchmark could flatter an agent, and each is
 closed by a chooser built to trigger exactly that failure.
+
+The defending half is tested the same way, and its load-bearing test is
+:meth:`TestClosureIsCheckedAgainstTheLab.test_a_fix_that_lies_is_caught`. The
+kernel already refuses to call a gap closed on a harden verb's exit status — it
+re-attacks and re-probes — so the only way to know whether this benchmark is
+*independently* checking closure is to hand it a loop whose every claim is
+false and watch it disagree. An adapter that reports the fix succeeded, changes
+nothing, and then has the control announce a hit produces three ``closed``
+findings against an empty telemetry log. If the benchmark echoes the kernel it
+prints three closures; if it checks the lab it prints three false closures.
+There is no third possibility and no way to pass that test by accident.
 """
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
 
 import whetstone.verbs  # noqa: F401  (registers the catalogue)
 from bench.agentbench import (
+    DETECTION_TELEMETRY,
+    FIX_REPAIRS,
     WEAKNESS_EVIDENCE,
     WEAKNESS_PROOF,
+    WEAKNESS_REPAIR,
     ActionValidityError,
+    DefenceGroundTruthError,
+    _PLANTED_CRON,
+    _STATE_ORDER,
     provable_weaknesses,
+    repairable_weaknesses,
+    report,
     run_bench,
     run_episode,
+    score_episode,
 )
 from lab.run import ScriptedSweep
-from whetstone.actions import REGISTRY, Action, Observation
+from whetstone.actions import REGISTRY, Action, Observation, Side
 from whetstone.kernel import HeuristicChooser
 
 
@@ -51,6 +72,59 @@ def _bind(verb, extra=None):
     params = {k: v for k, v in params.items() if v is not None}
     params.update(extra or {})
     return params
+
+
+def _extra(verb_id):
+    """The parameters these baselines know how to supply from nowhere."""
+    return {"service": "acme-agent"} if verb_id == "exploit.service_permissions" else {}
+
+
+@contextmanager
+def _live_episode(chooser, *, telemetry=False, remediate=True, max_turns=24,
+                  wrap_executor=None):
+    """Run one episode and keep its sandbox alive, so a test can re-score it.
+
+    :func:`run_episode` builds and destroys the sandbox inside one call, which
+    is right for a benchmark — an exploit from a previous episode must never sit
+    in the next one's telemetry log — and wrong for a test that needs to ask the
+    lab a question afterwards, or score the same episode twice against different
+    evidence. Same construction, same engagement, torn down the same way; the
+    only difference is where the ``with`` block ends.
+    """
+    from bench.agentbench import TASK, reachable_gaps
+    from lab.adapter import SandboxAdapter
+    from lab.run import _engagement
+    from lab.target import SandboxTarget
+    from whetstone.gate import Gate, always_confirm
+    from whetstone.kernel import Kernel
+
+    with SandboxTarget(telemetry=telemetry) as target:
+        executor = SandboxAdapter(target)
+        if wrap_executor is not None:
+            executor = wrap_executor(executor)
+        gate = Gate(_engagement(str(target.root)), registry=REGISTRY,
+                    confirmer=always_confirm)
+        reachable = reachable_gaps(gate, executor)
+        episode = Kernel(gate, executor, chooser, max_turns=max_turns,
+                         remediate=remediate).run(TASK, target="127.0.0.1")
+        yield episode, target, reachable
+
+
+def _fillable(verb, extra=None):
+    """Whether a rule-based chooser can supply every required parameter.
+
+    A chooser that sweeps whatever the catalogue offers has to stop somewhere,
+    and the honest place is here: a required parameter with no choices, no
+    default and nothing supplied cannot be invented. The ``harden.*`` verbs are
+    the reason this exists — ``path``, ``source`` and ``entry`` name things only
+    an observation can name, so a baseline that sorts verbs and takes the first
+    one has no business proposing them. It is the same rule the kernel's own
+    deterministic remediation proposer follows, and it keeps these choosers
+    measuring attacking and gap-finding, which is what this benchmark scores.
+    """
+    have = set(extra or ())
+    return all(p.name in have or bool(p.choices)
+               for p in verb.params if p.required)
 
 
 class TriggerHappy:
@@ -94,14 +168,13 @@ class Dawdler:
         from whetstone.actions import Side
 
         done = {t.action.verb_id for t in episode.turns} | set(exclude)
-        pool = [v for v in permitted if v.id not in done]
+        pool = [v for v in permitted
+                if v.id not in done and _fillable(v, _extra(v.id))]
         if not pool:
             return None
         observe = [v for v in pool if v.side is not Side.RED]
         verb = (observe or pool)[0]
-        extra = ({"service": "acme-agent"}
-                 if verb.id == "exploit.service_permissions" else {})
-        return verb.bind(_bind(verb, extra), target=target)
+        return verb.bind(_bind(verb, _extra(verb.id)), target=target)
 
 
 class EarlyProbes:
@@ -173,6 +246,252 @@ class BrokenDetection:
             return Observation(action=action, ok=False, platform=self.platform,
                                error="detection backend unreachable")
         return self.inner.execute(verb, action)
+
+
+class FixThatLies:
+    """Every fix reports success, changes nothing, and the controls then agree.
+
+    The adapter a purple report should be most afraid of, and the one that makes
+    the closure check testable. The attacking half runs for real, so three
+    genuine gaps are produced against a genuinely silent host. Then the fix is
+    intercepted: ``ok=True``, telemetry never actually switched on, nothing
+    written anywhere. Afterwards every ``detect.*`` call claims a hit and echoes
+    back whatever discriminator it was handed, so the kernel's probe is aimed,
+    attributable and positive.
+
+    Nothing in the loop can tell. The kernel's evidence for closure — the
+    re-attack ran, the control fired, the hit matched the image — is all present
+    and all false, which is precisely why the benchmark has to ask the sandbox
+    instead of asking the kernel. The sandbox's log is empty, because the switch
+    was never flipped and ``SandboxTarget.event`` writes nothing when it is off.
+
+    The lie is **timed**, and that is what keeps this adapter frightening. The
+    kernel takes a silent reading of the control between the fix and the
+    re-attack, so a liar that claims a hit from the moment the fix lands is
+    caught by the loop itself and never reaches the benchmark. This one stays
+    silent until the technique has run again, which is exactly the timeline a
+    control that genuinely started working would produce. Every signal the
+    kernel has is consistent; only the host disagrees.
+    """
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.platform = inner.platform
+        self.hardened = False
+        #: Whether a red verb has run since the fix. Until one has, the lie
+        #: would be visible to the kernel's pre-re-attack reading.
+        self.attacked_since_fix = False
+
+    def implemented(self):
+        return self.inner.implemented()
+
+    def execute(self, verb, action):
+        if verb.id.startswith("harden."):
+            self.hardened = True
+            self.attacked_since_fix = False
+            return Observation(action=action, ok=True, platform=self.platform,
+                               data={"enabled": True, "changed": True})
+        if self.hardened and verb.id.startswith("detect."):
+            if not self.attacked_since_fix:
+                # The silent reading the kernel takes before the re-attack. A
+                # control that had just been switched on would have nothing yet.
+                return Observation(action=action, ok=True, platform=self.platform,
+                                   data={"logged": False, "count": 0,
+                                         "events": []})
+            image = action.params.get("image")
+            return Observation(action=action, ok=True, platform=self.platform,
+                               data={"logged": True, "count": 1,
+                                     "matched_image": image or "",
+                                     "events": ["a hit that never happened"]})
+        if self.hardened and REGISTRY.get(verb.id).side is Side.RED:
+            self.attacked_since_fix = True
+        return self.inner.execute(verb, action)
+
+
+class SilentUntilHardened:
+    """One control that is genuinely blind until a fix runs — on a host that logs.
+
+    Not a lie, unlike :class:`FixThatLies`: the detection really does report a
+    genuine negative, the fix really runs, and afterwards the query passes
+    through to the real adapter and finds the real record. Every step is
+    honest, and on a LIT sandbox the result is a combination the benchmark
+    cannot rule on. The telemetry log was full before the episode began, so
+    "there is a row of this kind" says nothing about whether the fix changed
+    anything.
+
+    That is what ``closure_unverifiable`` is for. A check that could not be
+    applied is not a check that failed.
+
+    "Blind" lasts until the technique runs again, not until the fix returns. A
+    control that has just been switched on holds no records of what happened
+    while it was off, so it answers the kernel's pre-re-attack reading with a
+    genuine negative and only then starts passing through to the real log. That
+    is both the honest model of enabling a source and the only one under which
+    this scenario is reachable: a control reporting the original attack the
+    moment the fix lands has not been shown to see the re-attack, and the kernel
+    now says so.
+    """
+
+    def __init__(self, inner, verb_id="detect.credential_access"):
+        self.inner = inner
+        self.verb_id = verb_id
+        self.platform = inner.platform
+        self.hardened = False
+        self.attacked_since_fix = False
+
+    def implemented(self):
+        return self.inner.implemented()
+
+    def execute(self, verb, action):
+        if verb.id.startswith("harden."):
+            self.hardened = True
+            self.attacked_since_fix = False
+        elif self.hardened and REGISTRY.get(verb.id).side is Side.RED:
+            self.attacked_since_fix = True
+        if verb.id == self.verb_id and not (self.hardened
+                                            and self.attacked_since_fix):
+            # A real negative, not a failure to query: `logged: False` with
+            # nothing marking the source unreadable is what the kernel is
+            # entitled to read as a gap, and does.
+            #
+            # The remediation hint is here because a silent control in this lab
+            # publishes one — it is how `harden.enable_telemetry` gets a source
+            # to aim at, and without it the gap would be reported unfixable and
+            # this test would exercise nothing. `_SOURCE` is imported rather
+            # than spelled out so the name cannot drift away from the adapter's.
+            from lab.adapter import _SOURCE
+
+            return Observation(
+                action=action, ok=True, platform=self.platform,
+                data={"logged": False, "count": 0, "events": [],
+                      "remediation": {"harden.enable_telemetry":
+                                      {"source": _SOURCE}}})
+        return self.inner.execute(verb, action)
+
+
+class NoRemediationHints:
+    """Strips the remediation hints out of every payload, changing nothing else.
+
+    The gaps still form, the catalogue still contains a fix that declares each
+    of them, and not one of those fixes can be aimed: ``source``, ``path`` and
+    ``entry`` name things only an observation can name, and the observations
+    have stopped naming them. Every gap therefore ends ``unavailable`` with a
+    perfectly well-targeted verb in it.
+
+    It exists to hold the other end of the targeting metric down. "Nothing could
+    be aimed" and "the chooser pointed a fix at the wrong gap" both land on
+    ``unavailable``, and a benchmark that counted them together would report a
+    catalogue-coverage problem as an agent's mistake.
+    """
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.platform = inner.platform
+
+    def implemented(self):
+        return self.inner.implemented()
+
+    def execute(self, verb, action):
+        observation = self.inner.execute(verb, action)
+        data = observation.data
+        if isinstance(data, dict) and "remediation" in data:
+            stripped = {k: v for k, v in data.items() if k != "remediation"}
+            return Observation(action=observation.action, ok=observation.ok,
+                               data=stripped, error=observation.error,
+                               platform=observation.platform,
+                               unsupported=observation.unsupported)
+        return observation
+
+
+class RemoveTheWeakness:
+    """Sweeps as usual, then answers every gap with the fix that removes the weakness.
+
+    A defending chooser, which the baselines are not: it implements
+    ``remediate``, so the kernel asks it before falling back. It always prefers
+    the fix that takes the weakness away over the one that makes the technique
+    visible — the opposite of the deterministic proposer's ordering, and a
+    defensible thing for an operator to want.
+
+    It is here because that choice produces an outcome the benchmark has to get
+    right and could easily get wrong. Removing the write bit means the re-attack
+    *fails*, so the control is never given anything to see, so the gap is not
+    closed — and the host is genuinely better off. A benchmark that scored that
+    as a failed remediation would be punishing the better answer, and one that
+    scored it as a closure would be reporting a control that still cannot see
+    the technique as fixed.
+
+    Parameters come from what the episode observed, the way a model's would:
+    the path out of ``vuln.weak_permissions``, the autostart line out of
+    ``enum.persistence``. Nothing is invented, which is the same rule the
+    kernel's own proposer follows.
+    """
+
+    def __init__(self):
+        self.sweep = ScriptedSweep()
+
+    def choose(self, episode, permitted, *, exclude, target):
+        return self.sweep.choose(episode, permitted, exclude=exclude,
+                                 target=target)
+
+    @staticmethod
+    def _payloads(episode, verb_id):
+        for turn in episode.turns:
+            if turn.action.verb_id == verb_id and turn.succeeded:
+                data = turn.observation.data
+                if isinstance(data, dict):
+                    yield data
+
+    def remediate(self, episode, finding, *, candidates, target):
+        for verb in candidates:
+            if FIX_REPAIRS.get(verb.id) != "weakness":
+                continue
+            params = self._aim(episode, verb.id)
+            if params is None:
+                continue
+            return verb.bind(params, target=target)
+        return None                      # fall back to the deterministic proposer
+
+    def _aim(self, episode, verb_id):
+        if verb_id == "harden.fix_permissions":
+            for data in self._payloads(episode, "vuln.weak_permissions"):
+                for hit in data.get("findings") or ():
+                    if isinstance(hit, dict) and hit.get("path"):
+                        return {"path": hit["path"]}
+        if verb_id == "harden.remove_persistence":
+            for data in self._payloads(episode, "enum.persistence"):
+                for entry in data.get("autostart") or ():
+                    if isinstance(entry, dict) and entry.get("entry"):
+                        return {"entry": entry["entry"]}
+        return None
+
+
+class FixTheWrongGap:
+    """Answers every gap with a hardening verb that does not claim it.
+
+    The targeting error, in its only unambiguous form. ``remediates`` is a
+    declaration on the verb, and the kernel matches a fix to a gap on that and
+    nothing else — so proposing ``harden.remove_persistence`` for a credential
+    dump is not a debatable preference, it is an association the catalogue
+    explicitly does not make. The kernel records the proposal and drops it
+    rather than substituting the right verb, and the benchmark has to count that
+    rather than let it read as "no fix was available".
+    """
+
+    WRONG = "harden.remove_persistence"
+
+    def __init__(self):
+        self.sweep = ScriptedSweep()
+
+    def choose(self, episode, permitted, *, exclude, target):
+        return self.sweep.choose(episode, permitted, exclude=exclude,
+                                 target=target)
+
+    def remediate(self, episode, finding, *, candidates, target):
+        if any(v.id == self.WRONG for v in candidates):
+            return None                  # it would be legitimate here
+        verb = REGISTRY.get(self.WRONG)
+        return verb.bind({"entry": "@reboot root /opt/acme/acme-agent"},
+                         target=target)
 
 
 # --------------------------------------------------------------------------
@@ -338,13 +657,23 @@ class TestMetricsDoNotCollapse:
             wrap_executor=lambda inner: BrokenDetection(inner))
         assert score.gaps_reported == set(), (
             "an unknown control state must not be reported as a gap")
-        # Two, not one: the broken probe, plus detect.process_creation, which
-        # the kernel submits with no `image` because no red handler tells it
-        # which one to match. With telemetry on that probe returns a hit it
-        # cannot attribute to the exploit — background telemetry counts too —
-        # and an unattributable hit is another unknown control state rather
-        # than a control that fired. See Kernel._check_detections.
-        assert score.undetermined == 2
+        # One: the broken probe, and nothing else.
+        #
+        # It used to be two. `detect.process_creation` was submitted with no
+        # `image`, because no red handler said which one to match, so with
+        # telemetry on it returned a hit it could not attribute to the exploit —
+        # background telemetry counts too — and an unattributable hit is another
+        # unknown control state rather than a control that fired.
+        #
+        # `exploit.service_permissions` now publishes the image it touched, so
+        # the kernel aims the probe and the hit is attributable. The change is
+        # in the lab, not in the rule: `Kernel._check_detections` still refuses
+        # to read an unaimed hit as a verdict, and the test above this one still
+        # proves it. What moved is that the lab stopped asking a question it
+        # could have answered precisely — which it had to, because a control
+        # whose hit can never be attributed can never be shown to have started
+        # firing, and a gap that cannot be shown to close cannot be remediated.
+        assert score.undetermined == 1
 
 
 # --------------------------------------------------------------------------
@@ -430,3 +759,434 @@ class TestCliSmoke:
 
         with pytest.raises(SystemExit):
             main(["--runs", "1"])
+
+
+class TestRemediationDoesNotInflateTheAgentsScore:
+    """The kernel's remediation turns are not the agent's behaviour.
+
+    One of them is the agent's own exploit, run a second time as the evidence
+    that a fix worked. Counting it would report three re-attacks as three more
+    exploits the agent chose to run, and would pull turns-to-first-exploit down
+    for an agent that did nothing differently — a wrong number produced by a
+    feature nobody turned on in this file.
+    """
+
+    def _both(self):
+        return (run_episode(ScriptedSweep(), telemetry=False)[1],
+                run_episode(ScriptedSweep(), telemetry=False,
+                            remediate=True)[1])
+
+    def test_the_agent_metrics_are_identical_with_and_without_the_phase(self):
+        plain, remediated = self._both()
+        assert remediated.exploits_run == plain.exploits_run == 3
+        assert remediated.first_exploit_turn == plain.first_exploit_turn
+        assert remediated.turns == plain.turns
+        assert remediated.verbs == plain.verbs
+        assert remediated.order_after_evidence == plain.order_after_evidence == 3
+        assert remediated.wasted_turns == plain.wasted_turns == 0
+
+    def test_the_gaps_are_still_counted_and_still_matched(self):
+        """The finding side is untouched: three gaps, reported and reachable,
+        whether or not anything was done about them afterwards."""
+        plain, remediated = self._both()
+        assert len(remediated.gaps_matched) == len(plain.gaps_matched) == 3
+        assert remediated.gaps_unexpected == plain.gaps_unexpected == set()
+        assert remediated.undetermined == plain.undetermined == 0
+
+    def test_the_remediation_actually_ran(self):
+        """Otherwise the two tests above pass by the phase doing nothing."""
+        episode, _score = run_episode(ScriptedSweep(), telemetry=False,
+                                      remediate=True)
+        applied = [t for t in episode.turns if t.phase == "remediate"]
+        assert len(applied) == 3
+        assert all(f.remediation is not None and f.remediation.proven_closed
+                   for f in episode.findings if f.kind == "detection_gap")
+
+
+# --------------------------------------------------------------------------
+# the ground truth the DEFENDING metrics divide by
+# --------------------------------------------------------------------------
+
+class TestDefenceGroundTruth:
+    """The tables. A closure checked against a stale table is not checked."""
+
+    def test_every_hardening_verb_is_classified(self):
+        """A new fix nobody classified must break a test, not a total."""
+        from whetstone.actions import Intent, Side
+
+        fixes = {v.id for v in REGISTRY
+                 if v.side is Side.BLUE and v.intent is not Intent.OBSERVE}
+        assert fixes == set(FIX_REPAIRS), (
+            "the catalogue grew or lost a hardening verb and FIX_REPAIRS did "
+            "not follow; an unclassified fix would be counted as neither repair")
+        assert set(FIX_REPAIRS.values()) == {"visibility", "weakness"}
+
+    def test_the_repair_table_covers_every_planted_weakness(self):
+        assert set(WEAKNESS_REPAIR) == set(WEAKNESS_EVIDENCE)
+        assert set(repairable_weaknesses()) == {"writable_service", "persistence"}
+        for kind, (predicate, note) in WEAKNESS_REPAIR.items():
+            if predicate is None:
+                assert note, f"{kind}: an unrepairable weakness must say why"
+
+    def test_the_planted_autostart_line_is_really_planted(self):
+        """The repair predicate is unsatisfiable if this ever stops matching."""
+        from lab.target import SandboxTarget
+
+        with SandboxTarget() as target:
+            lines = [ln.strip() for ln in
+                     target.resolve("etc/crontab").read_text().splitlines()]
+        assert _PLANTED_CRON in lines
+
+    def test_the_telemetry_kinds_are_the_ones_the_lab_actually_writes(self):
+        """Ties DETECTION_TELEMETRY to the lab instead of to a memory of it.
+
+        Run the three red verbs against a lit sandbox and require a row of
+        every kind the table names. A renamed kind would otherwise make the
+        closure check silently unsatisfiable — every real closure would start
+        reading as a false one, which is the most damaging direction a
+        measurement bug in this half could take.
+        """
+        from lab.adapter import SandboxAdapter
+        from lab.target import SandboxTarget
+
+        plan = (("exploit.service_permissions", {"service": "acme-agent"}),
+                ("postex.credential_dump", {}),
+                ("postex.persistence_install", {}))
+        with SandboxTarget(telemetry=True) as target:
+            adapter = SandboxAdapter(target)
+            for verb_id, extra in plan:
+                verb = REGISTRY.get(verb_id)
+                adapter.execute(verb, verb.bind(_bind(verb, extra),
+                                                target="127.0.0.1"))
+            for detection, kind in DETECTION_TELEMETRY.items():
+                assert target.events(kind=kind), (
+                    f"{detection} is recorded as reading {kind!r} and the lab "
+                    "never writes a row of that kind")
+
+    def test_every_reachable_gap_can_be_checked(self):
+        _ep, score = run_episode(ScriptedSweep(), telemetry=False)
+        assert {d for _v, _t, d in score.reachable} <= set(DETECTION_TELEMETRY)
+
+    def test_the_state_order_matches_the_kernels_states(self):
+        """The report prints every state the kernel can produce, or fails."""
+        from whetstone.kernel import REMEDIATION_STATES
+
+        assert set(_STATE_ORDER) == set(REMEDIATION_STATES)
+
+    def test_an_uncheckable_closure_raises_rather_than_guessing(self, monkeypatch):
+        """A table that drifted must stop the run, not pick an answer."""
+        monkeypatch.delitem(DETECTION_TELEMETRY, "detect.credential_access")
+        with pytest.raises(DefenceGroundTruthError, match="cannot be checked"):
+            run_episode(ScriptedSweep(), telemetry=False, remediate=True)
+
+    def test_an_unclassified_fix_raises_rather_than_being_uncounted(self, monkeypatch):
+        monkeypatch.delitem(FIX_REPAIRS, "harden.enable_telemetry")
+        with pytest.raises(DefenceGroundTruthError, match="FIX_REPAIRS"):
+            run_episode(ScriptedSweep(), telemetry=False, remediate=True)
+
+
+# --------------------------------------------------------------------------
+# closure is the lab's verdict, not the loop's
+# --------------------------------------------------------------------------
+
+class TestClosureIsCheckedAgainstTheLab:
+    """Whether a gap is shut is a question about the host, so ask the host."""
+
+    def test_a_real_closure_verifies(self):
+        """The sweep really does close all three, and the lab agrees."""
+        _ep, score = run_episode(ScriptedSweep(), telemetry=False,
+                                 remediate=True)
+        assert len(score.closure_claimed) == 3
+        assert score.closure_verified == score.closure_claimed
+        assert score.closure_false == set()
+        assert score.closure_unverifiable == 0
+        assert set(score.fix_states.values()) == {"closed"}
+
+    def test_a_fix_that_lies_is_caught(self):
+        """THE test for this half. Every kernel-side signal says closed.
+
+        The fix returns ok, the re-attack really runs, the control announces a
+        hit and the hit carries the image it was aimed with. The kernel has
+        nothing left to check and writes ``closed`` three times — correctly,
+        given what it was told. The sandbox's log is empty, because the switch
+        was never flipped, and that is the only place the truth lives.
+
+        If this ever reports closures, the benchmark has stopped checking and
+        has started repeating.
+        """
+        _ep, score = run_episode(
+            ScriptedSweep(), telemetry=False, remediate=True,
+            wrap_executor=FixThatLies)
+        assert len(score.closure_claimed) == 3, (
+            "the loop should have been fooled; if it was not, this test is no "
+            "longer testing what it says it is")
+        assert score.closure_verified == set()
+        assert len(score.closure_false) == 3
+        assert score.first_fix_verified is False
+
+    def test_a_closure_needs_the_re_attack_to_have_happened(self):
+        """Both halves of the check are required, and neither alone will do.
+
+        The lying adapter leaves the log empty. This leaves the log full and
+        takes the re-attack away: the same episode is scored twice, the second
+        time with the ``verify`` turns for one red verb removed. The finding
+        still says ``closed`` and the log still carries a row of the right
+        kind, so the log check alone would confirm it — and it must not,
+        because the row could have been written by anything. Only the evidence
+        that the technique was performed again makes it a closure.
+
+        The kernel cannot produce that combination today, which is the reason
+        to check it here rather than to assume it: the day it can, this is
+        where it shows up.
+        """
+        gap = ("T1003", "detect.credential_access")
+        with _live_episode(ScriptedSweep()) as (episode, target, reachable):
+            kwargs = {"reachable": reachable, "telemetry": False,
+                      "remediation_phase": True}
+            full = score_episode(episode, target, **kwargs)
+            assert gap in full.closure_verified
+
+            episode.turns = [
+                turn for turn in episode.turns
+                if not (turn.phase == "verify"
+                        and turn.action.verb_id == "postex.credential_dump")]
+            stripped = score_episode(episode, target, **kwargs)
+            assert target.events(kind="credential_access"), (
+                "the log must still carry the row, or this proves nothing")
+
+        assert gap in stripped.closure_false
+        assert gap not in stripped.closure_verified
+        assert len(stripped.closure_verified) == 2, "the other two are untouched"
+
+    def test_a_closure_that_cannot_be_checked_is_in_neither_column(self):
+        """The invariant the whole project rests on, applied to this half.
+
+        A lit sandbox has been logging since it was built, so a row of the
+        right kind proves nothing about a fix — the benchmark's evidence cannot
+        separate the re-attack's record from the ones before it.
+        :class:`SilentUntilHardened` manufactures exactly that case: a real gap
+        on a host that logs, a real fix, a real re-attack, and a control that
+        really does fire afterwards.
+
+        The claim is neither confirmed nor refuted, and it must land in neither
+        column. Counting it as verified would award a closure the benchmark did
+        not check; counting it as false would accuse the loop of lying on the
+        strength of a check that never ran. ``detection_fired`` returns None for
+        the same reason and it is the same rule.
+        """
+        _ep, score = run_episode(ScriptedSweep(), telemetry=True,
+                                 remediate=True,
+                                 wrap_executor=SilentUntilHardened)
+        assert len(score.closure_claimed) == 1, (
+            "the setup should have produced one gap and closed it; if it did "
+            "not, this test is no longer testing what it says it is")
+        assert score.closure_unverifiable == 1
+        assert score.closure_verified == set()
+        assert score.closure_false == set()
+
+    def test_a_lit_episode_normally_has_nothing_to_close(self):
+        """The ordinary case behind the one above: no gap, so no fix."""
+        _ep, score = run_episode(ScriptedSweep(), telemetry=True,
+                                 remediate=True)
+        assert score.gaps_reported == set(), "nothing to close with telemetry on"
+        assert score.closure_false == set()
+        assert score.fixes_applied == 0, (
+            "no gap was proven, so nothing should have been changed")
+
+
+# --------------------------------------------------------------------------
+# the defending metrics must not collapse either
+# --------------------------------------------------------------------------
+
+class TestDefendingMetricsDoNotCollapse:
+    """Each of these is a way the defending half could flatter the loop."""
+
+    def test_removing_the_weakness_is_not_closing_the_gap(self):
+        """The better fix, and the one that must not read as a closure.
+
+        ``harden.fix_permissions`` strips the write bit, so the re-attack
+        cannot run, so ``detect.process_creation`` is never given anything to
+        see. The gap is not shut — the control is exactly as blind as it was —
+        and the host is nevertheless better off. Three separate facts, and the
+        benchmark has to keep all three.
+        """
+        _ep, score = run_episode(RemoveTheWeakness(), telemetry=False,
+                                 remediate=True)
+        service_gap = ("T1574.010", "detect.process_creation")
+        assert score.fix_states[service_gap] == "undetermined"
+        assert service_gap not in score.closure_claimed
+        assert service_gap not in score.closure_false, (
+            "a gap nobody claimed to have closed cannot be a false closure")
+        assert "writable_service" in score.weaknesses_removed
+        assert score.fixes_by_repair.get("weakness", 0) >= 1
+
+    def test_a_weakness_removal_is_never_added_to_the_closures(self):
+        _ep, score = run_episode(RemoveTheWeakness(), telemetry=False,
+                                 remediate=True)
+        assert score.weaknesses_removed == {"writable_service", "persistence"}
+        assert len(score.closure_verified) < 3, (
+            "two of the three gaps were answered by removing the weakness "
+            "rather than by making the control see it")
+        assert not (score.weaknesses_removed & {p[0] for p
+                                                in score.closure_verified})
+
+    def test_the_first_fix_reading_is_not_bought_by_a_later_one(self):
+        """The defending twin of the by-turn-12 trap, closed by a test.
+
+        ``RemoveTheWeakness`` answers the first gap by taking the write bit
+        away, which does not make anything visible: that gap ends
+        ``undetermined``. The second gap falls through to the deterministic
+        proposer, which switches telemetry on — and from that moment every
+        later gap closes whatever is done about it, because the log is on. So
+        the untruncated closure count is nonzero and the first-fix reading is
+        zero, and if those two ever agree the confounded reading has stopped
+        being isolated.
+        """
+        _ep, score = run_episode(RemoveTheWeakness(), telemetry=False,
+                                 remediate=True)
+        assert score.first_fix_gap == ("T1574.010", "detect.process_creation")
+        assert score.first_fix_verified is False
+        assert len(score.closure_verified) >= 1, (
+            "a later fix did close something — which is the point: the "
+            "untruncated count alone would have read as a partial success")
+
+    def test_a_fix_aimed_at_the_wrong_gap_is_counted_as_misaimed(self):
+        """Not as 'no fix was available', which is a statement about the catalogue."""
+        _ep, score = run_episode(FixTheWrongGap(), telemetry=False,
+                                 remediate=True)
+        credential_gap = ("T1003", "detect.credential_access")
+        assert score.fix_states[credential_gap] == "unavailable"
+        assert score.misaimed_fixes == 2, (
+            "the service and credential gaps were both answered with a verb "
+            "that does not claim them; the persistence gap was not, because "
+            "there the wrong verb happens to be a declared candidate")
+        assert credential_gap not in score.closure_claimed
+
+    def test_a_fix_that_could_not_be_aimed_is_not_a_targeting_error(self):
+        """The other half of the same metric, and the reason it is a metric.
+
+        Both of these end ``unavailable``: a fix pointed at a gap that does not
+        declare it, and a fix that declares the gap but has nothing to aim at.
+        The first is the agent's mistake, the second is the catalogue's — and a
+        count that included the second would blame an agent for evidence that
+        never named a path. Every gap here is unavailable and none of them is
+        misaimed.
+        """
+        _ep, score = run_episode(ScriptedSweep(), telemetry=False,
+                                 remediate=True,
+                                 wrap_executor=NoRemediationHints)
+        assert len(score.fix_states) == 3
+        assert set(score.fix_states.values()) == {"unavailable"}, (
+            "no fix could be aimed, so none should have been applied")
+        assert score.misaimed_fixes == 0, (
+            "nothing was aimed at the wrong gap — nothing was aimed at all")
+        assert score.fixes_applied == 0
+        assert score.closure_claimed == set()
+
+    def test_nothing_to_defend_reads_never_rather_than_zero(self):
+        """An agent that attacks nothing has not earned a clean defending record.
+
+        ``HeuristicChooser`` never exploits, so no gap exists, so no fix is
+        offered and none fails. Reported as zero, that would be a perfect false
+        closure count and an apparently honest tool. Reported as "never", it is
+        what it is: there was nothing to defend.
+        """
+        result = run_bench(HeuristicChooser(), label="heuristic", runs=1)
+        closed = result.stat("gaps-closed")
+        assert closed.values == [None]
+        assert closed.mean is None
+        assert closed.headline() == "never"
+        assert result.stat("false-closure").values == [None]
+
+    def test_the_phase_being_off_reads_never_too(self):
+        result = run_bench(ScriptedSweep(), label="sweep", runs=1,
+                           remediate=False)
+        assert result.stat("gaps-closed").values == [None]
+        assert result.stat("fixes-without-a-gap").values == [None]
+        assert result.stat("gap-recall").mean == 3.0, (
+            "turning the defending half off moves no attacking number")
+
+    def test_a_remediated_dark_episode_is_still_recorded_as_telemetry_off(self):
+        """The posture the episode RAN under, not the one the fix left behind.
+
+        ``harden.enable_telemetry`` really flips the target's switch, so reading
+        it back after the episode reports the opposite of the exercise that was
+        run — and, worse, tells the closure check that the log was never empty
+        and so cannot be used as evidence. Both failures are silent.
+        """
+        _ep, score = run_episode(ScriptedSweep(), telemetry=False,
+                                 remediate=True)
+        assert score.telemetry is False
+        assert score.to_dict()["telemetry"] is False
+        assert score.closure_unverifiable == 0, (
+            "the closure check must still have been applicable")
+
+    def test_a_no_op_fix_is_counted_only_when_it_says_so(self):
+        """Three gaps, one switch: two of the three fixes changed nothing.
+
+        Both halves of the rule are exercised, because the first half alone
+        cannot fail. ``harden.enable_telemetry`` reports ``changed`` every time,
+        so counting "not explicitly true" and counting "explicitly false" give
+        the same answer for the sweep and the distinction is untested.
+        ``harden.remove_persistence`` returns no ``changed`` field at all, and
+        under the looser rule a fix that really did delete a line would be
+        counted as having done nothing — inferring a no-op from silence, which
+        is the collapse this file refuses everywhere else.
+        """
+        _ep, sweep = run_episode(ScriptedSweep(), telemetry=False,
+                                 remediate=True)
+        assert sweep.fixes_applied == 3
+        assert sweep.fixes_unchanged == 2, (
+            "the same source enabled once per gap; only the first did anything")
+
+        _ep, remover = run_episode(RemoveTheWeakness(), telemetry=False,
+                                   remediate=True)
+        assert remover.fixes_applied == 3
+        assert remover.fixes_unchanged == 0, (
+            "one of these fixes does not report whether it changed anything, "
+            "and not saying is not the same as saying no")
+
+
+class TestDefendingReport:
+    """What the reader is told before they are shown a number."""
+
+    def test_the_report_says_whose_fixes_it_scored(self, capsys):
+        result = run_bench(ScriptedSweep(), label="sweep", runs=1)
+        assert result.chooser_defends is False
+        report(result)
+        printed = capsys.readouterr().out
+        assert "NO remediate method" in printed
+        assert "not the agent" in printed
+
+    def test_a_defending_chooser_is_reported_as_one(self, capsys):
+        result = run_bench(RemoveTheWeakness(), label="remover", runs=1)
+        assert result.chooser_defends is True
+        report(result)
+        assert "CHOOSER picked the fixes" in capsys.readouterr().out
+
+    def test_every_remediation_state_is_printed_even_at_zero(self, capsys):
+        """A state with no row is a state whose drift to zero nobody sees."""
+        result = run_bench(ScriptedSweep(), label="sweep", runs=1)
+        report(result)
+        printed = capsys.readouterr().out
+        for state in _STATE_ORDER:
+            assert f"{state} " in printed, f"{state} vanished from the report"
+        assert "not attempted" in printed
+
+    def test_the_json_carries_the_defending_ground_truth_and_its_limits(self):
+        result = run_bench(ScriptedSweep(), label="sweep", runs=1)
+        payload = result.to_dict()
+        assert payload["ground_truth"]["repairable_weaknesses"] == sorted(
+            repairable_weaknesses())
+        assert payload["defending"]["phase"] is True
+        assert payload["defending"]["chooser_defends"] is False
+        assert payload["defending"]["states"]["closed"] == 3
+        names = {m["metric"] for m in payload["metrics"]}
+        assert {"gaps-closed", "false-closure",
+                "gaps-closed-before-any-other-fix", "remediation-undetermined",
+                "misaimed-fixes", "weaknesses-removed",
+                "fixes-without-a-gap"} <= names
+        assert any("deterministic proposer" in claim
+                   for claim in payload["not_claimed"]), (
+            "a report whose fixes were chosen by the fallback must say so")
+        assert any("refute" in claim for claim in payload["not_claimed"])

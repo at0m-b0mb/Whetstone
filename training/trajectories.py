@@ -74,6 +74,29 @@ with no ``<|find|>`` at all. A model that has only ever seen vulnerable hosts
 will invent something to say about a clean one, and that is the failure mode
 that gets a tool thrown out after its first real engagement.
 
+**Defence is half the job and the corpus contained none of it.** Every episode
+here used to end at the finding: the technique ran, nothing saw it, document
+over. A model trained on that has literally never seen a ``harden.*`` verb
+chosen, and the constrained decoder will happily rank one it has no idea what to
+do with. The remediation families fix that by turning the kernel's own
+remediation phase on — :class:`~whetstone.kernel.Kernel` applies a fix, **runs
+the same attack again**, and asks the same control the same question a second
+time — so the harden action, the re-attack and the second probe are real gated
+actions with real observations, exactly like everything else here.
+
+**The six remediation states are the whole point of generating more than one
+kind of fix.** The SFT loss mask supervises ``<|act|>`` *and* ``<|find|>``, so
+the remediation dict inside a finding is text the model is trained to produce. A
+corpus in which every fix came back ``"state":"closed"`` would teach a model to
+write the word "closed" after a hardening verb — which is precisely the
+overstatement the re-attack exists to prevent, reintroduced through the training
+data instead of through the code. So the families below are constructed to reach
+five of the six states for real: a fix that closes the gap, a fix that runs and
+leaves the gap open, a fix the gate refuses, a fix whose success removes the
+technique so closure cannot be proven, and a gap nothing in the catalogue claims
+to close. None of those outcomes is written down anywhere; each is what the
+sandbox actually did.
+
 **Observations are truncated deliberately and visibly.** ``enum.processes`` on a
 real machine returns hundreds of records; a trajectory carrying all of them
 would not fit in a 1024-token window and would teach the model that an
@@ -111,7 +134,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
 import whetstone.verbs  # noqa: F401  (registers and freezes the catalogue)
-from whetstone.actions import REGISTRY, Action, Intent, Observation, TargetKind, Verb
+from whetstone.actions import (REGISTRY, Action, Intent, Observation,
+                               SchemaError, TargetKind, Verb)
 from whetstone.gate import (REFUSE_UNATTENDED, Gate, always_confirm,
                             null_engagement)
 from whetstone.gate.engagement import Authorization, Engagement, Scope
@@ -254,6 +278,38 @@ _CONTEXT: tuple[str, ...] = (
     "The last assessment here was two years ago. ",
     "Handing this over to the blue team in an hour. ",
     "The owner is on the call. ",
+)
+
+
+#: Clauses that ask for the gap to be *closed* rather than only reported, added
+#: to the task of every episode generated with the remediation phase on.
+#:
+#: The phase is a kernel flag and not something the model reads, so nothing
+#: forces these two to agree — which is exactly why they are made to. Without
+#: them the corpus would contain two populations of episode with identical
+#: ``<|task|>`` distributions, one that hardens after a gap and one that stops,
+#: and the model's only way to tell them apart would be to guess. An operator
+#: who turns remediation on is an operator who asked for fixes, so the
+#: instruction says so and the model has something to condition on.
+#:
+#: They are attached to the no-op families too, and that is deliberate rather
+#: than sloppy: being asked to fix things must not become a reason to fix
+#: something. An episode whose task says "close whatever nobody saw" and whose
+#: controls saw everything ends with no hardening verb at all, and that is the
+#: lesson those episodes carry.
+_REMEDIATE_ASK: tuple[str, ...] = (
+    " Close anything nobody saw.",
+    " If a control missed something, fix it and prove the fix took.",
+    " I want the gaps shut, not just listed.",
+    " Harden what you find and show me it worked.",
+    " Do not stop at the finding — close it.",
+    " Fix what you can and say plainly what you could not.",
+    " Then switch on whatever turned out to be blind.",
+    " Report the gaps and remediate them.",
+    " Leave this host better than you found it.",
+    " Anything you change, verify.",
+    " The blue team wants the holes shut this window.",
+    " Remediate on the spot if you are able to.",
 )
 
 
@@ -438,6 +494,26 @@ class Scenario:
     #: refusal comes first.
     shuffle: bool = True
     kind: str = "observe"
+    #: Run the kernel's remediation phase: offer a fix for every detection gap,
+    #: apply it, re-run the original attack and re-ask the control. Off by
+    #: default because it is off by default in the kernel, and for the same
+    #: reason — it is the one phase that changes the target on the loop's own
+    #: initiative. Only the sandbox worlds ever set it; see
+    #: :func:`_derived_remediation`.
+    remediate: bool = False
+    #: Which hardening verb the stand-in chooser proposes, or ``""`` for the
+    #: kernel's deterministic proposer.
+    #:
+    #: This is the only lever that reaches the states other than ``closed``. The
+    #: deterministic proposer prefers the fix the *control* named — enabling the
+    #: blind log source — and in this sandbox that one always closes the gap, so
+    #: a corpus built on it alone would contain one outcome. Naming a different
+    #: candidate is not staging the result: the verb still has to be a declared
+    #: remediation for the technique, its parameters still have to come out of an
+    #: observation, the gate still rules on it, the adapter still carries it out,
+    #: and what happens next is whatever really happens. See
+    #: :meth:`_PlanChooser.remediate`.
+    fix: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "steps", tuple(
@@ -464,9 +540,11 @@ class _PlanChooser:
     that nobody scripted.
     """
 
-    def __init__(self, steps: Sequence[Step], rng: random.Random) -> None:
+    def __init__(self, steps: Sequence[Step], rng: random.Random,
+                 fix: str = "") -> None:
         self._steps = list(steps)
         self._rng = rng
+        self._fix = fix
 
     def choose(self, episode: Any, permitted: Sequence[Verb], *,
                exclude: Sequence[str], target: str | None) -> Action | None:
@@ -481,6 +559,103 @@ class _PlanChooser:
                 target=None if verb.target is TargetKind.NONE
                 else (step.target or target))
         return None
+
+    # ------------------------------------------------------------ the fix
+
+    def remediate(self, episode: Any, finding: Any, *,
+                  candidates: Sequence[Verb],
+                  target: str | None) -> Action | None:
+        """Propose the scenario's preferred fix, or defer to the kernel's.
+
+        The kernel looks this method up with ``getattr``, so defining it here is
+        what makes the corpus able to reach a remediation state other than
+        ``closed``. Returning ``None`` hands the decision back to
+        :meth:`Kernel._default_fix`, and that is the path most episodes take —
+        the deterministic proposer is the baseline a trained model's defending
+        will be measured against, so it has to be the commonest thing in the
+        data rather than a special case.
+
+        Two constraints are honoured deliberately, because a chooser that broke
+        either would put a fabricated outcome in the corpus.
+
+        *A verb outside ``candidates`` is never returned.* The kernel would
+        record that as ``unavailable`` naming the verb, which is the right
+        answer to a chooser that matched a fix to a gap by plausibility — but
+        generating that on purpose would mean writing episodes whose lesson is
+        an association error, and the ``<|find|>`` text is supervised. When the
+        scenario's preferred verb is not a declared remediation for this
+        technique the honest move is to defer, so it does.
+
+        *Parameters come out of the evidence, exactly as the kernel's own
+        proposer takes them.* The hint channel is read from the red observation
+        and the probe that followed it — the two things a model reading this
+        trajectory would have in front of it — and nothing is inferred from the
+        payload's shape. A candidate whose required parameters are not in the
+        evidence cannot be bound, and the answer is to defer rather than to
+        guess: a MODIFY aimed at a made-up path is worse than a gap left open.
+        """
+        if not self._fix:
+            return None
+        verb = next((v for v in candidates if v.id == self._fix), None)
+        if verb is None:
+            return None
+
+        hints = _hints_for(episode, finding.produced_by).get(verb.id, {})
+        known = {p.name for p in verb.params}
+        params: dict[str, Any] = {p.name: p.default for p in verb.params
+                                  if p.default is not None}
+        params.update({k: v for k, v in hints.items() if k in known})
+        try:
+            return verb.bind(
+                params,
+                target=None if verb.target is TargetKind.NONE else target)
+        except SchemaError:
+            # The evidence did not carry a required parameter. Deferring sends
+            # the gap to the deterministic proposer, which will either find a
+            # candidate it *can* aim or report `unavailable`; either is a true
+            # statement, and a placeholder would not be.
+            return None
+
+
+def _hints_for(episode: Any, red_verb_id: str) -> dict[str, dict[str, Any]]:
+    """Remediation hints published around one red action, merged probe-last.
+
+    The wire format is the one the kernel documents: an observation payload may
+    carry ``{"remediation": {"<harden verb id>": {"<param name>": value}}}``,
+    namespaced under exactly that key and keyed by exact ids. Read here rather
+    than imported from the kernel because this class is a stand-in for a model,
+    and a model has the rendered trajectory and nothing else — a chooser reaching
+    into runtime internals would be a chooser the trained one cannot replace.
+
+    Only the turns belonging to *this* gap are read: the first planned turn that
+    ran ``red_verb_id`` and the probe immediately after it. Later turns include
+    re-attacks from gaps already closed in this episode, and a hint lifted off
+    one of those would aim a fix at evidence from a different finding.
+
+    The probe is merged second so it wins a collision, which is the kernel's
+    ordering rule and holds for the kernel's reason: a detection gap is a
+    statement about the control, so the control's own account of its blindness
+    is the more specific answer.
+    """
+    turns = list(episode.turns)
+    out: dict[str, dict[str, Any]] = {}
+    for i, turn in enumerate(turns):
+        if turn.phase != "plan" or turn.action.verb_id != red_verb_id:
+            continue
+        window = [turn.observation]
+        if i + 1 < len(turns) and turns[i + 1].phase == "detect":
+            window.append(turns[i + 1].observation)
+        for obs in window:
+            if obs is None or not isinstance(obs.data, dict):
+                continue
+            published = obs.data.get("remediation")
+            if not isinstance(published, dict):
+                continue
+            for verb_id, params in published.items():
+                if isinstance(params, dict):
+                    out.setdefault(verb_id, {}).update(params)
+        break
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -547,15 +722,25 @@ class _LabExecutor:
 
     platform = "sandbox"
 
-    def __init__(self, target: Any) -> None:
+    def __init__(self, target: Any, hide: Sequence[str] = ()) -> None:
         from lab.adapter import SandboxAdapter
 
         self.target = target
         self._adapter = SandboxAdapter(target)
+        #: Verbs withheld from :meth:`implemented`, which is how an executor
+        #: that carries out no hardening measure is modelled. That is not a
+        #: hypothetical shape: ``lab/vm/adapter.py`` implements none of the
+        #: three harden verbs, so a gap found against the Lima VM has nothing
+        #: in the permitted catalogue that claims to close it. Withholding is
+        #: enough because the kernel only ever proposes from
+        #: ``catalogue() ∩ implemented()``, so a hidden verb is never bound,
+        #: never gated and never run — the episode is what it would be on an
+        #: adapter that genuinely lacks it.
+        self._hidden = frozenset(hide)
 
     def implemented(self) -> tuple[str, ...]:
-        return tuple(sorted(set(self._adapter.implemented())
-                            | {"postex.exfil_probe"}))
+        return tuple(sorted((set(self._adapter.implemented())
+                             | {"postex.exfil_probe"}) - self._hidden))
 
     def execute(self, verb: Verb, action: Action) -> Observation:
         if verb.id != "postex.exfil_probe":
@@ -768,18 +953,20 @@ class _LabWorld(_World):
 
     def __init__(self, name: str, engagement: Engagement, *, root: Path,
                  target_factory: Callable[[], type], telemetry: bool,
-                 confirmer: Callable[..., bool] = always_confirm) -> None:
+                 confirmer: Callable[..., bool] = always_confirm,
+                 hide: Sequence[str] = ()) -> None:
         super().__init__(name, engagement, None, confirmer=confirmer)
         self._root = root
         self._factory = target_factory
         self._telemetry = telemetry
+        self._hide = tuple(hide)
 
     def open(self) -> tuple[Gate, Any]:
         shutil.rmtree(self._root, ignore_errors=True)
         self._root.mkdir(parents=True, exist_ok=True)
         target = self._factory()(telemetry=self._telemetry, root=self._root)
         gate = Gate(self.engagement, registry=REGISTRY, confirmer=self.confirmer)
-        return gate, _LabExecutor(target)
+        return gate, _LabExecutor(target, self._hide)
 
     def close(self, executor: Any) -> None:
         # revert() puts back everything an exploit changed, which is the lab's
@@ -878,7 +1065,8 @@ def _lab_worlds(root: Path) -> dict[str, _World]:
 
     def engagement(name: str, *, red: bool = True,
                    techniques: tuple[str, ...] = red_techniques,
-                   ceiling: Intent = Intent.EXECUTE) -> Engagement:
+                   ceiling: Intent = Intent.EXECUTE,
+                   unattended: frozenset[Intent] | None = None) -> Engagement:
         return Engagement(
             name=name,
             authorization="LAB — self-contained sandbox, no real host in scope",
@@ -895,7 +1083,8 @@ def _lab_worlds(root: Path) -> dict[str, _World]:
             authorize=Authorization(
                 red_team=red, max_intent=ceiling,
                 techniques=techniques if red else (),
-                unattended=frozenset(Intent)),
+                unattended=(frozenset(Intent) if unattended is None
+                            else unattended)),
         )
 
     vulnerable = _vulnerable_target_class
@@ -941,6 +1130,31 @@ def _lab_worlds(root: Path) -> dict[str, _World]:
             "lab-narrow",
             engagement("sandbox T1574 validation", techniques=("T1574",)),
             root=root / "narrow", target_factory=vulnerable, telemetry=False),
+        # The fix is refused. Every intent runs unattended under this
+        # engagement except MODIFY, so the red half of the plan executes and
+        # the hardening measure lands on the default CONFIRM rule with no
+        # confirmer attached — a real `confirm.declined` on the one action the
+        # episode existed to take. This is the shape of the change window that
+        # has not opened yet, and it is a ruling the defending half has to have
+        # met: DENY has no override here either, and a model that has only seen
+        # remediation permitted will meet its first refusal in production.
+        "lab-fix-denied": _LabWorld(
+            "lab-fix-denied",
+            engagement("sandbox purple exercise, no change authority",
+                       unattended=frozenset({Intent.OBSERVE, Intent.EXECUTE})),
+            root=root / "fixdenied", target_factory=vulnerable,
+            telemetry=False, confirmer=REFUSE_UNATTENDED),
+        # Nothing to fix with. The executor reports no `harden.*` verb, so the
+        # permitted catalogue contains no declared remediation for the
+        # technique and the kernel says so instead of proposing something.
+        # `lab/vm/adapter.py` really is this adapter, which is why the shape is
+        # worth having in the corpus: it is what remediation against the Lima
+        # VM looks like today, and the blue-side twin of `no_coverage`.
+        "lab-nofix": _LabWorld(
+            "lab-nofix", purple, root=root / "nofix",
+            target_factory=vulnerable, telemetry=False,
+            hide=("harden.enable_telemetry", "harden.fix_permissions",
+                  "harden.remove_persistence")),
     }
 
 
@@ -1511,13 +1725,202 @@ def _derived_clean(rng: random.Random, count: int = 320) -> list[Scenario]:
     return out
 
 
+#: What each remediation family is built to produce, checked against what it
+#: really produced. The construction is indirect — a flavour picks a world, a
+#: red verb and a preferred fix, and the *sandbox* decides the state — so an
+#: adapter change could quietly turn the ineffective family into another batch
+#: of closures and the run would still print a healthy number. Generation
+#: compares the two and counts every divergence into ``stats["fix_mismatch"]``,
+#: which the CLI prints and a test asserts empty. A wrong number nobody notices
+#: is worse than a crash.
+#:
+#: ``fix-none`` maps to ``None`` rather than to a state: its claim is that the
+#: remediation phase ran and attached nothing, so the check is that no finding
+#: in the episode carries a remediation at all.
+_INTENDED_STATE: dict[str, str | None] = {
+    "fix-closed": "closed",
+    "fix-ineffective": "ineffective",
+    "fix-undetermined": "undetermined",
+    "fix-refused": "refused",
+    "fix-unavailable": "unavailable",
+    "fix-none": None,
+}
+
+
+def _derived_remediation(rng: random.Random, count: int = 260) -> list[Scenario]:
+    """Episodes that do something about the gap, across five real outcomes.
+
+    Every trajectory in this corpus used to stop at the finding, so the model
+    has never seen a hardening verb chosen and cannot be expected to choose one.
+    These families run the kernel's remediation phase, which means the harden
+    action, the silent reading, the re-attack and the second probe are four
+    more gated actions
+    against the same sandbox — nothing about how they are produced differs from
+    the rest of this module.
+
+    What differs is that the *outcome* is the training signal, and there are six
+    of them. Both supervised segment types carry it: the ``<|act|>`` for the
+    hardening verb, and the ``remediation`` dict inside the ``<|find|>``. A
+    corpus where every fix came back ``closed`` would teach a model to write
+    "closed" after a harden verb, which is the claimed-fixed overstatement the
+    re-attack was built to catch — reintroduced through the data rather than
+    through the code, where no amount of runtime care would reach it.
+
+    So five states are reached, each by a construction the sandbox resolves
+    rather than a label this file applies:
+
+    ``closed``
+        The deterministic proposer's own choice — the control published a hint
+        naming the log source it was blind on, the switch is flipped, the attack
+        is performed again and the control speaks. Weighted heaviest because it
+        is the baseline a trained model's defending is measured against, and
+        because it is the outcome the loop is *for*.
+
+    ``ineffective``
+        ``harden.remove_persistence`` against the persistence gap, with the
+        exploit's own cleanup turned off so the entry is genuinely still on disk
+        for the fix to remove. The removal really succeeds — and then the
+        re-attack installs the entry again and the control, still switched off,
+        still says nothing. A fix that runs is a claim; this is the family where
+        the claim is wrong, and a model that has not seen one has no reason to
+        believe verification is worth the turns.
+
+    ``undetermined``
+        ``harden.fix_permissions`` against the writable-binary gap. The chmod is
+        real and it works: the re-attack now fails, because the write bit the
+        technique depended on is gone. That is a good outcome and it is *not*
+        closure — the gap was a statement about the control, and a technique
+        that cannot run tells you nothing about what would have been logged. The
+        distinction is subtle enough that it has to be in the data.
+
+    ``refused``
+        The gate denies the hardening action under an engagement that runs
+        everything unattended except MODIFY. Defence is not a category the gate
+        makes exceptions for, and a model trained only on permitted remediation
+        would learn that hardening is always allowed.
+
+    ``unavailable``
+        An executor that implements no hardening measure at all, so nothing in
+        the permitted catalogue claims to close the gap and the kernel reports
+        that instead of proposing something. The blue-side twin of
+        ``no_coverage``.
+
+    ``fix-none`` is the sixth family and the one that keeps the other five
+    honest. The remediation phase is on, the task asks for the holes to be shut,
+    and the episode produces no hardening verb because there was nothing to
+    remediate: the control saw the attack (``lab-seen``), the detection could
+    not be established either way (``lab-blind``), or nothing in the catalogue
+    covers the technique (``lab-nocover``). Without it the model would learn
+    that being asked to fix something means emitting a fix, which is the
+    defending half of the failure the clean-host family exists to prevent.
+
+    ``failed`` — the sixth state, where the hardening verb itself returns
+    ``ok=False`` — is deliberately absent. The only way to reach it here is to
+    propose a fix with a parameter the adapter rejects, such as a telemetry
+    source this sandbox does not have, and the ``<|act|>`` segment carrying that
+    parameter is supervised. Teaching the model to emit a bad parameter in order
+    to teach it that bad parameters fail is a trade this corpus should not make;
+    the runtime handles the state, and no trajectory asserts it cannot happen.
+    """
+    #: (kind, world, preferred fix, weight). The weights put closure ahead of
+    #: everything else and keep the no-op family large, because between them
+    #: they are the two answers that should be commonest at serving time.
+    flavours: tuple[tuple[str, str, str, int], ...] = (
+        ("fix-closed", "lab-gap", "", 10),
+        ("fix-none", "lab-seen", "", 6),
+        ("fix-ineffective", "lab-gap", "harden.remove_persistence", 5),
+        ("fix-undetermined", "lab-gap", "harden.fix_permissions", 5),
+        ("fix-refused", "lab-fix-denied", "", 4),
+        ("fix-unavailable", "lab-nofix", "", 3),
+    )
+    weights = [w for _k, _w, _f, w in flavours]
+
+    recon = ("enum.host", "enum.privileges", "enum.services",
+             "enum.persistence", "enum.software")
+    assess = ("vuln.weak_permissions", "vuln.credential_exposure",
+              "vuln.patch_gap")
+    red_params: dict[str, dict[str, Any]] = {
+        "exploit.service_permissions": {"service": "acme-agent"},
+        "postex.credential_dump": {"redact": True},
+        "postex.persistence_install": {"mechanism": "cron"},
+    }
+
+    out: list[Scenario] = []
+    for _ in range(count):
+        kind, world, fix, _w = rng.choices(flavours, weights=weights)[0]
+        reds: list[Step] = []
+
+        if kind == "fix-ineffective":
+            # cleanup=False is load-bearing and is not a convenience. The
+            # exploit removes its own entry by default, and a hint pointing at a
+            # line that is already gone is correctly not published — the
+            # deterministic proposer would then fall back to the telemetry
+            # switch and the gap would close. Leaving the entry on disk is what
+            # gives `harden.remove_persistence` something real to remove.
+            reds.append(Step("postex.persistence_install",
+                             {"mechanism": "cron", "cleanup": False}))
+        elif kind == "fix-undetermined":
+            reds.append(Step("exploit.service_permissions",
+                             {"service": "acme-agent"}))
+        elif kind == "fix-none" and rng.random() < 0.45:
+            world = rng.choice(("lab-blind", "lab-nocover"))
+            if world == "lab-nocover":
+                reds.append(Step("postex.exfil_probe",
+                                 {"bytes": rng.choice((1048576, 262144)),
+                                  "sink": "sandbox-collector"}))
+
+        if not reds or (kind in ("fix-ineffective", "fix-undetermined")
+                        and rng.random() < 0.35):
+            # A second technique, after the one this family is built around.
+            # Ordering is the whole reason it comes second: the first gap's fix
+            # changes the host, and a telemetry switch flipped for an earlier
+            # gap would make the later re-attack visible — which is true, is
+            # recorded as such, and would silently take this family's intended
+            # outcome away if the order were reversed.
+            spare = [r for r in red_params if r not in {s.verb for s in reds}]
+            picked = rng.sample(spare, rng.choices(
+                (1, 2), weights=(74, 26))[0] if not reds else 1)
+            reds += [Step(r, red_params[r]) for r in picked]
+
+        # Kept short on purpose. Each gap now costs four more turns than it
+        # used to — the fix, the re-attack, the second probe — and every one of
+        # them is an act/obs pair competing for the same 1024-token window that
+        # the finding, which carries the remediation outcome, sits at the end
+        # of. The recon that would have opened the episode is what gives way.
+        lead: list[Step | str] = []
+        budget = max(0, rng.randint(0, 3) - len(reds))
+        if budget:
+            lead += rng.sample(recon, min(budget, rng.randint(0, 2)))
+            if len(lead) < budget:
+                lead.append(rng.choice(assess))
+
+        steps = tuple(lead + reds)
+        task = _phrase(rng, [s.verb if isinstance(s, Step) else s
+                             for s in steps]) + rng.choice(_REMEDIATE_ASK)
+        out.append(Scenario(
+            task=_dress(rng, task),
+            steps=steps,
+            world=world,
+            max_turns=len(steps) * 2 + 6,
+            # Never shuffled. The red verb this family is built around has to
+            # run first, and a reordering that put the other one ahead of it
+            # would change the outcome without changing the label.
+            shuffle=False,
+            kind=kind,
+            remediate=True,
+            fix=fix,
+        ))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # generation
 # ---------------------------------------------------------------------------
 
 def build_scenarios(rng: random.Random, *, include_lab: bool = True,
                     observe: int = 1000, refusals: int = 420,
-                    lab: int = 420, clean: int = 320) -> list[Scenario]:
+                    lab: int = 420, clean: int = 320,
+                    remediate: int = 260) -> list[Scenario]:
     """Assemble the full scenario list, hand-written and derived.
 
     Shuffled once at the end so that the numbered output files interleave the
@@ -1531,6 +1934,7 @@ def build_scenarios(rng: random.Random, *, include_lab: bool = True,
     if include_lab:
         scenarios += _derived_lab(rng, lab)
         scenarios += _derived_clean(rng, clean)
+        scenarios += _derived_remediation(rng, remediate)
     else:
         scenarios = [s for s in scenarios if not s.world.startswith("lab")]
     rng.shuffle(scenarios)
@@ -1841,7 +2245,7 @@ def generate_trajectories(
     stats: dict[str, Any] | None = None,
     scenarios: Sequence[Scenario] | None = None,
     observe: int = 1000, refusals: int = 420, lab: int = 420, clean: int = 320,
-    host_executor: Any = None,
+    remediate: int = 260, host_executor: Any = None,
 ) -> Iterator[str]:
     """Yield rendered trajectory documents, each from a real agent run.
 
@@ -1889,6 +2293,10 @@ def generate_trajectories(
     counts.setdefault("world", {})
     counts.setdefault("rule", {})
     counts.setdefault("finding", {})
+    #: The remediation states the sandbox actually produced, not the ones the
+    #: families were built to produce. The two are compared below.
+    counts.setdefault("remediation", {})
+    counts.setdefault("fix_mismatch", {})
     counts.setdefault("duplicates", 0)
     counts.setdefault("errors", {})
 
@@ -1908,7 +2316,7 @@ def generate_trajectories(
 
     plan = list(scenarios) if scenarios is not None else build_scenarios(
         rng, include_lab=include_lab, observe=observe, refusals=refusals,
-        lab=lab, clean=clean)
+        lab=lab, clean=clean, remediate=remediate)
     counts["scenarios"] = len(plan)
 
     seen: set[bytes] = set()
@@ -1928,8 +2336,9 @@ def generate_trajectories(
             gate, executor = world.open()
             try:
                 kernel = Kernel(gate, executor,
-                                _PlanChooser(steps, rng),
-                                max_turns=scenario.max_turns)
+                                _PlanChooser(steps, rng, scenario.fix),
+                                max_turns=scenario.max_turns,
+                                remediate=scenario.remediate)
                 episode = kernel.run(tasks[rep], target="127.0.0.1")
             except Exception as exc:                        # noqa: BLE001
                 # A scenario that cannot run is a bug in the scenario, not a
@@ -1969,9 +2378,36 @@ def generate_trajectories(
                 if turn.refused:
                     rule = turn.decision.rule
                     counts["rule"][rule] = counts["rule"].get(rule, 0) + 1
+            states: list[str] = []
             for finding in episode.findings:
                 counts["finding"][finding.kind] = (
                     counts["finding"].get(finding.kind, 0) + 1)
+                if finding.remediation is not None:
+                    state = finding.remediation.state
+                    states.append(state)
+                    counts["remediation"][state] = (
+                        counts["remediation"].get(state, 0) + 1)
+
+            # What the family claimed against what the sandbox did. The
+            # construction is indirect — a world, a red verb and a preferred
+            # fix, with the outcome decided by a real chmod or a real gate
+            # ruling — so a change in the adapter or the policy could turn one
+            # family into a second copy of another and nothing downstream would
+            # notice: the corpus would still be well formed, every action would
+            # still bind, and the state distribution the whole family exists to
+            # spread would have quietly collapsed. Recorded here and printed by
+            # the CLI, because a wrong number nobody notices is worse than a
+            # crash.
+            if scenario.kind in _INTENDED_STATE:
+                want = _INTENDED_STATE[scenario.kind]
+                got = sorted(set(states))
+                ok = (not states) if want is None else (want in states)
+                if not ok:
+                    label = (f"{scenario.kind} wanted "
+                             f"{want or 'no remediation'}, got "
+                             f"{','.join(got) or 'none'}")
+                    counts["fix_mismatch"][label] = (
+                        counts["fix_mismatch"].get(label, 0) + 1)
 
             yield text
 
@@ -2061,6 +2497,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--refusals", type=int, default=420)
     p.add_argument("--lab", type=int, default=420)
     p.add_argument("--clean", type=int, default=320)
+    p.add_argument("--remediate", type=int, default=260,
+                   help="episodes that run the kernel's remediation phase: the "
+                        "fix, the re-attack that tests it, and the outcome. "
+                        "0 reproduces a corpus in which the model has never "
+                        "seen a hardening verb chosen")
     args = p.parse_args(argv)
 
     host_executor = None
@@ -2075,7 +2516,8 @@ def main(argv: list[str] | None = None) -> int:
         repeats=args.repeats, seed=args.seed, verbose=True,
         include_lab=not args.no_lab, lab_root=args.lab_root, stats=stats,
         observe=args.observe, refusals=args.refusals, lab=args.lab,
-        clean=args.clean, host_executor=host_executor)
+        clean=args.clean, remediate=args.remediate,
+        host_executor=host_executor)
 
     if args.out.suffix == ".jsonl":
         n, chars = _write_jsonl(args.out, texts)
@@ -2085,7 +2527,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{n:,} trajectories, {chars/1e6:.2f}M chars -> {args.out}")
     print(f"  scenarios   {stats.get('scenarios', 0):,} × {args.repeats} repeats"
           f"  ({stats.get('duplicates', 0):,} identical episodes dropped)")
-    for label in ("kind", "finding", "rule"):
+    for label in ("kind", "finding", "rule", "remediation"):
         rows = stats.get(label) or {}
         if rows:
             body = "  ".join(f"{k}={v:,}" for k, v in sorted(rows.items()))
@@ -2093,6 +2535,13 @@ def main(argv: list[str] | None = None) -> int:
     if stats.get("errors"):
         for name, count in sorted(stats["errors"].items()):
             print(f"  ERROR       {count:,}x {name}")
+    # Printed as loudly as an exception and separately from `errors`, because
+    # nothing raised: every one of these episodes ran, rendered and was written.
+    # A family that stopped producing the outcome it exists for is a corpus that
+    # has lost a state without losing a document, which is the failure mode that
+    # only shows up two checkpoints later.
+    for label, count in sorted(stats.get("fix_mismatch", {}).items()):
+        print(f"  MISMATCH    {count:,}x {label}")
     return 0
 
 

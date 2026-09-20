@@ -100,6 +100,25 @@ def _cmd_coverage(args: argparse.Namespace) -> int:
             "listed so that a report can say 'we did not test for this' rather "
             "than implying the technique was covered."
         )
+
+    # The second axis, and the one that was invisible until the remediation
+    # phase existed. "Would anything notice this?" and "could we do anything
+    # about it?" are different questions, and a catalogue can answer the first
+    # for a technique it has no fix for — in which case the loop finds the gap,
+    # proves it, and then reports that nothing claims to close it. Better seen
+    # before an exercise than inferred from an empty remediation column after.
+    fixes = REGISTRY.remediation()
+    fixable = {k: v for k, v in fixes.items() if v}
+    unfixable = sorted(k for k, v in fixes.items() if not v)
+    print("\nremediation coverage of the red catalogue\n")
+    for verb_id in sorted(fixable):
+        print(f"  fixable   {verb_id}")
+        print(f"            → {', '.join(fixable[verb_id])}")
+    for verb_id in unfixable:
+        print(f"  NO FIX    {verb_id}")
+        print("            nothing in this catalogue claims to close it")
+    print(f"\n{len(fixable)}/{total} red verbs have a hardening measure; "
+          f"{len(unfixable)} without.")
     return 0
 
 
