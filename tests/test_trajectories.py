@@ -40,6 +40,14 @@ the blue one and with worse consequences, because the output of that mistake is
 a hole reported fixed. :class:`TestRemediationFollowsEvidence` reads the claim
 out of the finding and looks for the actions behind it in the same document.
 
+**A state that covers several situations is reached by more than one of them.**
+Counting states is not enough. ``undetermined`` has five routes through the
+kernel and this corpus was once measured reaching one of them in every single
+document — a distribution that looked healthy, passed every assertion above, and
+would have taught the model that the word means "the fix overshot" and nothing
+else. What a model can learn is what the *text* distinguishes, so the route is
+read out of the finding's prose and the routes are counted, not the labels.
+
 The host adapter is stubbed throughout. Shelling out to ``ps``, ``launchctl``
 or PowerShell three times over in CI would be slow, flaky and would test the
 adapters rather than this module. The sandbox worlds are *not* stubbed: they
@@ -371,6 +379,104 @@ class TestRemediationFollowsEvidence:
                 "anyway")
             checked += 1
         assert checked, "no refused remediation was generated to check"
+
+    #: How an ``undetermined`` detail is sorted into the branch of
+    #: ``Kernel._close_gap`` that produced it. Matched on a phrase from the
+    #: kernel's own wording rather than on the verb or the family name, because
+    #: the question is what the *model* can tell apart: the family label never
+    #: reaches the trajectory, and two routes that read identically in the text
+    #: are one route as far as anything trained on it is concerned.
+    _UNDETERMINED_ROUTES = {
+        "gate refused the re-attack": "the proof was not authorised",
+        "no longer succeeds": "the technique stopped working",
+        "already reporting activity": "the control was not silent first",
+        "could not establish whether it fired": "the second probe could not tell",
+        "aimed differently": "the two readings asked different questions",
+    }
+
+    def test_undetermined_is_reached_by_more_than_one_route(self, corpus):
+        """One state, several situations — and the text has to show which.
+
+        ``undetermined`` is the widest state the kernel has: five branches of
+        :meth:`whetstone.kernel.Kernel._close_gap` end on it, and they mean
+        different things to an operator. "The fix removed the weakness so the
+        attack no longer runs" is good news that happens not to be closure. "The
+        gate refused the re-attack" is an authorisation problem. "The control
+        was already reporting this kind of activity" is a confound. The state
+        alone deliberately does not distinguish them; the ``detail`` does.
+
+        This corpus was measured, once, reaching exactly one of those branches:
+        every document carrying the state said the technique no longer
+        succeeded. Nothing was wrong with any of them, and the state distribution
+        looked healthy — ``undetermined`` was well represented and the family
+        that produced it did what it claimed. But a model reading that corpus
+        learns the word as a synonym for a fix that overshot, and the situation
+        it most needs the word for, *the loop could not check*, is one it has
+        never seen described. A single-route state is a collapsed state that
+        counts as present.
+
+        So the assertion is on routes rather than on the state, and it is the
+        reason :class:`training.trajectories._ConfirmOncePerVerb` exists.
+        """
+        texts, _ = corpus
+        seen: set[str] = set()
+        unsorted = 0
+        for _text, finding in _remediated(texts):
+            fix = finding["remediation"]
+            if fix["state"] != "undetermined":
+                continue
+            for marker, route in self._UNDETERMINED_ROUTES.items():
+                if marker in fix["detail"]:
+                    seen.add(route)
+                    break
+            else:
+                unsorted += 1
+        assert not unsorted, (
+            f"{unsorted} undetermined findings are phrased in a way this test "
+            "does not recognise; either the kernel grew a route or its wording "
+            "moved, and both need looking at rather than skipping")
+        assert len(seen) >= 2, (
+            f"every undetermined finding in the corpus is {seen}; the state "
+            "covers several situations and a model trained on one of them will "
+            "produce that one for all of them")
+
+    def test_a_denied_re_attack_leaves_the_claim_open(self, corpus):
+        """The gate stopped the proof, so the document must not assert one.
+
+        The narrow risk this pins is the one the whole phase is built around,
+        arriving by a new road. A fix ran, it reported success, and the
+        verification did not happen — which is the exact set of facts that
+        reads, to anything summarising it carelessly, like a successful
+        remediation. The kernel calls it ``undetermined``; what this checks is
+        that the trajectory backs that up, by showing the technique proposed a
+        second time and stopped, rather than carried out a second time and
+        seen.
+
+        ``_verbs`` against ``_executed`` is the whole test: the technique is
+        proposed twice and executed once. A document where it was executed twice
+        would mean the loop attacked a host to verify a fix and then mislabelled
+        what it found; a document where it was proposed once would mean the
+        state was reached without the kernel ever trying.
+        """
+        texts, _ = corpus
+        checked = 0
+        for text, finding in _remediated(texts):
+            fix = finding["remediation"]
+            if "gate refused the re-attack" not in fix["detail"]:
+                continue
+            assert fix["state"] == "undetermined", fix
+            red = finding["produced_by"]
+            assert _verbs(text).count(red) >= 2, (
+                f"{red} is reported to have had its re-attack refused, but the "
+                "second proposal is not in the document")
+            assert _executed(text).count(red) == 1, (
+                f"{red} ran twice in a trajectory that says the gate stopped "
+                "the second run")
+            assert "confirm.declined" in text
+            checked += 1
+        assert checked, (
+            "no re-attack was ever refused; the lab-reattack-denied world is "
+            "the only source of that route and it produced nothing")
 
     def test_a_host_is_never_changed_without_a_gap_behind_it(self, corpus):
         """No fix *carried out* without something to fix.

@@ -136,7 +136,7 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 import whetstone.verbs  # noqa: F401  (registers and freezes the catalogue)
 from whetstone.actions import (REGISTRY, Action, Intent, Observation,
                                SchemaError, TargetKind, Verb)
-from whetstone.gate import (REFUSE_UNATTENDED, Gate, always_confirm,
+from whetstone.gate import (REFUSE_UNATTENDED, Decision, Gate, always_confirm,
                             null_engagement)
 from whetstone.gate.engagement import Authorization, Engagement, Scope
 from whetstone.kernel import Kernel
@@ -911,6 +911,45 @@ _FUTURE_WINDOW = (datetime(2099, 6, 1, tzinfo=timezone.utc),
                   datetime(2099, 6, 8, tzinfo=timezone.utc))
 
 
+class _ConfirmOncePerVerb:
+    """A human who approves a technique the first time and declines a repeat.
+
+    A confirmer is the seam where a person stands, and the two that existed
+    before this one are the two degenerate people: :data:`always_confirm` says
+    yes to everything and :data:`REFUSE_UNATTENDED` is nobody at the keyboard at
+    all. Neither can produce the ruling this class exists for — a run that was
+    authorised and a *re*-run of the same technique that was not.
+
+    That person is not a contrivance. "You may execute it once so we can see
+    whether the control notices" is the ordinary shape of an approval for a
+    production box, and the operator who granted it has every reason to answer
+    no when the same exploit comes back a second time. The kernel's verification
+    step is exactly that second proposal, and what it gets here is a real
+    :func:`~whetstone.gate.policy.decide` ruling on a real CONFIRM — the gate is
+    not bypassed, patched or told the answer; it asks, and this answers.
+
+    State is per episode, which is why :class:`_LabWorld` takes a factory rather
+    than an instance. One of these shared across fourteen thousand episodes
+    would decline every attack after the first episode's, and the corpus would
+    quietly become a refusal family.
+
+    Only the verb id is remembered, not the parameters. The question a careful
+    operator is answering is "do I let you run this technique again", and an
+    exploit re-aimed at a second service is the same answer; matching on
+    parameters would let a repeat through on a difference the operator does not
+    care about.
+    """
+
+    def __init__(self) -> None:
+        self._seen: set[str] = set()
+
+    def __call__(self, verb: Verb, action: Action, decision: Decision) -> bool:
+        if action.verb_id in self._seen:
+            return False
+        self._seen.add(action.verb_id)
+        return True
+
+
 class _World:
     """An engagement and an executor, and the gate that joins them.
 
@@ -954,18 +993,26 @@ class _LabWorld(_World):
     def __init__(self, name: str, engagement: Engagement, *, root: Path,
                  target_factory: Callable[[], type], telemetry: bool,
                  confirmer: Callable[..., bool] = always_confirm,
+                 confirmer_factory: Callable[[], Callable[..., bool]] | None = None,
                  hide: Sequence[str] = ()) -> None:
         super().__init__(name, engagement, None, confirmer=confirmer)
         self._root = root
         self._factory = target_factory
         self._telemetry = telemetry
         self._hide = tuple(hide)
+        #: Built fresh per episode when given, for a confirmer that remembers
+        #: what it has already said yes to. The sandbox is rebuilt every episode
+        #: for the same reason one turn's evidence must not answer another
+        #: episode's question, and a person's decisions are evidence.
+        self._confirmer_factory = confirmer_factory
 
     def open(self) -> tuple[Gate, Any]:
         shutil.rmtree(self._root, ignore_errors=True)
         self._root.mkdir(parents=True, exist_ok=True)
         target = self._factory()(telemetry=self._telemetry, root=self._root)
-        gate = Gate(self.engagement, registry=REGISTRY, confirmer=self.confirmer)
+        confirmer = (self._confirmer_factory() if self._confirmer_factory
+                     else self.confirmer)
+        gate = Gate(self.engagement, registry=REGISTRY, confirmer=confirmer)
         return gate, _LabExecutor(target, self._hide)
 
     def close(self, executor: Any) -> None:
@@ -1144,6 +1191,27 @@ def _lab_worlds(root: Path) -> dict[str, _World]:
                        unattended=frozenset({Intent.OBSERVE, Intent.EXECUTE})),
             root=root / "fixdenied", target_factory=vulnerable,
             telemetry=False, confirmer=REFUSE_UNATTENDED),
+        # The fix is permitted and the *proof* is not. Hardening runs
+        # unattended here; EXECUTE needs a person, and the person approves each
+        # technique once and declines the repeat — see `_ConfirmOncePerVerb`.
+        # So the attack runs, the gap is found, the fix is applied, the control
+        # is read and found silent, and then the re-attack that would have
+        # settled the question is denied.
+        #
+        # This is the one world in the corpus where the loop does everything
+        # right and still cannot say a hole is shut, and it is worth having
+        # because `undetermined` otherwise means one thing in the data and five
+        # in the kernel. Before it, every `undetermined` in the corpus was the
+        # chmod family's "the technique no longer succeeds" — a model reading
+        # the corpus would learn that the word describes a fix that worked *too*
+        # well, which is the cheerful half of a state that also has to cover
+        # being unable to check at all.
+        "lab-reattack-denied": _LabWorld(
+            "lab-reattack-denied",
+            engagement("sandbox purple exercise, one run per technique",
+                       unattended=frozenset({Intent.OBSERVE, Intent.MODIFY})),
+            root=root / "reattack", target_factory=vulnerable,
+            telemetry=False, confirmer_factory=_ConfirmOncePerVerb),
         # Nothing to fix with. The executor reports no `harden.*` verb, so the
         # permitted catalogue contains no declared remediation for the
         # technique and the kernel says so instead of proposing something.
@@ -1741,6 +1809,13 @@ _INTENDED_STATE: dict[str, str | None] = {
     "fix-closed": "closed",
     "fix-ineffective": "ineffective",
     "fix-undetermined": "undetermined",
+    # Two families land on `undetermined`, by two different routes through
+    # `_close_gap`, and that is the point of the second one rather than an
+    # oversight — see the docstring below. This table checks the state; the
+    # routes are checked in `tests/test_trajectories.py`, because a state
+    # reached one way in every document is a state the model has learnt one
+    # meaning of.
+    "fix-reattack-denied": "undetermined",
     "fix-refused": "refused",
     "fix-unavailable": "unavailable",
     "fix-none": None,
@@ -1785,13 +1860,41 @@ def _derived_remediation(rng: random.Random, count: int = 260) -> list[Scenario]
         the claim is wrong, and a model that has not seen one has no reason to
         believe verification is worth the turns.
 
-    ``undetermined``
+    ``undetermined`` (the fix worked too well)
         ``harden.fix_permissions`` against the writable-binary gap. The chmod is
         real and it works: the re-attack now fails, because the write bit the
         technique depended on is gone. That is a good outcome and it is *not*
         closure — the gap was a statement about the control, and a technique
         that cannot run tells you nothing about what would have been logged. The
         distinction is subtle enough that it has to be in the data.
+
+    ``undetermined`` (the proof was not authorised)
+        The second family reaching the same state, deliberately, because
+        ``undetermined`` has five routes through :meth:`Kernel._close_gap` and
+        this corpus was measured reaching exactly one of them: every one of the
+        three hundred documents carrying the state said *the technique no longer
+        succeeds*. A model reading that learns the word as a description of a
+        fix that worked too well, and will not produce it for the case it is
+        needed most — the loop being unable to check.
+
+        So: an engagement that runs hardening unattended and asks a person
+        before every EXECUTE, and a person who approves a technique once and
+        declines the repeat (:class:`_ConfirmOncePerVerb`). The gap is real, the
+        fix is applied, the control is read and is silent, and the re-attack
+        that would have settled it is refused by the gate. Nothing is closed and
+        nothing failed; the question is open, and the detail says which of the
+        two it is.
+
+        The other three routes — the control already reporting activity of this
+        kind before the re-attack, the second probe failing to answer, a hit the
+        probe could not attribute — are *not* reachable here, and it is worth
+        writing down why rather than leaving the gap looking like laziness. Each
+        needs either two gaps sharing one detection verb or a probe that breaks
+        between the first reading and the second. The sandbox implements three
+        red verbs and they have three different declared detections, so no two
+        gaps in one episode can confound each other; and a log that stops being
+        readable halfway through an episode is a state this module would have to
+        manufacture. Manufacturing it is the one thing this file does not do.
 
     ``refused``
         The gate denies the hardening action under an engagement that runs
@@ -1831,6 +1934,11 @@ def _derived_remediation(rng: random.Random, count: int = 260) -> list[Scenario]
         ("fix-ineffective", "lab-gap", "harden.remove_persistence", 5),
         ("fix-undetermined", "lab-gap", "harden.fix_permissions", 5),
         ("fix-refused", "lab-fix-denied", "", 4),
+        # The second route to `undetermined`, and the smallest family that can
+        # carry it. It takes no weight from the first: the chmod route is the
+        # commoner situation in real use, and this one only has to be present
+        # often enough that the state is not a synonym for it.
+        ("fix-reattack-denied", "lab-reattack-denied", "", 3),
         ("fix-unavailable", "lab-nofix", "", 3),
     )
     weights = [w for _k, _w, _f, w in flavours]

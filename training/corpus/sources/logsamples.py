@@ -207,8 +207,9 @@ _LFS_URL = f"https://media.githubusercontent.com/media/{_REPO}/{_REF}/{{path}}"
 _LICENSE_PATH = "LICENSE"
 
 #: How much of each file to take. Large enough that a chatty log still yields a
-#: dozen distinct event families after deduplication, small enough that 250 of
-#: them cost about 60 MB over the wire once, ever.
+#: dozen distinct event families after deduplication, small enough to be cheap:
+#: the 238 files this selects come to 19 MB on disk, once, ever, because most
+#: datasets upstream are smaller than the slice and only the big ones are cut.
 _SLICE_BYTES = 256 * 1024
 
 #: Headroom over the requested range, and the guard described in *Trap 2*: a
@@ -244,9 +245,14 @@ _INDEX = "tree.json"
 #: request and there is only one "family" to be had.
 _SHAPE_PASSES = (5, 15, 40)
 
-#: A record longer than this in lines is a parser that has lost its place, not a
-#: record. The longest real one measured here is a 4104 script block at 90 lines.
-_MAX_RECORD_LINES = 400
+#: A runaway guard for the two accumulating splitters, and nothing more: an XML
+#: file with no ``</Event>`` or a JSON file that never parses would otherwise
+#: grow one "record" until the slice ran out. It has to sit well clear of real
+#: records, which get very long — the largest in the fetched cache is a single
+#: PowerShell 4104 event whose ``ScriptBlockText`` is a 544-line script. That
+#: record is not noise, it is some of the best text in the source, so the bound
+#: is generous and only catches a splitter that has genuinely lost its place.
+_MAX_RECORD_LINES = 2_000
 #: Per file, across all families, before chunking into documents.
 _MAX_FILE_CHARS = 60_000
 #: One document. Twenty-odd Windows XML records, or a few hundred auditd lines.
@@ -272,12 +278,14 @@ _MIN_TREE_ENTRIES = 1_500
 class _Family:
     """One telemetry family, and how many files of it to take.
 
-    The caps are the whole design of this source. Upstream is wildly uneven —
-    209 ``windows-sysmon.log`` files against three Zeek logs and ten Kubernetes
-    audit captures — and taking files in repository order would produce a corpus
-    that is Sysmon with a rounding error of everything else. The model has to
-    read all of these formats, not the most common one fluently, so breadth is
-    bought explicitly here and the build prints what each family contributed.
+    The caps are the whole design of this source. Upstream is wildly uneven:
+    measured over the index, 434 files match Windows Sysmon and 268 Windows
+    Security, against 8 Zeek logs, 9 Kubernetes audit captures and 2 plain
+    syslog files. Taking files in repository order would produce a corpus that
+    is Sysmon with a rounding error of everything else. The model has to read
+    all of these formats, not the most common one fluently, so breadth is bought
+    explicitly here — a cap the small families never reach and the large ones
+    always do — and the build prints what each family contributed.
     """
 
     name: str
@@ -289,7 +297,7 @@ class _Family:
 
 #: Order is load-bearing: ``sysmon_linux.log`` must be claimed by the Linux
 #: family before the Windows Sysmon pattern reaches it, and ``windows-security``
-#: before the bare ``security\\.log`` fallback.
+#: before the bare ``security.log`` fallback.
 _FAMILIES: tuple[_Family, ...] = (
     _Family("linux-auditd", r"auditd|^audit\.log$", 26),
     _Family("linux-sysmon", r"(sysmon[-_]linux|linux[-_]sysmon)", 12),
@@ -1078,7 +1086,12 @@ def _resolve(path: Path) -> Path:
 
 
 def _documents(path: Path) -> Iterator[Document]:
-    """One to three documents per cached file, in a stable sorted order."""
+    """One or more documents per cached file, in a stable sorted order.
+
+    How many depends on the file: a dataset with four distinct records is one
+    document and a Windows Security capture is five, because the split is by
+    character budget rather than by count.
+    """
     root = _resolve(path)
     files = _slice_files(root)
     if not files:
@@ -1096,9 +1109,9 @@ def _documents(path: Path) -> Iterator[Document]:
             body = file.read_bytes()
         except OSError:
             continue
-        # A byte range can cut a UTF-8 sequence in half; the truncated tail is
-        # dropped with the partial line below, so a lenient decode here costs
-        # nothing and a strict one would throw away the whole file.
+        # A byte range can cut a UTF-8 sequence in half, and the record that
+        # sequence belonged to is dropped by _split anyway, so a lenient decode
+        # here costs nothing and a strict one would throw away the whole file.
         text = body.decode("utf-8", errors="ignore")
         records = _records(text, truncated=len(body) >= _SLICE_BYTES)
         if not records:
@@ -1157,7 +1170,7 @@ SPEC = SourceSpec(
     fetch=_fetch,
     documents=_documents,
     #: Measured: the family caps select 239 files, 238 of which were available,
-    #: and they yield 421 documents and 4.6 MB of text. The floor sits well
+    #: and they yield 427 documents and 4.7 MB of text. The floor sits well
     #: under that because the document count legitimately moves with how chatty
     #: the logs upstream happen to be — a file with four distinct records is one
     #: document and a Sysmon capture is four. What it is here to catch is the

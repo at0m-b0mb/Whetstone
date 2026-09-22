@@ -58,9 +58,11 @@ in :func:`training.corpus.build.balance_report` before arguing: ``by_reg`` and
 the per-document one. A source that mixes registers therefore makes the report
 lie, and the report is the only instrument this project has for the thing it is
 trying to fix. So the choice had to be one label for all of it, and ADVERSARY is
-the honest one: 15.7% of The Hacker Recipes' ``ad/`` characters sit inside 613
-fenced blocks (393 ``bash``, 174 ``powershell``), which is dense enough to feed
-the SHELL gap and nowhere near dense enough to *be* SHELL. What these documents
+the honest one. Measured on what this adapter actually emits, **14.3% of the
+source's characters are inside a fenced block** — 16.3% on the Hacker Recipes
+half, across 613 blocks whose info strings are 393 ``bash`` and 174
+``powershell``, and 10.8% on the BloodHound half. That is dense enough to feed
+the SHELL gap substantially and nowhere near dense enough to *be* SHELL. What these documents
 teach is an ordering — this ACE implies that write, which implies this ticket,
 which is why the next command works — and the commands are the evidence rather
 than the content. The one place this label is a stretch is BloodHound's 38 node
@@ -1219,8 +1221,9 @@ def _walk(root: Path, suffix: str) -> Iterator[tuple[Path, Path]]:
 def _decode(path: Path) -> str | None:
     """Read a page as text with its line endings normalised, or ``None``.
 
-    The line endings are not cosmetic here and this cost an hour. The two
-    upstreams disagree: The Hacker Recipes is checked in with LF and
+    The line endings are not cosmetic here, and the first version of this
+    adapter shipped broken because of them. The two upstreams disagree: The
+    Hacker Recipes is checked in with LF and
     bloodhound-docs with **CRLF**, so every ``.mdx`` in this cache arrives with a
     ``\r`` on the end of every line. Each of this module's line regexes is
     anchored with ``$`` and applied to one line at a time, and ``$`` does not

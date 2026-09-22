@@ -698,6 +698,13 @@ def _ctf101_documents(root: Path) -> Iterator[Document]:
                     Register.ADVERSARY, Side.RED)
 
 
+#: Copyleft grants that can appear INSIDE a permissively or CC-licensed tree.
+#: Matched against document text, not against a path, because the question is
+#: what the document says about itself rather than where it sits.
+_FOREIGN_COPYLEFT = re.compile(
+    r"GNU/?\s*GPL|General Public Licen[cs]e|GNU Lesser|Affero", re.I)
+
+
 def _r2book_documents(root: Path) -> Iterator[Document]:
     """The radare2 book, one document per chapter. SYSTEM/NEUTRAL.
 
@@ -716,6 +723,22 @@ def _r2book_documents(root: Path) -> Iterator[Document]:
     commands; the book takes no side and neither does this label.
     """
     for rel, text in _walk(root, (".md",)):
+        # A repository's own licence does not cover everything inside it, and
+        # this book is the proof: src/refcard/ is Thanat0s' radare2 reference
+        # card, which says on its third line that it is GPL and repeats the
+        # grant in a box below. The book ships CC-BY-SA-4.0 and this SPEC
+        # declares CC-BY-SA-4.0, so emitting that chapter would make the
+        # declaration false for one document — and a licence inventory that is
+        # true of 99.4% of a source is not a licence inventory.
+        #
+        # Filtered on CONTENT rather than on a path list, because the path is
+        # where it happens to live today. `malwareanalysis.py` collects this
+        # same book and caught the same chapter by grepping for copyright
+        # statements instead of trusting the repository; this does the same, so
+        # a chapter vendored in tomorrow is caught on the first build rather
+        # than on the first audit.
+        if _FOREIGN_COPYLEFT.search(text):
+            continue
         yield _emit(text, f"radare2book/{rel.as_posix()}",
                     Register.SYSTEM, Side.NEUTRAL)
 

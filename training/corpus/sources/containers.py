@@ -1,15 +1,21 @@
 """Containers and Kubernetes — the platform the corpus had never seen.
 
-Nothing in the other twenty-nine sources knows what a Pod is. ``manpages`` and
-``kerneldocs`` describe the machine a container is carved out of, ``sigma`` and
-``elastic`` describe hosts and Windows event logs, ``metasploit`` and ``capec``
-describe services reachable over a network. None of them contains the word
-``kubectl``, a ``securityContext``, a service-account token, a hostPath mount or
-an admission webhook. That is a hole where most of the industry's compute now
-runs, and it shows up in the two places this project measures: the model cannot
-tokenise the vocabulary, and it cannot reason about the one privilege boundary —
-container to host — that has no analogue in the single-machine material the
-corpus is otherwise made of.
+The corpus had heard of Kubernetes and had never been taught it. Counted across
+all twenty-nine existing sources, **382 documents and 2.05 MB mention it at all
+— 0.51% of a 398 MB corpus** — and the shape of that sliver is the argument for
+this one. 130 of those documents are Elastic detection rules and 79 are GitHub
+advisories, which are DETECTION and ADVISORY, the two registers already at their
+caps. 59 are ``tldr`` pages: one-line ``kubectl`` invocations stripped of
+everything around them. 26 are ATT&CK's Containers matrix, which names the
+behaviours without showing one. Nothing anywhere states how RBAC binds a subject
+to a verb, what a service-account token is mounted at, which flag turns off
+kubelet anonymous authentication, or what a Pod manifest looks like.
+
+So the model can recognise that a rule fired on a container and cannot reason
+about the privilege boundary the rule exists to protect — container to host — a
+boundary with no analogue in the single-machine material the rest of the corpus
+is made of. ``manpages`` and ``kerneldocs`` describe the machine a container is
+carved out of; none of them describes the thing doing the carving.
 
 **Why this source is shaped the way it is.** SHELL is the corpus's biggest gap,
 8.9% against a 26% target, and ``kubectl`` is a command line. So the selection
@@ -61,12 +67,12 @@ because that is the text the tokenizer will see. :data:`_SHELL_SHARE` and
 :data:`_CONFIG_SHARE` are the two thresholds and they are the only tunable
 things in the classification.
 
-Measured over the current upstreams — 1,205 documents, 7.5 MB — it lands at 79%
-PROSE, 14% SYSTEM, 6% SHELL and 1% ADVERSARY, and that result is worth stating
+Measured over the current upstreams — 1,204 documents, 7.5 MB — it lands at 73%
+PROSE, 20% SYSTEM, 6% SHELL and 1% ADVERSARY, and that result is worth stating
 plainly rather than dressing up. Kubernetes documentation *is* mostly
 explanation in sentences; the commands are the smaller part of it. PROSE is the
 register this corpus is most starved of in relative terms — 1.8% against a 9%
-target — so 5.9 MB of it is the largest single thing this source contributes,
+target — so 5.5 MB of it is the largest single thing this source contributes,
 and it is also a large single-topic injection into a register that currently
 holds about 7 MB. That is a real judgement call and it belongs in the open: the
 alternative was to reclassify concept pages as SYSTEM to look more balanced,
@@ -172,6 +178,27 @@ collapsed too without this module knowing that ``kubeadm`` exists. The corpus-
 wide dedup in ``build.py`` cannot see this at all: the pages differ, only a
 section inside them repeats.
 
+**Trap: a shortcode that looks up its own arguments.** ``{{< feature-state
+feature_gate_name="InPlacePodVerticalScaling" >}}`` carries neither a version
+nor a maturity level: the site reads both out of the named gate's own page,
+whose front matter holds a ``stages`` list ending in the current one. Rendered
+from the call alone it produces ``FEATURE STATE: Kubernetes []`` — a line
+shaped exactly like a statement of fact that states nothing — **265 times**.
+:func:`_feature_gates` indexes those pages first, which costs nothing because
+they are already in the cache as documents in their own right, and
+:func:`_feature_line` assembles the line from the parts that exist rather than
+from a template with holes in it. All 452 feature-state lines in the output are
+now well formed; before, three in five were not.
+
+**Trap: 135 pages that never say what they document.** The ``kubeadm``
+reference is generated as *partials* — no front matter, no heading, straight
+into "### Synopsis" and a flag table. As documents they describe a command and
+never name it, so the single most important token on the page is the one that
+is missing, and a corpus sample of one looks perfectly healthy. The generator's
+filename is the command (``kubeadm_reset_phase.md``), so
+:func:`_generated_title` restores it, and only under a ``generated/`` directory,
+where that convention is guaranteed.
+
 **Trap: near-identical manifests.** ``badPods`` ships each of its eight Pod
 classes as eight Kubernetes workload kinds — Deployment, DaemonSet, CronJob,
 Job, ReplicaSet, ReplicationController, StatefulSet and bare Pod — times two
@@ -192,6 +219,15 @@ no such limit, arrives in seventeen seconds, and is deleted as soon as the
 filtered tree is extracted. :func:`_fetch` passes an explicit ``max_bytes``
 because the archive is larger than :data:`~training.corpus.net.MAX_DOWNLOAD_BYTES`,
 and says so at the call site, which is what that parameter exists for.
+
+**Every one of those traps was found by looking at the output, not by reading
+the input.** The missing example manifests, the version splices left inside
+shell commands, the repeated flag table, the empty feature-state lines, the
+untitled kubeadm partials — each was a counter or a scan over the finished
+documents, and the first document this source ever emitted was
+``content/en/docs/test.md``: the site's own rendering smoke test, twelve
+kilobytes of *lorem ipsum*. A document count says nothing about whether a corpus
+is worth training on.
 
 **Licensing.** Four LICENSE files were read in full; each is copied into the
 cache beside the tree it covers.
@@ -224,6 +260,25 @@ further in: the repository licence was right and the *content* licence was not.
 container attack technique documentation on the public web — is CC BY-NC-SA 4.0
 as well, confirmed by reading its ``LICENSE``, whose first line is the
 Attribution-NonCommercial-ShareAlike legal code. Not usable.
+
+**What was rejected for register, and what was already here.** Unique text is
+the scarcest thing a corpus has, so two otherwise good upstreams were left out
+on arithmetic rather than on licence. ``falcosecurity/rules`` (Apache-2.0) is
+the container runtime's detection language and would be a fine source — for a
+corpus whose DETECTION register was not already 20.9% against a 13% target;
+``aquasecurity/trivy-checks`` is the same answer for the same reason. ``peirates``
+is Kubernetes attack tooling and is GPL-2.0, which this source's permissive mix
+does not want to inherit; ``cdk-team/CDK`` is Apache-2.0 and is a Go binary with
+four markdown files, none of them worth a fetch. The NSA/CISA Kubernetes
+Hardening Guidance is a US Government work and therefore public domain (17 USC
+105), and it is a PDF this package has no reader for — it is the one rejection
+here worth revisiting.
+
+And what is already in the corpus was checked rather than assumed: the 59
+``tldr`` ``kubectl`` pages, Elastic's Kubernetes rules, Nuclei's misconfiguration
+templates and the eleven Atomic Red Team container tests all stay where they
+are. This source does not re-render any of them, and the duplicate check in
+:func:`_documents` would catch it if it did.
 
 And the material this source would most like to have is already refused
 elsewhere in this package. ``swisskyrepo/PayloadsAllTheThings`` has pages named
@@ -1011,7 +1066,8 @@ def _fence_versions(text: str, params: dict[str, str]) -> str:
 
 
 def _shortcodes(text: str, examples: Path, counts: dict[str, int],
-                missing: list[str], params: dict[str, str]) -> str:
+                missing: list[str], params: dict[str, str],
+                gates: dict[str, str]) -> str:
     """Rewrite one prose segment's Hugo shortcodes into plain text.
 
     Unknown shortcodes lose their tags and keep whatever was between them,
@@ -1041,10 +1097,11 @@ def _shortcodes(text: str, examples: Path, counts: dict[str, int],
         if name == "glossary_definition":
             return ""
         if name in ("feature-state", "feature-state-validation"):
-            version = named.get("for_k8s_version", "")
-            state = named.get("state", "")
-            label = f"FEATURE STATE: Kubernetes {version} [{state}]"
-            return label.replace("Kubernetes  ", "Kubernetes ").strip()
+            gate = named.get("feature_gate_name", "").strip()
+            if gate:
+                return gates.get(gate, "")
+            return _feature_line(named.get("for_k8s_version", ""),
+                                 named.get("state", ""))
         if name == "heading":
             key = (positional[0] if positional else "").lower()
             return _HEADINGS.get(key, key.title())
@@ -1206,6 +1263,10 @@ def _dehtml(text: str) -> str:
 
 _FRONT = re.compile(r"\A---\n(.*?)\n---\s*\n", re.DOTALL)
 
+#: ``content_type`` values that mean the page is generated reference rather
+#: than writing. Upstream's own vocabulary, taken as given.
+_REFERENCE_TYPES = frozenset({"tool-reference", "reference", "feature_gate"})
+
 
 def _front_matter(raw: str) -> tuple[dict, str]:
     """Split YAML front matter from the body.
@@ -1225,9 +1286,84 @@ def _front_matter(raw: str) -> tuple[dict, str]:
     return (parsed if isinstance(parsed, dict) else {}), raw[match.end():]
 
 
+def _feature_gates(docs: Path) -> dict[str, str]:
+    """Map each feature gate to the line the site renders for it.
+
+    ``{{< feature-state feature_gate_name="InPlacePodVerticalScaling" >}}`` is
+    the newer form of the shortcode, and the version and maturity it displays
+    are not in the call — the site looks them up in the gate's own page, whose
+    front matter carries a ``stages`` list ending in the current one. Rendered
+    without that lookup the shortcode produces ``FEATURE STATE: Kubernetes []``,
+    and it does so **265 times**: a line that appears to state a fact and states
+    nothing, repeated until a model would learn the shape of it.
+
+    So the gate pages are read first — they are already in the cache, because
+    they are documents in their own right — and the newest stage wins, which is
+    what the site does.
+    """
+    index: dict[str, str] = {}
+    gates = docs / "reference" / "command-line-tools-reference" / "feature-gates"
+    if not gates.is_dir():
+        return index
+    for path in _walk(gates):
+        if path.suffix.lower() != ".md":
+            continue
+        raw = _read(path)
+        if raw is None:
+            continue
+        front, _ = _front_matter(raw)
+        name = str(front.get("title") or path.stem).strip()
+        stages = front.get("stages")
+        if not name or not isinstance(stages, list) or not stages:
+            continue
+        newest = stages[-1]
+        if not isinstance(newest, dict):
+            continue
+        stage = str(newest.get("stage", "")).strip()
+        version = str(newest.get("fromVersion", "")).strip()
+        index[name] = _feature_line(version, stage)
+    return index
+
+
+def _feature_line(version: str, stage: str) -> str:
+    """``FEATURE STATE: Kubernetes v1.33 [beta]``, or as much of it as is known.
+
+    Assembled from the parts that are present rather than formatted from a
+    template with holes in it. The template version emitted ``Kubernetes []``
+    whenever a call carried neither attribute, which is worse than saying
+    nothing: it is a sentence shaped like a fact.
+    """
+    version = version if not version or version.startswith("v") else f"v{version}"
+    parts = [part for part in (version, f"[{stage}]" if stage else "") if part]
+    return f"FEATURE STATE: Kubernetes {' '.join(parts)}" if parts else ""
+
+
+def _generated_title(relative: str) -> str:
+    """A title for the ``generated/`` fragments, which carry no front matter.
+
+    135 of the cached pages are kubeadm reference *partials*: no front matter,
+    no heading, just "### Synopsis" and a flag table. As documents they say
+    what the command does and never say which command it is — the single most
+    important token on the page is missing, and a corpus sample looks fine
+    because the body is well formed.
+
+    The filename is the command, in the generator's own convention:
+    ``kubeadm_reset_phase.md`` is ``kubeadm reset phase``, and an ``_index.md``
+    takes the name of the directory holding it. Derived only for paths under a
+    ``generated/`` directory, because that is the only place the convention is
+    guaranteed.
+    """
+    if "/generated/" not in f"/{relative}":
+        return ""
+    path = Path(relative)
+    stem = path.parent.name if path.stem == "_index" else path.stem
+    return stem.replace("_", " ").strip()
+
+
 def _render_markdown(raw: str, examples: Path, counts: dict[str, int],
-                     missing: list[str],
-                     params: dict[str, str] | None = None) -> tuple[str, dict]:
+                     missing: list[str], params: dict[str, str] | None = None,
+                     relative: str = "",
+                     gates: dict[str, str] | None = None) -> tuple[str, dict]:
     """Render one Hugo markdown file to plain text. Returns (text, front matter).
 
     Two segmentation passes. The first splits the file so shortcodes and HTML
@@ -1245,11 +1381,12 @@ def _render_markdown(raw: str, examples: Path, counts: dict[str, int],
             rendered.append(_Segment(True, segment.info,
                                      _fence_versions(segment.text, params or {})))
             continue
-        text = _shortcodes(segment.text, examples, counts, missing, params or {})
+        text = _shortcodes(segment.text, examples, counts, missing,
+                           params or {}, gates or {})
         rendered.append(_Segment(False, "", _dehtml(text)))
 
     header: list[str] = []
-    title = str(front.get("title") or "").strip()
+    title = str(front.get("title") or "").strip() or _generated_title(relative)
     if title:
         header.append(f"# {title}")
     description = str(front.get("description") or "").strip()
@@ -1336,14 +1473,24 @@ def _measure(text: str) -> tuple[float, float]:
     return shell / total, config / total
 
 
-def _register(text: str, *, generated: bool, red: bool) -> Register:
+def _register(text: str, *, reference: bool = False, red: bool = False) -> Register:
     """Decide a document's register from its measured surface form.
 
-    ``generated`` is the ``auto_generated: true`` front-matter flag the
-    Kubernetes reference pages carry. It only matters for the ones with no
-    shell in them at all — ``kube-apiserver.md`` is a single enormous flag
-    table with no fenced block anywhere, and without this it would be filed as
-    PROSE, which it very much is not.
+    ``reference`` is the second signal, and it is upstream's rather than this
+    module's: a page carrying ``auto_generated: true``, or a ``content_type``
+    of ``tool-reference``/``reference``/``feature_gate``, or living under a
+    directory the Kubernetes project named ``generated/``, is machine-produced
+    from a component's own help output. It matters for the ones with no shell
+    in them — ``kube-apiserver.md`` is a single enormous flag table with no
+    fenced block anywhere, and 126 of the 244 generated pages have a flag table
+    where a fence would be. Without this they are filed as PROSE, which they
+    very much are not: "API references" is named in the SYSTEM register's own
+    definition.
+
+    Using the site's own labels rather than a rule of this module's invention
+    is the point. PROSE is the register this corpus is starved of, so every
+    judgement call here has a thumb on the scale, and the way to keep it honest
+    is to let the authors classify their own pages.
 
     ``red`` routes the offensive upstreams' non-shell documents to ADVERSARY
     rather than PROSE. A badPods README that is more explanation than command
@@ -1353,9 +1500,7 @@ def _register(text: str, *, generated: bool, red: bool) -> Register:
     shell, config = _measure(text)
     if shell >= _SHELL_SHARE:
         return Register.SHELL
-    if generated:
-        return Register.SYSTEM
-    if config >= _CONFIG_SHARE:
+    if reference or config >= _CONFIG_SHARE:
         return Register.SYSTEM
     return Register.ADVERSARY if red else Register.PROSE
 
@@ -1551,6 +1696,7 @@ def _k8s_documents(root: Path, counts: dict[str, int],
         raise SourceError(
             f"containers: no content/en/docs under {root}; run fetch() first"
         )
+    gates = _feature_gates(docs)
 
     pages: list[_Rendered] = []
     generated: list[bool] = []
@@ -1560,30 +1706,35 @@ def _k8s_documents(root: Path, counts: dict[str, int],
         raw = _read(path)
         if raw is None:
             continue
-        text, front = _render_markdown(raw, examples, counts, missing, params)
+        relative = path.relative_to(root).as_posix()
+        text, front = _render_markdown(raw, examples, counts, missing, params,
+                                       relative, gates)
         text = normalise(text)
         if len(text) < _MIN_CHARS:
             continue
         pages.append(_Rendered(
-            relative=path.relative_to(root).as_posix(),
+            relative=relative,
             text=text,
             # Placeholder: the register is measured below, after the repeated
             # sections are gone.
             register=Register.PROSE,
             comment=None,
         ))
-        generated.append(bool(front.get("auto_generated")))
+        generated.append(
+            bool(front.get("auto_generated"))
+            or str(front.get("content_type", "")).strip() in _REFERENCE_TYPES
+            or "/generated/" in f"/{relative}")
 
     pages, sections, chars = _collapse_repeats(pages)
     if sections:
         counts["sections"] = sections
         counts["section_chars"] = chars
 
-    for page, is_generated in zip(pages, generated):
+    for page, is_reference in zip(pages, generated):
         if len(page.text) < _MIN_CHARS:
             continue
         yield page._replace(
-            register=_register(page.text, generated=is_generated, red=False))
+            register=_register(page.text, reference=is_reference))
 
 
 def _plain_documents(root: Path, repo: _Repo) -> Iterator[_Rendered]:
@@ -1630,8 +1781,7 @@ def _plain_documents(root: Path, repo: _Repo) -> Iterator[_Rendered]:
                     header.append(f"{key.title()}: {value}")
             text = normalise("\n".join(header + ["", body]))
             comment = None
-            register = _register(text, generated=False,
-                                 red=repo.side is Side.RED)
+            register = _register(text, red=repo.side is Side.RED)
         else:
             continue
 
@@ -1728,11 +1878,16 @@ SPEC = SourceSpec(
     name="containers",
     license=_LICENSE,
     url="https://github.com/kubernetes/website (largest of four; see _REPOS)",
-    register=Register.SHELL,
+    # The source-level register and side are the *summary*, and they are set to
+    # what the mix actually is rather than to what this source was built to
+    # contribute: 73% of the characters are PROSE and 97% are NEUTRAL. Every
+    # document carries its own measured register and its upstream's side, and
+    # those are what build.py balances on.
+    register=Register.PROSE,
     side=Side.NEUTRAL,
     fetch=_fetch,
     documents=_documents,
-    #: 1,205 documents survive today: 1,112 Kubernetes pages from 1,512 cached
+    #: 1,204 documents survive today: 1,111 Kubernetes pages from 1,511 cached
     #: markdown files — the other 400 are landing pages and feature-gate stubs
     #: under the 250-character floor — plus 93 from the three red upstreams. A
     #: floor at 900 clears ordinary upstream churn and the drift of that floor,
@@ -1741,8 +1896,9 @@ SPEC = SourceSpec(
     #: as a merely thinner build report.
     expect_min_docs=900,
     notes=(
-        "Kubernetes and container security, which no other source in this "
-        "corpus contains: kubectl/kubeadm command reference, component flag "
+        "Kubernetes and container security, which the rest of the corpus "
+        "mentions in 0.5% of its text and nowhere explains: kubectl/kubeadm "
+        "command reference, component flag "
         "dumps, RBAC, admission control, service-account tokens, Pod Security "
         "Standards — plus the offensive half, eight classes of over-"
         "permissioned Pod walked to a root shell on the node (badPods), "
