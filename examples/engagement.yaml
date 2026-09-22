@@ -14,8 +14,13 @@ engagement:
   operator: at0m-b0mb
   # Timezone is mandatory. An authorisation window without one is not an
   # authorisation window.
-  starts:  2026-09-16T09:00:00Z
-  expires: 2026-09-20T18:00:00Z
+  # A real engagement's window is tight — days, not years — and the gate
+  # enforces it: outside this range every action is denied, which is the
+  # control working rather than a bug. These dates are deliberately wide only
+  # so that this EXAMPLE still demonstrates the rest of the file to someone
+  # cloning the repository a year from now. Narrow them for anything real.
+  starts:  2026-01-01T09:00:00Z
+  expires: 2027-12-31T18:00:00Z
 
 scope:
   hosts:

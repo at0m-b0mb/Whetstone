@@ -878,9 +878,34 @@ class TestCheckRehearsal:
         from whetstone.cli import _representative_host
         assert _representative_host(null_engagement()) == "127.0.0.1"
 
-    def test_check_counts_the_authorised_red_verbs(self, capsys):
+    def test_check_counts_the_authorised_red_verbs(self, capsys, tmp_path):
+        """The verb count, checked against an engagement whose window is OPEN.
+
+        This read `examples/engagement.yaml` directly and asserted exit 0, which
+        made it a time bomb: the shipped example carries fixed dates, and the
+        day they passed `check` correctly reported that every action would be
+        denied and returned 1. The test was measuring the calendar.
+
+        So the window is rewritten to a live one here. Everything else — the
+        scope, the four authorised techniques, the red-team flag — is the
+        example's own, because the count under test is a property of those.
+        """
+        import re
+
         from whetstone.cli import main
-        assert main(["-e", "examples/engagement.yaml", "check"]) == 0
+
+        text = Path("examples/engagement.yaml").read_text(encoding="utf-8")
+        now = datetime.now(timezone.utc)
+        text = re.sub(r"starts:\s*\S+",
+                      "starts:  " + (now - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                      text, count=1)
+        text = re.sub(r"expires:\s*\S+",
+                      "expires: " + (now + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                      text, count=1)
+        live = tmp_path / "engagement.yaml"
+        live.write_text(text, encoding="utf-8")
+
+        assert main(["-e", str(live), "check"]) == 0
         out = capsys.readouterr().out
         # 4 techniques authorised; exactly 3 red verbs fall inside them.
         assert "3 of them red" in out

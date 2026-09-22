@@ -627,6 +627,23 @@ def build(
                 for doc in run.documents:
                     if doc.n_chars < min_chars:
                         continue
+                    # Identity redaction is a CHOKEPOINT, not a courtesy each
+                    # source performs. The trajectory generator redacted its own
+                    # output and every other adapter did not, which was fine
+                    # until `ownrepos` walked the maintainer's own repositories
+                    # and carried their account name and the per-user temp path
+                    # that fingerprints one particular Mac into the corpus — and
+                    # from there into weights, where it is not removable. A
+                    # measured audit of the shipped corpus found identity in two
+                    # sources, only one of which had ever thought about it.
+                    #
+                    # So it happens here, once, on the way in, where no future
+                    # adapter can forget it. redact_identity refuses rather than
+                    # degrades: a survivor raises instead of being written, and
+                    # the raise is caught below as a source-level failure, which
+                    # is the correct blast radius — one bad source is skipped
+                    # and named, the corpus is not silently contaminated.
+                    doc = _redacted(doc)
                     fp = doc.fingerprint
                     if fp in seen:
                         st.duplicates += 1
@@ -750,6 +767,24 @@ def build(
         for name, err in _IMPORT_FAILURES:
             print(f"  ! {name}: {err}")
     return stats
+
+
+
+def _redacted(doc):
+    """Substitute this machine's identity out of a document before it is kept.
+
+    Imported lazily because :mod:`training.trajectories` pulls in the kernel and
+    the adapters, and the corpus builder has no other reason to depend on them.
+    If that import ever fails the build must FAIL rather than quietly write
+    unredacted text — a corpus that is clean only when an optional import
+    succeeds is a corpus nobody can make a claim about.
+    """
+    from dataclasses import replace
+
+    from training.trajectories import redact_identity
+
+    clean = redact_identity(doc.text)
+    return doc if clean == doc.text else replace(doc, text=clean)
 
 
 def _note_source(st: BuildStats) -> None:

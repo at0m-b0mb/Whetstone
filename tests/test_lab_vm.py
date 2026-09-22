@@ -236,10 +236,24 @@ class TestExploitRevert:
             if inner[:1] == ["cat"]:
                 return subprocess.CompletedProcess(cmd, 0, stdout=original,
                                                    stderr="")
+            # Two DIFFERENT tee invocations, and the difference is the
+            # technique. The exploit writes as the unprivileged lab user —
+            # `tee` with no sudo — because a world-writable root-owned binary
+            # being writable by an ordinary account IS T1574.010; an exploit
+            # that needed root to demonstrate it would be demonstrating
+            # nothing. The restore is `sudo tee`, since putting the original
+            # back is a privileged repair rather than part of the attack.
+            #
+            # This mock matched only `sudo tee`, so it intercepted the restore
+            # and never the write, and `write_rc` was quietly inert — the
+            # failure this test exists to force was not being forced.
+            if inner[:1] == ["tee"]:
+                tee_payloads.append(kw.get("input", ""))
+                return subprocess.CompletedProcess(cmd, write_rc, stdout="",
+                                                   stderr="permission denied")
             if inner[:2] == ["sudo", "tee"]:
                 tee_payloads.append(kw.get("input", ""))
-                rc = write_rc if len(tee_payloads) == 1 else 0
-                return subprocess.CompletedProcess(cmd, rc, stdout="", stderr="")
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
         monkeypatch.setattr(vm_adapter.subprocess, "run", fake_run)
@@ -256,12 +270,27 @@ class TestExploitRevert:
         The old ``if restore and changed`` skipped the revert whenever the write
         did not cleanly succeed — the exact case that leaves the binary holding
         the marker, which the next run then reads as its "original" baseline.
+
+        The observation is ``ok=False`` and that is the point rather than a
+        regression. A write that did not happen is not a technique that ran, and
+        once ``harden.fix_permissions`` exists the commonest reason for it is
+        that the fix landed and removed the bit this exploit depended on. The
+        remediation loop reads exactly this difference: an attack that RAN and
+        met silence is a gap, and an attack that could not run establishes
+        nothing about the control and must come back ``undetermined``. Returning
+        ``ok=True, wrote=False`` blurred those two, which is the collapse this
+        whole project exists to refuse.
+
+        What the test is actually for — that the revert happens in a ``finally``
+        rather than behind the success branch — is asserted on the tee payloads,
+        and that assertion is unchanged.
         """
         obs, tee_payloads = self._run_exploit(monkeypatch, write_rc=1)
-        assert obs.ok is True
-        assert obs.data["wrote"] is False
+        assert obs.ok is False, (
+            "a write that did not happen must not be reported as a technique "
+            "that ran; the remediation loop depends on telling those apart")
+        assert "write bit" in (obs.error or ""), obs.error
         assert len(tee_payloads) == 2, "restore must be attempted after a failed write"
-        assert obs.data["cleanup"] == "succeeded"
 
 
 class TestBoundedVMCalls:

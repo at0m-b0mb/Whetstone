@@ -2102,3 +2102,57 @@ class TestChildOutcomeIsVerified:
         fatal = build_mod._child_fatal(
             {"phase": "ok", "error": "", "emitted": 5}, docs, 1.0)
         assert "truncated" in fatal, fatal
+
+
+class TestIdentityChokepoint:
+    """No source can put this machine's identity into the corpus.
+
+    Redaction used to be something the trajectory generator did for itself and
+    no other adapter thought about. That held until `ownrepos` walked the
+    maintainer's own repositories and carried their account name and the
+    per-user temp path that fingerprints one particular Mac into the corpus —
+    and a corpus is the thing that becomes weights, where it is not removable.
+
+    An audit of the shipped corpus found 1,187 leaking documents across two
+    sources, one of which had never considered the problem. So it is no longer
+    per-source: `build.py` redacts on the way in, once, where a future adapter
+    cannot forget it.
+    """
+
+    def test_the_build_redacts_every_document(self):
+        from dataclasses import dataclass
+
+        from training.corpus.build import _redacted
+        from training.trajectories import identity_leaks
+
+        @dataclass
+        class _Doc:
+            text: str
+
+        import getpass
+        user = getpass.getuser()
+        dirty = f"operator {user} ran a scan from /Users/{user}/work"
+        assert identity_leaks(dirty), (
+            "this test is vacuous unless the fixture actually leaks")
+
+        clean = _redacted(_Doc(text=dirty))
+        assert not identity_leaks(clean.text), clean.text
+        assert user not in clean.text
+
+    def test_clean_text_is_returned_unchanged(self):
+        """Redaction must not rewrite documents that have nothing to redact.
+
+        Every source pays this cost on every document, so it has to be a no-op
+        when there is nothing to do — and, more importantly, a redactor that
+        edits clean text is one that will eventually corrupt a payload.
+        """
+        from dataclasses import dataclass
+
+        from training.corpus.build import _redacted
+
+        @dataclass
+        class _Doc:
+            text: str
+
+        original = "CVE-2024-21412 cvss: 9.8 CRITICAL\nvector: CVSS:3.1/AV:N"
+        assert _redacted(_Doc(text=original)).text == original
