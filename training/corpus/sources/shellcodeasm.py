@@ -722,6 +722,22 @@ def _r2book_documents(root: Path) -> Iterator[Document]:
     analyst, an exploit developer and a firmware auditor all do with the same
     commands; the book takes no side and neither does this label.
     """
+    # DISABLED — malwareanalysis.py ships the same radareorg/radare2-book and
+    # ships MORE of it: its 182 pages are a strict superset of the 166 here, so
+    # keeping both spends 1.39 MB of corpus on 712 KB of unique text. Worse, the
+    # two adapters label the same pages differently — 99 are SHELL in one and
+    # SYSTEM in the other — so the balance report was being fed contradictory
+    # registers for identical text, and the same 99 pages counted toward the
+    # SHELL deficit in one source and toward the 15-points-over-target SYSTEM in
+    # the other. build.py's whole-document fingerprint cannot catch it: the two
+    # renderings differ, so there are zero fingerprint collisions while 3,536
+    # distinctive lines are shared.
+    #
+    # One book, one adapter, one register. malwareanalysis owns it because it
+    # takes more of it and because it already filters the GPL chapter by
+    # content. The assembly material this source exists for — shellcraft,
+    # syscall tables, CTF101 — is untouched.
+    return
     for rel, text in _walk(root, (".md",)):
         # A repository's own licence does not cover everything inside it, and
         # this book is the proof: src/refcard/ is Thanat0s' radare2 reference

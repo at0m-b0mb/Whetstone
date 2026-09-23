@@ -1246,15 +1246,22 @@ def _decode(path: Path) -> str | None:
 
 
 def _emit(ident: str, header: list[str],
-          lines: list[str], title: str) -> Iterator[Document]:
-    """Turn one rendered page into one document, or several if it is long."""
+          lines: list[str], title: str,
+          source: str = "activedirectory") -> Iterator[Document]:
+    """Turn one rendered page into one document, or several if it is long.
+
+    ``source`` names the adapter in the unclosed-fence warning below.
+    :mod:`~training.corpus.sources.hackerrecipes` reuses this splitter over the
+    same repository's other trees, and a warning that named this module while
+    describing that one's page would send the reader to the wrong adapter.
+    """
     rows, unclosed = _fence_scan(lines)
     if unclosed:
         # Loud rather than silent: a page that ends inside a fence has a broken
         # block somewhere above, and every heading under it stopped being a
         # split point. Rendered anyway — the prose and the commands are all
         # still there, in order — but not quietly.
-        print(f"   activedirectory: {ident} ends inside an unclosed code "
+        print(f"   {source}: {ident} ends inside an unclosed code "
               "fence upstream; its later headings are not split points")
     rows = _strip_images(rows)
     if _size(rows) <= _SPLIT_ABOVE:
