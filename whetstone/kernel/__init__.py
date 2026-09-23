@@ -632,8 +632,35 @@ class Kernel:
         # `self.chooser.choose` below, and constrained decoding scores every
         # entry of it. This string is the prompt's display of the catalogue, so
         # a cut costs legibility rather than reach.
+        # THE PLANNING POOL IS NOT THE PERMITTED CATALOGUE.
+        #
+        # MODIFY verbs — the harden family, the only ones the defending half
+        # owns — are aimed by the remediation phase from evidence, not chosen
+        # while planning. Each declares `remediates`, and _fix_candidates uses
+        # that declaration to match a fix to a gap; their parameters come from
+        # a remediation hint published by an observation. A planner picking one
+        # has none of that: harden.enable_telemetry needs a `source` it cannot
+        # know yet, and _close_gap already refuses to guess one because
+        # "guessing would aim a MODIFY at something nobody identified".
+        #
+        # Offered anyway, they were the entire wasted-turn count. Measured on
+        # small-sft, one episode, all three of its wasted turns:
+        #
+        #     7  harden.enable_telemetry     plan   UNSUPPORTED
+        #    11  harden.fix_permissions      plan   REFUSED
+        #    18  harden.remove_persistence   plan   FAILED
+        #
+        # and all three of those verbs then closed their gaps successfully in
+        # the remediate phase of the same run. The model had learned what they
+        # do and not when — which is not a thing it can learn from the
+        # trajectory, because the kernel, not the chooser, decides when.
+        #
+        # `permitted` keeps them: remediate_gaps() below is handed the whole
+        # catalogue and its candidates come from there.
+        plan_pool = [v for v in permitted if v.intent is not Intent.MODIFY]
+
         entries = [f"{v.id}({', '.join(p.name for p in v.params)})"
-                   for v in permitted]
+                   for v in plan_pool]
         catalogue, budget = "", _CATALOGUE_CHARS
         for entry in entries:
             step = entry if not catalogue else f"; {entry}"
@@ -658,7 +685,7 @@ class Kernel:
 
         while len(episode.turns) < self.max_turns:
             action = self.chooser.choose(
-                episode, permitted, exclude=exclude, target=target)
+                episode, plan_pool, exclude=exclude, target=target)
             if action is None:
                 break
 
