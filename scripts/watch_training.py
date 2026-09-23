@@ -27,7 +27,41 @@ import time
 from pathlib import Path
 
 D = Path("/Volumes/at0m_b0mb/whetstone")
-RUN = D / "runs/overnight-v5"
+# The version is not a constant. This read overnight-v5 while v6 was the live
+# run, so the watcher sat all night reporting six green stages and a finished
+# model -- the most convincing possible way to be told nothing is wrong. Takes
+# argv[1], then $VER, and only then falls back to whichever run directory was
+# modified most recently, which is the one someone watching almost certainly
+# means.
+def _default_run() -> Path:
+    runs = sorted((d for d in (D / "runs").glob("overnight-*") if d.is_dir()),
+                  key=lambda d: d.stat().st_mtime, reverse=True)
+    return runs[0] if runs else D / "runs/overnight-v6"
+
+
+import os
+
+_ver = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("VER", "")
+RUN = (D / f"runs/overnight-{_ver.lstrip('v') and 'v' + _ver.lstrip('v')}"
+       if _ver else _default_run())
+
+VER = RUN.name.split("-")[-1]
+
+
+def _corpus_stats() -> str:
+    """Real numbers for the run being watched, read from its own shard index.
+
+    This line was three hardcoded constants describing v5. Under the v6 run it
+    reported 99.7M tokens and 29 sources over a corpus of 145.9M and 44 -- a
+    header that is wrong in the reassuring direction, which is the worst kind.
+    """
+    try:
+        idx = json.loads((D / f"corpus/tokenized-{VER}/index.json").read_text())
+        return (f"{idx['total_tokens'] / 1e6:.1f}M tokens"
+                f" · {len(idx.get('by_source', {}))} sources")
+    except Exception:
+        return "corpus unread"
+
 
 STAGES = [("1", "corpus"), ("2", "tokenizer"), ("3", "shards"),
           ("4", "pretrain"), ("5", "sft"), ("6", "verify")]
@@ -131,7 +165,7 @@ def read_sft() -> list[dict]:
 def checkpoints() -> list[str]:
     out = []
     for name in ("small", "small/best", "small-sft"):
-        sj = D / "models/checkpoints-v5" / name / "state.json"
+        sj = D / f"models/checkpoints-{VER}" / name / "state.json"
         if sj.is_file():
             try:
                 d = json.loads(sj.read_text())
@@ -147,8 +181,8 @@ def render() -> tuple[str, bool]:
     cur = current_stage()
     L: list[str] = []
     A = L.append
-    A(f"{C['b']}{C['c']}  WHETSTONE — pipeline v5{C['x']}"
-      f"{C['dim']}   small 61.5M · 99.7M tokens · 29 sources{C['x']}")
+    A(f"{C['b']}{C['c']}  WHETSTONE — pipeline {VER}{C['x']}"
+      f"{C['dim']}   small 61.5M · {_corpus_stats()}{C['x']}")
     A("")
     A("  " + stage_strip(cur))
     A("")

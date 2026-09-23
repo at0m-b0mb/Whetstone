@@ -23,7 +23,11 @@ D=/Volumes/at0m_b0mb/whetstone
 # the file a run is executing can make it resume mid-line. A snapshot lives
 # outside the repo, so it cannot infer the repo from its own path.
 REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-VER=v5
+# Defaults to the CURRENT version, never a finished one. This read ${VER:-v5}
+# while v6 was the live run: any re-run without the env var -- which is exactly
+# what the header tells you to do after a crash -- would have trained stage 4
+# into checkpoints-v5 and overwritten the only trained model this project has.
+VER=${VER:-v6}
 RUN="$D/runs/overnight-$VER"
 MARK="$RUN/markers"
 MODEL=${MODEL:-small}
@@ -40,6 +44,12 @@ export PYTHONPATH="$REPO"
 # Unbuffered, or every stage log stays empty until its stage ends and the
 # question "is it still making progress at 3am" has no answer until 7am.
 export PYTHONUNBUFFERED=1
+# Every source unpacks into tempfile.mkdtemp(), which follows TMPDIR -- and the
+# default lands on the internal disk, not here. Forty-four sources unpacking
+# there filled a 926 GB volume mid-build and took the machine down with it.
+# The SSD is where the corpus already lives, so it is where the scratch belongs.
+export TMPDIR="$D/tmp"
+mkdir -p "$TMPDIR"
 
 FROM=0
 [[ "${1:-}" == "--from" ]] && FROM="${2:-0}"
@@ -156,6 +166,13 @@ PY
 
 pretrain() {
     local try=1 resume=""
+    # Seeded from disk, not from the attempt counter. This supervisor is built
+    # to be re-runnable, but a re-run re-enters here with try=1, and try=1 meant
+    # no --resume: hours of training discarded at step 0, and then the first
+    # eval of a fresh model satisfies `vl < best_val` (inf) and overwrites
+    # `best` with it. pretrain.py makes --resume a no-op when there is no
+    # state.json, so passing it whenever one exists is safe unconditionally.
+    [[ -f "$D/models/checkpoints-$VER/$MODEL/state.json" ]] && resume="--resume"
     local steps; steps=$(plan_steps)
     [[ -z "$steps" ]] && { log "   could not plan steps"; return 1; }
     log "   planned $steps steps for a ${HOURS}h budget"
@@ -232,7 +249,7 @@ verify() {
 
     echo; echo "=== captured example run (committable artifact) ==="
     python3 -m lab.record_run --checkpoint "$ck" --tokenizer "$tok" \
-        --out examples/runs --name "sandbox-$MODEL-v5" || true
+        --out examples/runs --name "sandbox-$MODEL-$VER" || true
 }
 
 log "════ overnight $VER starting — model=$MODEL ════"
