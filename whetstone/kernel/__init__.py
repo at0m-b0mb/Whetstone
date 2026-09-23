@@ -90,6 +90,15 @@ __all__ = [
 #: other parameter a detection verb declares exists to aim it at a particular
 #: technique, which is what makes the distinction below computable from the
 #: schema instead of from a hand-maintained list.
+
+#: How much of the verb catalogue the prompt carries. Entries are whole or
+#: absent; see the cut in Kernel.run. Raised from the historical 400 to cover
+#: the widest catalogue an adapter actually permits — macos implements 30 of
+#: the 32 verbs, which renders to about 900 characters — because the budget was
+#: tight enough to cut two-thirds of the list and nothing was measuring what
+#: that cost.
+_CATALOGUE_CHARS = 1024
+
 _WINDOW_PARAM = "since_seconds"
 
 #: Parameter types whose values can be lifted out of a red observation without
@@ -613,9 +622,25 @@ class Kernel:
         if callable(implemented):
             runnable = set(implemented())
             permitted = [v for v in permitted if v.id in runnable]
-        catalogue = "; ".join(
-            f"{v.id}({', '.join(p.name for p in v.params)})" for v in permitted
-        )[:400]
+        # Cut on entry boundaries, never mid-identifier. A flat [:400] left 87%
+        # of the built trajectories ending on a fragment — "...; vuln.credenti",
+        # "...; postex.credential_du" — which teaches the model that a truncated
+        # identifier is a thing that appears in this position.
+        #
+        # It does NOT hide a verb from the chooser, and that is worth stating
+        # because it reads as though it should: `permitted` is what reaches
+        # `self.chooser.choose` below, and constrained decoding scores every
+        # entry of it. This string is the prompt's display of the catalogue, so
+        # a cut costs legibility rather than reach.
+        entries = [f"{v.id}({', '.join(p.name for p in v.params)})"
+                   for v in permitted]
+        catalogue, budget = "", _CATALOGUE_CHARS
+        for entry in entries:
+            step = entry if not catalogue else f"; {entry}"
+            if len(step) > budget:
+                break
+            catalogue += step
+            budget -= len(step)
         episode = Episode(
             task=task,
             host=host or getattr(self.executor, "platform", "unknown"),

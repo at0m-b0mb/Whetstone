@@ -43,33 +43,52 @@ class ModelChooser:
     """
 
     def __init__(self, model: Any, tokenizer: Any, *, verbose: bool = False,
-                 stop_on_eos: bool = True, eos_floor: int = 16) -> None:
+                 stop_on_eos: bool = False, eos_floor: int = 16) -> None:
         self.model = model
         self.tok = tokenizer
         self.verbose = verbose
         #: Ask the model whether the episode is over before asking which verb
-        #: comes next. Every one of the 14,766 trajectories ends in EOS, so
-        #: where a sweep ends is something the model spent three SFT epochs
-        #: learning; the loop used to throw that away, because EOS is not a
-        #: Verb and the pool holds only Verbs. Stopping was therefore possible
-        #: only by exhausting the catalogue or hitting max_turns.
+        #: comes next. **Defaults OFF, and the reason is the more interesting
+        #: half of this.**
         #:
-        #: Measured on small-sft, agentbench, 3 runs per setting, nothing but
-        #: these two values changed:
+        #: The premise is sound: every one of the 14,766 trajectories ends in
+        #: EOS, so where a sweep ends is something three SFT epochs taught, and
+        #: the loop used to discard it because EOS is not a Verb. Scoring EOS
+        #: against the verbs and adding a floor — EOS may not win before this
+        #: much work is done, because in training it follows a COMPLETE sweep —
+        #: measured well on small-sft, agentbench, 3 runs per setting:
         #:
         #:     floor   found  proved  gap-recall  closed  turns  wasted
         #:     off       4/4     3/3         3/3     3/3   18.3       3
-        #:     0       1.5/4   2.5/3       2.5/3   2.5/3      9       1
-        #:     8       1.5/4   2.5/3       2.5/3   2.5/3      9       1
+        #:     0/8     1.5/4   2.5/3       2.5/3   2.5/3      9       1
         #:     12        4/4  2.33/3      2.33/3  2.33/3   14.7    1.33
-        #:     16        4/4     3/3         3/3     3/3   16.3    1.67  <--
+        #:     16        4/4     3/3         3/3     3/3   16.3    1.67
         #:
-        #: At 16 every capability row sits at its ceiling with spread 0.00 —
-        #: deterministic, not lucky — while wasted turns nearly halve and
-        #: weakness-proved-by-turn-12 rises to 2.67/3, past the scripted
-        #: sweep's 2.0. Below 16 it stops early and quietly loses proofs and
-        #: gaps: floor 12 keeps the headline 4/4 and costs 0.67 on three other
-        #: rows, which only three runs made visible.
+        #: Floor 16 looked like a free win: every row at its ceiling with
+        #: spread 0.00, and wasted turns nearly halved.
+        #:
+        #: It was not free, it was an ARTEFACT OF A BROKEN PROMPT. The kernel
+        #: was cutting the verb catalogue mid-identifier at 400 characters, so
+        #: the model was reading "...; vuln.credenti" in 87% of episodes.
+        #: Fixing that cut (Kernel.run, entry-aligned at _CATALOGUE_CHARS)
+        #: changed the prompt, and with it the calibration this floor was tuned
+        #: against. Re-measured on the corrected prompt:
+        #:
+        #:     floor   found  proved  gap-recall  closed  turns  wasted
+        #:     off       4/4     3/3         3/3     3/3     18       3
+        #:     10     2.67/4  2.67/3      2.67/3  2.67/3   11.3       1
+        #:     13        4/4  2.33/3      2.33/3  2.33/3     15    1.33
+        #:     16        4/4     3/3         3/3     3/3     18       3
+        #:
+        #: No floor now buys turns without paying capability, and at 16 EOS
+        #: simply never wins. Three turns are not worth 0.67 of proved,
+        #: gap-recall and gaps-closed, so this is off.
+        #:
+        #: Left wired, and the flags exposed on agentbench, because the premise
+        #: is still right and the thing that would make it work is a model
+        #: trained with a stop DECISION rather than one inferred from a
+        #: sequence end. The lesson recorded here is narrower and more useful:
+        #: a threshold tuned against a prompt is a measurement of that prompt.
         self.stop_on_eos = stop_on_eos
         #: Turns that must have completed before EOS is allowed to win at all.
         #: The bare comparison stops too early because the model was taught EOS
@@ -135,7 +154,7 @@ class ModelChooser:
 
 
 def load_chooser(checkpoint: Path, tokenizer: Path, *, verbose: bool = False,
-                 stop_on_eos: bool = True, eos_floor: int = 16) -> ModelChooser:
+                 stop_on_eos: bool = False, eos_floor: int = 16) -> ModelChooser:
     """Build a :class:`ModelChooser` from a checkpoint on disk.
 
     A thin convenience so the lab runners do not each repeat the model-loading
