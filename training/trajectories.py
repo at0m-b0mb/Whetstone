@@ -118,6 +118,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import glob
 import hashlib
 import json
 import os
@@ -2234,9 +2235,32 @@ def _identity_table() -> tuple[tuple[str, str], ...]:
     if _is_identifying(home.name):
         add(str(home), str(home.parent / _OPERATOR))
 
-    tmp = tempfile.gettempdir()
+    # Every temp directory this machine could have written into a path, not
+    # only the one TMPDIR names right now. ``gettempdir()`` follows TMPDIR, so
+    # pointing the corpus build's scratch at the external volume -- which this
+    # project now does, because forty-four sources unpacking into the internal
+    # disk filled it and took the machine down mid-build -- drops the per-user
+    # ``/var/folders`` path straight out of this table, while every document
+    # captured before the move still carries it. That is not a hypothetical:
+    # it put a real ``/var/folders/<x>/<hash>/T`` into a built corpus, seven
+    # times in one document, and the build reported zero leaks because the
+    # literal it was checking for was no longer the literal that was there.
+    # A directory identifies its owner whether or not anything is using it, so
+    # the table is keyed on ownership rather than on the current environment.
+    # Found by ownership rather than by ``getconf``: this module must build its
+    # table without running a command, and ``CS_DARWIN_USER_TEMP_DIR`` is not
+    # in every build's ``os.confstr_names``.
+    temps = {tempfile.gettempdir()}
+    for candidate in glob.glob("/var/folders/*/*/T"):
+        try:
+            if os.stat(candidate).st_uid == os.getuid():
+                temps.add(candidate)
+        except OSError:
+            continue
     generic_tmp = "C:\\Temp" if os.name == "nt" else "/tmp"
-    if tmp != generic_tmp:
+    for tmp in sorted(temps):
+        if tmp == generic_tmp:
+            continue
         add(tmp, generic_tmp)
         # macOS reports the same directory both with and without the /private
         # prefix depending on whether anything resolved it, and the sandbox
