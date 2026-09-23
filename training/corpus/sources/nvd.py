@@ -59,10 +59,21 @@ keeping documents until the allowance runs out. That is a **prefix cut**. A
 perfectly stratified fetch, yielded stratum by stratum in file order, gets
 re-sorted into exactly the old bias the instant the balancer decides ADVISORY
 is over target and keeps only the front of the list — which is stratum 0, which
-is 1988. This is why the built corpus showed 9.7% CWE coverage while the raw
-cache showed 38.3%: the balancer had kept the oldest 12,254 of 40,000. So
-:func:`_documents` emits in a deterministic shuffled order, and any prefix of
-that stream is a representative sample of the whole.
+is 1988.
+
+That is not a theory about what might happen, it is where the reported numbers
+came from, and replaying the old cache in the old order shows it exactly. The
+whole 40,000-record cache carried a CWE line on 37.2% of records; its first
+12,254 — the prefix the balancer kept — carried one on **9.3%**, which is the
+9.7% the build reported. The number that looked like a broken adapter was the
+cut, not the parse. Fixing only the fetch would have moved 37.2% to 82.9% and
+left the balancer to cut a fresh biased prefix out of it, because a stratified
+fetch yielded in stratum order is still sorted by date.
+
+So :func:`_documents` emits in a deterministic shuffled order, and any prefix
+of that stream is a representative sample of the whole. Measured on the rebuilt
+source: the leading 10% and the leading 30% both carry a CWE line on 83% of
+records against 82.9% for the whole, so the balancer can cut wherever it likes.
 
 The permutation is keyed on ``blake2b`` of the CVE id rather than
 :func:`random.shuffle` or :func:`hash`. ``hash()`` on a ``str`` is salted per
@@ -349,7 +360,7 @@ def _fetch(cache_dir: Path) -> Path:
     # The probe doubles as the reachability check. If this fails there is no
     # index space to stratify over and nothing sensible to do but say so.
     try:
-        probe = _get(f"{_API}?resultsPerPage=1&startIndex=0{_FILTER}", api_key)
+        _, probe = _get(f"{_API}?resultsPerPage=1&startIndex=0{_FILTER}", api_key)
     except NetworkError as exc:
         raise SourceError(f"NVD unreachable on the count probe: {exc}") from None
     total = int(probe.get("totalResults") or 0)
@@ -368,8 +379,14 @@ def _fetch(cache_dir: Path) -> Path:
         url = (f"{_API}?resultsPerPage={_PER_STRATUM}&startIndex={offset}"
                f"{_FILTER}")
         try:
-            _get(url, api_key)  # validated before anything touches the cache
-            payload = fetch(url, timeout=90, headers=_headers(api_key))
+            payload, data = _get(url, api_key)
+            # Validated before anything touches the cache. A stratum that came
+            # back structurally fine but empty is a real signal — it means the
+            # offset ran off the end of a catalogue that shrank under us — and
+            # caching it would bake that gap in permanently.
+            if not (data.get("vulnerabilities") or []):
+                raise NetworkError(
+                    f"no records at startIndex={offset} (totalResults={total:,})")
         except NetworkError as exc:
             # Skip, do not break. See the module docstring: breaking here drops
             # every later stratum, and later means more recent, which rebuilds
@@ -502,10 +519,20 @@ def _render(cve: dict) -> str | None:
         lines.append("affected:")
         lines.extend(f"  {c}" for c in configs)
 
-    refs = [
-        r.get("url", "") for r in (cve.get("references") or [])[:6]
-        if r.get("url")
-    ]
+    # Deduplicated BEFORE the cap, which is the whole point. Every record in
+    # NVD carries each reference at least twice: once in the CVE Program's own
+    # container (source ``cve@mitre.org``) and again in NVD's ADP container
+    # (source ``af854a3a-2127-422b-91ae-364da2661108``), with identical URLs.
+    # That is 100% of records sampled, and one carried 200 redundant copies.
+    # Slicing the raw list to six first — which is what this did — takes three
+    # real URLs and then the same three again, so a short reference block came
+    # out perfectly doubled. Training a model to emit a URL and immediately
+    # repeat it is the one thing the corpus contract singles out as worse than
+    # having no text at all. dict.fromkeys keeps first-seen order, so the CVE
+    # Program's own ordering survives.
+    refs = list(dict.fromkeys(
+        r.get("url", "") for r in (cve.get("references") or []) if r.get("url")
+    ))[:6]
     if refs:
         lines.append("")
         lines.append("references:")

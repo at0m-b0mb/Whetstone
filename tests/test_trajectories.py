@@ -5,7 +5,7 @@ checkpoint and a model that has never seen the job, so the properties worth
 testing are the ones whose failure would be invisible in the output. A
 trajectory full of plausible-looking nonsense reads exactly like a good one.
 
-Four things are checked, and each corresponds to a way the generator could
+Six things are checked, and each corresponds to a way the generator could
 quietly start lying:
 
 **Every action is one the registry accepts.** If it is not, the model is being
@@ -136,6 +136,21 @@ def _executed(text: str) -> list[str]:
         if part == "<|act|>" and parts[i + 2 : i + 3] == ["<|obs|>"]:
             out.append(json.loads(parts[i + 1])["verb"])
     return out
+
+
+#: How an ``undetermined`` detail is sorted into the branch of
+#: ``Kernel._close_gap`` that produced it. Matched on a phrase from the kernel's
+#: own wording rather than on the verb or the family name, because the question
+#: is what the *model* can tell apart: the family label never reaches the
+#: trajectory, and two routes that read identically in the text are one route as
+#: far as anything trained on it is concerned.
+_UNDETERMINED_ROUTES = {
+    "gate refused the re-attack": "the proof was not authorised",
+    "no longer succeeds": "the technique stopped working",
+    "already reporting activity": "the control was not silent first",
+    "could not establish whether it fired": "the second probe could not tell",
+    "aimed differently": "the two readings asked different questions",
+}
 
 
 def _remediated(texts):
@@ -380,20 +395,6 @@ class TestRemediationFollowsEvidence:
             checked += 1
         assert checked, "no refused remediation was generated to check"
 
-    #: How an ``undetermined`` detail is sorted into the branch of
-    #: ``Kernel._close_gap`` that produced it. Matched on a phrase from the
-    #: kernel's own wording rather than on the verb or the family name, because
-    #: the question is what the *model* can tell apart: the family label never
-    #: reaches the trajectory, and two routes that read identically in the text
-    #: are one route as far as anything trained on it is concerned.
-    _UNDETERMINED_ROUTES = {
-        "gate refused the re-attack": "the proof was not authorised",
-        "no longer succeeds": "the technique stopped working",
-        "already reporting activity": "the control was not silent first",
-        "could not establish whether it fired": "the second probe could not tell",
-        "aimed differently": "the two readings asked different questions",
-    }
-
     def test_undetermined_is_reached_by_more_than_one_route(self, corpus):
         """One state, several situations — and the text has to show which.
 
@@ -425,7 +426,7 @@ class TestRemediationFollowsEvidence:
             fix = finding["remediation"]
             if fix["state"] != "undetermined":
                 continue
-            for marker, route in self._UNDETERMINED_ROUTES.items():
+            for marker, route in _UNDETERMINED_ROUTES.items():
                 if marker in fix["detail"]:
                     seen.add(route)
                     break
