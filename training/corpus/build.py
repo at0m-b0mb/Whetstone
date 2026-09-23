@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import importlib
 import json
 import multiprocessing
@@ -824,9 +825,33 @@ def _cap_source_share(
     scale, and one source drowning the rest throws that away.
 
     A cap, not an exclusion — RFC keeps its full share of the ceiling. What is
-    trimmed is the excess beyond it, oldest-document-first so the trim is
-    deterministic. Everything dropped is logged; a silent cap reads as coverage
-    that is not there.
+    trimmed is the excess beyond it. Everything dropped is logged; a silent cap
+    reads as coverage that is not there.
+
+    **What survives is a representative sample, not the front of the list**, and
+    that is this function's second scar. It used to walk ``docs`` in the order
+    the adapter yielded them and keep documents until the ceiling ran out. For a
+    source that yields in any meaningful order this is not a cap, it is a filter
+    on that order — and every large adapter here yields in a meaningful order,
+    because a stable order is what makes a build reproducible.
+
+    It cost the corpus the modern internet. ``rfc`` yields numerically, RFC 1
+    upward, and at 14.2% of the corpus it is the source this cap actually binds.
+    The built v6 corpus held RFC 1 through RFC 3166 and **not one of the 6,500
+    after it**: no TLS 1.3 (8446), no HTTP/2 (9113), no HTTP/3 or QUIC (9114,
+    9000), no OAuth 2.0 (6749), no JWT (7519). All 9,832 were fetched and cached;
+    the cap threw away everything published after 2001. A model whose single
+    largest source is thirty-year-old protocol text learns the internet of 1998.
+
+    :mod:`~training.corpus.sources.nvd` hit the same wall from the other side and
+    worked around it locally, by emitting in a deterministic shuffled order so
+    that any prefix of its stream is representative. That fix was right and it is
+    still there; this one generalises it, so the next adapter to grow past the
+    ceiling does not have to rediscover it. Selection is by ``blake2b`` of the
+    document identity — deterministic across runs and machines, unlike
+    :func:`hash`, which is salted per process — and the survivors are then
+    emitted in their original order, so the cap changes *which* documents land
+    and never the order they land in.
 
     **The ceiling is solved against the total the trim leaves behind**, not the
     one it starts from, and that distinction is the whole of this function's
@@ -888,12 +913,29 @@ def _cap_source_share(
             continue
         kept: list[Document] = []
         running = 0
-        for doc in docs:
+        # Spread the keep across the whole source instead of the front of it.
+        # Keyed on ident where the adapter set one and on the text otherwise, so
+        # a source that leaves ident blank still gets a stable, well-distributed
+        # order rather than falling back to yield order.
+        order = sorted(
+            range(len(docs)),
+            key=lambda i: hashlib.blake2b(
+                (docs[i].ident or docs[i].text[:512]).encode("utf-8"),
+                digest_size=8,
+            ).digest(),
+        )
+        chosen: set[int] = set()
+        for i in order:
+            doc = docs[i]
             if running + doc.n_chars > ceiling:
                 st_by_name[name].dropped_for_balance += 1
                 continue
             running += doc.n_chars
-            kept.append(doc)
+            chosen.add(i)
+        # Back into the adapter's own order: the cap decides membership, never
+        # sequence. A corpus whose document order changed with its size would
+        # make every build diff unreadable.
+        kept = [docs[i] for i in range(len(docs)) if i in chosen]
         collected[name] = kept
         st_by_name[name].chars = running
         st_by_name[name].docs = len(kept)
