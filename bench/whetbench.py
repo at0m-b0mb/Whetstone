@@ -360,8 +360,37 @@ PROBES: list[Probe] = [
           "associates a weakness class with a vulnerability record"),
     Probe("attck-real", "The adversary used technique ",
           check_technique_real,
-          "emits ATT&CK ids that EXIST, not just ids that look right — the "
-          "difference between learning a referent and learning a shape"),
+          "emits ATT&CK ids that EXIST from an UNCUED prompt. Reads as a "
+          "knowledge probe and is really a robustness one — see attck-cued"),
+    # Two probes because one number was answering two questions and getting
+    # both wrong. attck-real went 2/5 on v5 and 0/5 on v6, which reads as the
+    # model forgetting ATT&CK. It has not. Asked with this prompt it emits no
+    # technique id at all and completes into reference URLs and CVE links,
+    # because "The adversary used technique " resembles nothing in the corpus
+    # and the model falls into the register that dominates it — advisory at
+    # 16.2% of tokens against adversary's 4.2%.
+    #
+    # Handed a shape it has actually seen, it produces real ids immediately:
+    # nine of nine verified against the attack source's 1,116 distinct
+    # technique ids, including the whole T1078.001-.004 sub-technique family in
+    # order. So the knowledge is there and the first probe cannot see it.
+    #
+    # This prompt is an ATT&CK mitigation page, which is a real document shape
+    # in the corpus and carries no technique id of its own — assert_probes_can_fail
+    # rules out the obvious cue, a list of ids with one missing, because that
+    # prompt would satisfy this checker on its own.
+    #
+    # Measured on small-sft at the time of writing: attck-real 0/5,
+    # attck-cued 2/5, every emitted id real. Read together they say the model
+    # knows the referents and can only reach them through familiar shapes, and
+    # that gap is the thing worth tracking. Neither number alone says it.
+    Probe("attck-cued",
+          "Matrix: Enterprise ATT&CK\nType: Mitigation\n"
+          "Name: Privileged Account Management\n\n"
+          "## Techniques Addressed by Mitigation\n\n- ",
+          check_technique_real,
+          "emits ATT&CK ids that EXIST when the prompt is shaped like a "
+          "document it has seen — the knowledge half of attck-real"),
     # The two routing prompts are constrained in a way the others are not: a
     # prompt may not contain any marker its own checker looks for. That rules
     # out the obvious phrasings — ``PS C:\> Get-Process | `` hands the checker
