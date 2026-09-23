@@ -1696,6 +1696,11 @@ def main(argv: list[str] | None = None) -> int:
                         "did before defence existed; the defending rows then "
                         "read 'never' and no attacking number moves")
     p.add_argument("--json", type=Path, help="also write results here")
+    p.add_argument("--stop-on-eos", action="store_true",
+                   help="let the model end the episode by scoring EOS above "
+                        "every remaining verb (see ModelChooser.stop_on_eos)")
+    p.add_argument("--eos-floor", type=int, default=0,
+                   help="turns that must complete before --stop-on-eos may fire")
     p.add_argument("--verbose", action="store_true")
     args = p.parse_args(argv)
 
@@ -1719,7 +1724,9 @@ def main(argv: list[str] | None = None) -> int:
         from training.agent import load_chooser
         jobs.append((f"model {args.model.name}",
                      load_chooser(args.model, args.tokenizer,
-                                  verbose=args.verbose)))
+                                  verbose=args.verbose,
+                                  stop_on_eos=args.stop_on_eos,
+                                  eos_floor=args.eos_floor)))
 
     results: list[BenchResult] = []
     for label, chooser in jobs:
