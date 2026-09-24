@@ -657,7 +657,24 @@ class Kernel:
         #
         # `permitted` keeps them: remediate_gaps() below is handed the whole
         # catalogue and its candidates come from there.
-        plan_pool = [v for v in permitted if v.intent is not Intent.MODIFY]
+        # ...EXCEPT under blue-only, where there is no remediation phase to aim
+        # them from. _check_detections returns early for every non-RED verb, so
+        # `gaps` stays empty and remediate_gaps is never called; the planner is
+        # the only path blue-only has to a fix, and MODIFY is the entire point
+        # of that mode — Profile's own docstring says blue-only exists so
+        # harden.* can run without carrying a red authorisation with it.
+        #
+        # Filtering unconditionally made blue-only a silent no-op: its
+        # catalogue is 24 verbs including all three harden verbs, the pool
+        # became 12, and lab/run.py's PostureSweep skipped the harden entries
+        # without a word because `by_id.get(verb_id)` returned None. Nothing
+        # printed an error — the posture ledger just said zero.
+        from ..gate.engagement import Profile
+        blue_only = getattr(
+            getattr(self.gate.engagement, "authorize", None), "profile", None
+        ) is Profile.BLUE
+        plan_pool = (list(permitted) if blue_only else
+                     [v for v in permitted if v.intent is not Intent.MODIFY])
 
         entries = [f"{v.id}({', '.join(p.name for p in v.params)})"
                    for v in plan_pool]
