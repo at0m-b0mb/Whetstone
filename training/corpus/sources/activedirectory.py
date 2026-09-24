@@ -1282,7 +1282,15 @@ def _emit(ident: str, header: list[str],
             continue
         yield Document(
             text=text,
-            source="activedirectory",
+            # NOT the module name. hackerrecipes reuses this splitter, and with
+            # the name hardcoded its 109 documents landed in
+            # hackerrecipes.jsonl carrying source="activedirectory" — so the
+            # shard index credited them to the wrong source, every provenance
+            # line about them was false, and the file looked to a reader like a
+            # source that had never been trained on. The `source` parameter was
+            # already threaded through for the unclosed-fence warning; the
+            # Document is the half that actually reaches the corpus.
+            source=source,
             register=Register.ADVERSARY,
             side=Side.RED,
             ident=ident if total == 1 else f"{ident}#{index}",
