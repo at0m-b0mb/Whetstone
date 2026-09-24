@@ -48,6 +48,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
 import numpy as np
+from mlx.utils import tree_map
 
 from .config import STAIRCASE, ModelConfig, TrainConfig, get_config
 from .data import Dataset
@@ -346,6 +347,7 @@ def train(
     resume: bool = False,
     train_cfg: TrainConfig | None = None,
     reset_optimizer: bool = False,
+    master_weights: bool = True,
 ) -> Path:
     cfg = get_config(model_name)
     tcfg = train_cfg or TrainConfig()
@@ -368,6 +370,35 @@ def train(
         betas=[tcfg.beta1, tcfg.beta2],
         weight_decay=tcfg.weight_decay,
     )
+
+    # FP32 MASTER WEIGHTS. The model trains in bf16 because that is what buys
+    # the throughput, but the optimizer must not do its arithmetic there.
+    #
+    # MLX's AdamW casts to the gradient's dtype — `lr = self.learning_rate
+    # .astype(gradient.dtype)` — so with bf16 parameters the whole update,
+    # including the weight-decay multiply, happens in 8 significant bits. Any
+    # update below half a ULP of the weight rounds straight back to the weight,
+    # and because rounding is applied to the already-rounded parameter every
+    # step, sub-ULP progress can never accumulate.
+    #
+    # Measured on this project's own finished v6 checkpoint: all 37 RMSNorm
+    # gain vectors — 18,944 parameters — were still EXACTLY 1.0 after 8,900
+    # steps, every element, while every one of their Adam moments was
+    # non-zero. Gradients arrived for the whole run and not one of those
+    # weights ever moved. Reproduced in isolation at lr 3e-5: 0 of 16 gains
+    # move in bf16, 16 of 16 move with this master.
+    #
+    # `weight_decay=0.1` was dead for the same reason: 1 - 3e-4*0.1 rounds to
+    # exactly 1.0 in bf16, so the only regulariser a four-epoch run with no
+    # dropout has was a no-op on every step it ever ran.
+    #
+    # Costs one fp32 copy of the parameters plus fp32 optimizer moments —
+    # about 0.5 GB for `small`, against the 13 GB of swap the accumulation bug
+    # once cost. The forward and backward passes are untouched and still bf16.
+    master = None
+    if master_weights and cfg.dtype != "float32":
+        master = tree_map(lambda a: a.astype(mx.float32), model.parameters())
+        opt.init(master)
 
     total_steps = min(tcfg.total_steps(cfg), max_steps or 10**9)
     accum = tcfg.grad_accum_steps(cfg)
@@ -396,6 +427,15 @@ def train(
         # resume the retry loop ever performed.
         start = load_checkpoint(out, model, opt,
                                 require_optimizer=not reset_optimizer) + 1
+        if master is not None:
+            # Rebuilt from the restored bf16 weights, so a resume loses whatever
+            # sub-ULP progress the master was holding at the moment it was
+            # written — once, at the resume, not per step. Saving the master
+            # instead would add 246 MB to every checkpoint and change the
+            # format that load_for_inference and every bench reads; the whole
+            # point of the retry loop is that a resume is rare and cheap.
+            master = tree_map(lambda a: a.astype(mx.float32), model.parameters())
+            opt.init(master)
 
         # The config the checkpoint was WRITTEN with, which is not necessarily
         # this process's: --micro-batch is the flag operators are told to
@@ -487,8 +527,18 @@ def train(
 
         grads = _tree_scale(grads, 1.0 / accum)
         grads, gnorm = optim.clip_grad_norm(grads, tcfg.grad_clip)
-        opt.update(model, grads)
-        mx.eval(model.parameters(), opt.state)
+        if master is None:
+            opt.update(model, grads)
+            mx.eval(model.parameters(), opt.state)
+        else:
+            # Update the fp32 master, then cast it back into the bf16 model the
+            # next forward pass will use. apply_gradients returns the new tree
+            # rather than mutating, so the master is the only full-precision
+            # copy and the model never holds one.
+            master = opt.apply_gradients(
+                tree_map(lambda a: a.astype(mx.float32), grads), master)
+            model.update(tree_map(lambda a: a.astype(mx.bfloat16), master))
+            mx.eval(model.parameters(), master, opt.state)
 
         if step % tcfg.log_every == 0:
             dt = time.perf_counter() - t0
@@ -611,6 +661,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--data", type=Path, default=Path("data/corpus/tokenized"))
     p.add_argument("--out", type=Path, default=Path("data/models/checkpoints"))
     p.add_argument("--max-steps", type=int, default=None)
+    p.add_argument("--no-master-weights", dest="master_weights",
+                   action="store_false",
+                   help="do the optimizer arithmetic in the model's own dtype, "
+                        "as this did before fp32 master weights. Kept so the "
+                        "frozen-parameter result is reproducible, not because "
+                        "anyone should train with it.")
     p.add_argument("--micro-batch", type=int, default=None,
                    help="sequences per forward pass. Lower it if the run swaps: "
                         "small at 8 x 1024 swapped this machine to 24.9 GB and "
@@ -643,6 +699,7 @@ def main(argv: list[str] | None = None) -> int:
     train(args.model, args.data, args.out,
           max_steps=args.max_steps, resume=args.resume,
           reset_optimizer=args.reset_optimizer,
+          master_weights=args.master_weights,
           train_cfg=(TrainConfig(micro_batch=args.micro_batch)
                      if args.micro_batch else None))
     return 0
