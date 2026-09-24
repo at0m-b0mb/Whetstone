@@ -499,10 +499,18 @@ SPEC = SourceSpec(
     #: category membership on Wikipedia moves daily, and the regression worth
     #: catching is a seed renamed to nothing, which _fetch already refuses.
     expect_min_docs=1_500,
-    #: Several hundred paced requests at ~1.1s each. The build-wide default is
-    #: written for a source that downloads one tarball, and would kill this one
-    #: in the middle of its first category.
-    timeout=5_400,
+    #: MEASURED, after the first estimate was wrong by a factor of three and
+    #: cost a build. The seeds resolve to 9,074 titles, not the ~2,900 the
+    #: direct page counts suggested — depth-1 descent triples it — and the API
+    #: refuses to batch whole articles, so it is 9,074 paced requests at
+    #: _DELAY plus latency: about 3.2 hours cold. The v7 build allowed 5,400s,
+    #: reached 3,827 pages, was killed, and the source was skipped entirely.
+    #:
+    #: Four hours, and the fetch is resumable by construction: every page is
+    #: written as it arrives and `pending` skips what is already cached, so a
+    #: build that dies here resumes where it stopped rather than restarting.
+    #: That is what makes a budget this large safe rather than reckless.
+    timeout=14_400,
     notes=(
         "Hand-picked computer-science and security categories only, never a "
         "general dump: the corpus is data-limited but a 61.5M-parameter model "
