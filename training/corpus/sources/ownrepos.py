@@ -18,6 +18,7 @@ but it is now one source among several rather than the whole corpus, and
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Iterator
 
@@ -110,7 +111,44 @@ def _fetch(cache_dir: Path) -> Path:
     return cache_dir
 
 
+#: Email addresses, redacted HERE and nowhere else in the corpus.
+#:
+#: build.py already runs every document through
+#: :func:`~training.trajectories.redact_identity`, which removes this machine's
+#: user, host, home and temp paths. It does not remove email addresses, and for
+#: forty-six of the forty-seven sources it must not: the corpus holds 28,805 of
+#: them, nearly all RFC authors, kernel maintainers and advisory contacts, and
+#: several of those sources carry licences — CC-BY, the IETF Trust provisions —
+#: whose attribution condition is satisfied by exactly those lines. Stripping
+#: them would trade a privacy problem for a licence one.
+#:
+#: This source is the exception because it is the only one built from the
+#: author's own machine, and it swept up a university project README whose
+#: "Team Members" section listed four people by full name with their addresses:
+#: the author's, and three @jh.edu addresses belonging to other students. The
+#: author can publish their own address; the other three never agreed to be in
+#: a training corpus, and a .edu address is tied to a named individual.
+#:
+#: The replacement keeps the shape so the surrounding prose still reads as
+#: prose — a line that said "(name@example.edu)" still says something
+#: address-shaped — without carrying anyone's identity.
+_EMAIL = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+_EMAIL_REPLACEMENT = "contributor@example.invalid"
+
+
+def _redact_emails(text: str) -> tuple[str, int]:
+    """Replace every address, and say how many — silence here is the failure.
+
+    Returned rather than logged so :func:`_documents` can report the total once
+    for the source instead of once per file, and so a future test can assert
+    the count is what it was rather than merely that the function ran.
+    """
+    found = len(_EMAIL.findall(text))
+    return (_EMAIL.sub(_EMAIL_REPLACEMENT, text) if found else text), found
+
+
 def _documents(path: Path) -> Iterator[Document]:
+    redacted = 0
     for file in sorted(path.iterdir()):
         if not file.is_file():
             continue
@@ -124,8 +162,12 @@ def _documents(path: Path) -> Iterator[Document]:
         text = normalise(raw)
         if len(text) < 200:
             continue
+        text, n = _redact_emails(text)
+        redacted += n
         yield Document(text=text, source="ownrepos", register=Register.PROSE,
                        side=Side.NEUTRAL, ident=name)
+    if redacted:
+        print(f"   ownrepos: redacted {redacted} email address(es)")
 
 
 SPEC = SourceSpec(
