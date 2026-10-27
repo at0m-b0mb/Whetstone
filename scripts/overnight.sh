@@ -17,7 +17,7 @@
 set -uo pipefail          # NOT -e: a failed stage must be caught and reported,
                           # not kill the supervisor that is meant to retry it.
 
-D=/Volumes/at0m_b0mb/whetstone
+D="${WHETSTONE_DATA:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/data}"
 # Overridable, because this script is meant to be run from an immutable
 # snapshot copy: bash reads a script incrementally by byte offset, so editing
 # the file a run is executing can make it resume mid-line. A snapshot lives
@@ -37,6 +37,21 @@ HOURS=${HOURS:-9}          # wall-clock budget for pretraining
 # into 24.9 GB of swap and never reached step 1; at 4 it sustains ~9,300 tok/s.
 # A run that has started swapping is finished, so this is not a tuning knob.
 MICRO=${MICRO:-4}
+
+# ── no leak override, and that is deliberate ─────────────────────────────────
+# This briefly carried `--accept-leaking-corpus d907e82657e3` to get past the
+# four `ipv4-private` findings in clean-v9. It does not any more, because the
+# right fix was not an override but a rule: `training.corpus.provenance` asks
+# whether an ambiguous finding's value is present in that source's own raw
+# upstream download, and all three gates — build.py's stamp,
+# training.data.require_clean_corpus, and scripts/gate_corpus.py — now consult
+# it. The four findings are Nmap's own documentation address colliding with this
+# machine's Colima bridge, and they are exonerated with the reason printed.
+#
+# An override parked in a script is exactly what require_clean_corpus's own
+# message warns against ("it cannot be parked in a script, a config file or an
+# environment variable"). There is no standing override here. If a future build
+# genuinely leaks, this pipeline stops, which is the point.
 
 mkdir -p "$RUN" "$MARK"
 cd "$REPO" || exit 1
@@ -82,6 +97,49 @@ stage() {                 # stage <n> <name> <command...>
     return 1
 }
 
+# ── 1a. the verification gate ────────────────────────────────────────────────
+# Part of stage 1 rather than a stage of its own, because the semantics are
+# "the corpus stage is not finished until the corpus is clean" — so no marker is
+# written, nothing downstream runs, and a re-run retries the whole thing.
+#
+# This exists because of what an audit found in October 2026: the shipped corpus
+# carried 23,535 occurrences of 11 distinct values — a live global IPv6 address
+# and the delegated /64 prefix, three hardware MAC addresses, the external volume
+# name, the maintainer's own name and address, and the full names and personal
+# addresses of three non-consenting third parties. Every redaction fix of that
+# week lives in build.py's chokepoint, and every one of them was useless against
+# the artifacts already on disk, because **nothing ever read the finished
+# corpus**. A redactor that was added and never run is indistinguishable, from
+# the code, from one that ran and found nothing.
+#
+# The gate is also why `verify` is trusted here at all: it had three fail-opens
+# of its own fixed the same week, one of which made it report "0 leaks, exit 0"
+# having read **zero bytes** — printing 625.3 MB in 0.0s, which is 128,124 MB/s
+# and therefore impossible. Exit 2 is now reserved for the instrument failing
+# rather than the corpus passing, and it is treated as a failure here, because a
+# verdict from a broken instrument is worth less than no verdict.
+verify_corpus_gate() {
+    local dir="$D/corpus/clean-$VER"
+    # gate_corpus.py, not the bare verifier: the verifier REPORTS findings and
+    # the gate DECIDES what they mean. The one policy it applies is provenance —
+    # an RFC1918 address is ambiguous by construction (a bound address and an
+    # Nmap example are the same bytes), so a finding whose value is present in
+    # that source's own raw upstream download is exonerated and printed.
+    # Nothing else is exonerable: identity, email, mac, ipv6-global, volume and
+    # ident-path fail the gate whatever the cache says.
+    python3 scripts/gate_corpus.py "$dir"
+    local rc=$?
+    case $rc in
+        0) echo "verification gate: clean — safe to tokenize" ;;
+        1) echo "verification gate: LEAKS FOUND in $dir — refusing to tokenize."
+           echo "A corpus becomes weights, and weights are neither greppable nor"
+           echo "removable. Fix the chokepoint and rebuild; do not --from 2 past this." ;;
+        *) echo "verification gate: the INSTRUMENT reported a problem (exit $rc)."
+           echo "Not a clean corpus and not a dirty one — an unusable verdict." ;;
+    esac
+    return $rc
+}
+
 # ── 1. corpus ────────────────────────────────────────────────────────────────
 build_corpus() {
     # NOT --balance: its own help records that scaling every register down to
@@ -90,9 +148,14 @@ build_corpus() {
     # describes an existing build and returns without fetching anything.
     # --max-source-share matters more than usual now that rfc fetches properly:
     # it is 9,825 documents and was 64% of the corpus on its own before the cap.
+    # --cache is corpus/raw, not cache/: as of 2026-10-15 the 18 sources added
+    # that week (falco zeek panther d3fend engage atlas attackflow mispgalaxy
+    # wazuh busybox auditdocs psconcept codeqlhelp …) are warm in corpus/raw and
+    # cold in cache/, so the old path re-fetched 13 upstreams for nothing.
     python3 -m training.corpus.build --out "$D/corpus/clean-$VER" \
-        --cache "$D/cache" --max-register-multiple 1.6 --max-source-share 0.15 \
-        && python3 -m training.corpus.build --out "$D/corpus/clean-$VER" --report
+        --cache "$D/corpus/raw" --max-register-multiple 1.6 --max-source-share 0.15 \
+        && python3 -m training.corpus.build --out "$D/corpus/clean-$VER" --report \
+        && verify_corpus_gate
 }
 
 # ── 2. tokenizer ─────────────────────────────────────────────────────────────

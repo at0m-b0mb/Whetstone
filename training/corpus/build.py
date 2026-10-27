@@ -46,13 +46,16 @@ import json
 import multiprocessing
 import os
 import pkgutil
+import re
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import time
 from collections import Counter
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Iterator
 
@@ -67,8 +70,39 @@ from .source import (
 
 __all__ = [
     "discover_sources", "build", "read_documents", "balance_report",
-    "DEFAULT_SOURCE_TIMEOUT",
+    "CorpusGateFailed", "DEFAULT_SOURCE_TIMEOUT", "GATE_MARKER",
 ]
+
+
+class CorpusGateFailed(RuntimeError):
+    """The written corpus did not pass :func:`~training.corpus.verify.verify_corpus`.
+
+    Raised at the very end of :func:`build`, after the balance report, so the
+    operator gets the full diagnosis and then the refusal rather than a refusal
+    with no context. Nothing is deleted: the leaking JSONL is the evidence that
+    says which adapter is leaking, and destroying it to feel safer would destroy
+    the only thing that names the bug. What stops the corpus being trained on is
+    :data:`GATE_MARKER`, which :func:`read_documents` refuses to read past.
+    """
+
+
+class _RedactionRefused(Exception):
+    """Redaction did not complete for a document, so nothing about it is trusted.
+
+    Separate from every other failure on purpose. ``redact_identity`` refuses
+    rather than degrades, and before this type existed its refusal landed in the
+    same ``except Exception`` as a malformed upstream file and was reported as
+    ``parse failed`` — which sends the reader to the adapter's parser when the
+    thing that needs fixing is that the adapter is carrying identity. The two
+    also need different blast radii: a parse failure is one bad file in a walk,
+    a redaction refusal is a source that has been handling identifying text all
+    along and whose earlier documents came out of the same walk.
+
+    Any exception out of the redactor becomes this, not just the documented
+    ``RuntimeError``. If the substitution raised a ``KeyError`` on a case-fold
+    the table does not hold, we equally do not know the document is clean, and
+    "we do not know" is the same answer as "it is dirty".
+    """
 
 
 def discover_sources() -> list[SourceSpec]:
@@ -203,6 +237,28 @@ _TIMEOUTS: list[tuple[str, float]] = []
 #: that is not something to learn about from a directory listing a week later.
 _STALE_REMOVED: list[tuple[str, int]] = []
 
+#: Sources discarded whole because redaction refused a document, re-listed after
+#: the balance report for a reason the other two lists do not share: a timeout
+#: or a failed fetch is somebody else's outage and the answer is to re-run. A
+#: redaction refusal is a defect in an adapter in this tree, and re-running it
+#: produces the same refusal — the fix is to stop that adapter carrying
+#: identifying text, not to try again.
+_REDACTION_REFUSED: list[tuple[str, str]] = []
+
+#: Per-source email counts, ``name -> (rewritten, kept_by_policy)``, printed
+#: after the balance report. The whole lesson of this audit is that a redactor
+#: which was added but never run is indistinguishable, from the code, from one
+#: that ran and found nothing — so the chokepoint reports what it did on every
+#: build, and a ``keep`` decision that nobody intended is visible as a number
+#: instead of waiting to be discovered in a checkpoint.
+_EMAIL_COUNTS: dict[str, list[int]] = {}
+
+#: Written into the corpus directory on every build with the verification
+#: gate's verdict. Its ``FAIL`` form is what :func:`read_documents` refuses to
+#: read past, which is how one gate run protects the tokenizer, the shard writer
+#: and the data loader without any of them having to remember to ask.
+GATE_MARKER = "CORPUS-GATE.txt"
+
 #: How long to wait for a SIGTERM to land before escalating to SIGKILL. A child
 #: wedged in a C call has no Python-level cleanup to run, so this is short; the
 #: only thing it buys is a chance for a well-behaved child to close its files.
@@ -226,6 +282,18 @@ class _SourceRun:
     partial: str = ""
     #: True only for a blown budget, so it can be re-listed after the report.
     timed_out: bool = False
+    #: ``(rewritten, kept)`` address counts from the child's redaction pass, or
+    #: ``None`` when no child ran. Carried back explicitly because the child
+    #: redacts before it writes its transport file, so the work happens in a
+    #: process whose module globals the parent never sees — and a build report
+    #: that silently counted zero because the counting ran somewhere else would
+    #: be the same class of lie as the redactor that was never called.
+    #:
+    #: ``None`` rather than ``(0, 0)`` because the two are different facts: no
+    #: child ran, versus a child ran and found no addresses. The parent's own
+    #: pass is a second, idempotent sweep over text the child already cleaned,
+    #: so adding the two together would report every address twice.
+    emails: tuple[int, int] | None = None
 
 
 def _child_main(
@@ -260,9 +328,34 @@ def _child_main(
 
         status["phase"] = "documents"
         emitted = 0
+        policy = _email_policy(spec.name)
+        emails = [0, 0]
         with docs_path.open("w", encoding="utf-8") as fh:
             try:
                 for doc in spec.documents(path):
+                    # Redact HERE, before the transport file is written, and
+                    # again at the chokepoint in the parent. Not belt and
+                    # braces — the two calls guard different things.
+                    #
+                    # This hop is a real file on a real disk holding every
+                    # document of every source in the final schema, and under
+                    # scripts/overnight.sh TMPDIR is the external volume, so the
+                    # spill lands beside the corpus it is supposed to be a
+                    # redacted version of. Redacting only in the parent meant
+                    # the unredacted set existed on disk for the length of the
+                    # source and survived anything that stopped the parent
+                    # before its ``finally``. Redacting first means the worst a
+                    # SIGKILL can leave behind is an artifact of the same class
+                    # as the corpus, which is the only version of this guarantee
+                    # that does not depend on cleanup running.
+                    #
+                    # The parent's call stays because ``--source-timeout 0`` has
+                    # no child at all, and because redaction must be the last
+                    # thing to touch the text. Both passes are idempotent: every
+                    # replacement this produces is drawn from a vocabulary that
+                    # the matchers deliberately do not match, so a second pass
+                    # is a no-op rather than a second substitution.
+                    doc = _redacted(doc, policy, emails)
                     # Exactly the schema build() writes to the final corpus
                     # JSONL, so the two encodings cannot drift apart.
                     #
@@ -287,6 +380,16 @@ def _child_main(
                 # and stays valid, which is what the in-process build did too.
                 status["error"] = f"{type(exc).__name__}: {exc}"
         status["emitted"] = emitted
+        # A FILE OF ITS OWN, not a field on the status record. That record is
+        # written last, in a finally, precisely so that its absence means the
+        # child was killed — `_child_fatal` reads it that way and a test pins
+        # its exact shape. A tally has nothing to do with how the process
+        # ended, and hanging one on it would blunt the only signal there is.
+        # This file's absence means zero, which is the right default for a
+        # count.
+        with contextlib.suppress(OSError):
+            (docs_path.parent / _EMAIL_COUNTS_FILE).write_text(
+                json.dumps(emails), encoding="utf-8")
         if not status["error"]:
             status["phase"] = "ok"
     finally:
@@ -412,6 +515,26 @@ def _child_fatal(status: dict, docs_path: Path, elapsed: float) -> str:
     return ""
 
 
+#: Where the child leaves its address tally. Separate from the status record on
+#: purpose: see _child_main.
+_EMAIL_COUNTS_FILE = "emails.json"
+
+
+def _read_child_emails(workdir: Path) -> tuple[int, int]:
+    """The child's ``(rewritten, kept)`` address counts, or zeros.
+
+    Zeros for an unreadable or absent file, which is the honest default: a
+    count that could not be read is not evidence that redaction did nothing,
+    and the build report shows the number beside the source name so a zero on a
+    source known to carry addresses is visible rather than reassuring.
+    """
+    try:
+        value = json.loads((workdir / _EMAIL_COUNTS_FILE).read_text(encoding="utf-8"))
+        return (int(value[0]), int(value[1]))
+    except (OSError, ValueError, TypeError, IndexError, KeyError):
+        return (0, 0)
+
+
 def _read_child_documents(path: Path) -> Iterator[Document]:
     """Stream the child's JSONL back as Documents.
 
@@ -498,7 +621,15 @@ def _source_documents(
         return
 
     ctx = multiprocessing.get_context("spawn")
+    # mkdtemp is already 0700, which is stated rather than relied on: this
+    # directory holds every document of one source, and on a shared or
+    # multi-user machine a transport file is as readable as the corpus. The
+    # child redacts before it writes here, so what is inside carries the same
+    # guarantee as the output — but the mode is the thing that stops anybody
+    # else reading it in the window before the rmtree below, and a comment is
+    # cheaper than discovering the default changed.
     workdir = Path(tempfile.mkdtemp(prefix=f"whetstone-corpus-{spec.name}-"))
+    os.chmod(workdir, 0o700)
     docs_path = workdir / "documents.jsonl"
     status_path = workdir / "status.json"
     proc = ctx.Process(
@@ -542,11 +673,19 @@ def _source_documents(
             return
 
         yield _SourceRun(_read_child_documents(docs_path),
-                         partial=status.get("error", ""))
+                         partial=status.get("error", ""),
+                         emails=_read_child_emails(workdir))
     finally:
         # Unconditional: a KeyboardInterrupt in the parent must not leave a
         # child holding a core, and setsid means the child no longer shares the
         # terminal's Ctrl-C.
+        #
+        # A `finally` covers every exception and a Ctrl-C. It does not cover a
+        # SIGKILL of the parent or a power loss, and no amount of cleanup code
+        # can, which is precisely why the child redacts before it writes: this
+        # guarantee is "the spill is no worse than the corpus", not "the spill
+        # is always removed". Claiming the second would be the fail-open shape
+        # this whole file exists to avoid.
         _kill_child(proc)
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -561,6 +700,7 @@ def build(
     max_register_multiple: float = 0.0,
     min_chars: int = 40,
     source_timeout: float = DEFAULT_SOURCE_TIMEOUT,
+    require_identity_table: bool = True,
 ) -> list[BuildStats]:
     """Fetch, clean, dedupe and write the corpus. Returns per-source stats.
 
@@ -570,13 +710,29 @@ def build(
     because from the corpus's point of view they are the same event. 0 disables
     the watchdog and runs every source in this process, which is the behaviour
     that let one runaway regex burn seven and a half hours.
+
+    ``require_identity_table`` refuses to start when this machine has nothing
+    identifying for :func:`~training.trajectories.redact_identity` to remove.
+    That sounds like a non-event and it is the fail-open: the redactor's first
+    two lines are ``pattern = _identity_pattern(); if pattern is None: return
+    text``, so on a host whose account name, host name and temp dir are all
+    generic — a container running as root, a CI runner, a uid missing from the
+    passwd database — every document is returned byte-for-byte and *nothing says
+    so*. A build with an empty table is identical in its output and in its log
+    to a build where redaction ran and found nothing. Pass ``False`` only when
+    there is genuinely no identity to protect, and know that it is the one flag
+    in this file that can make the corpus worse in a way the report cannot show.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     _TIMEOUTS.clear()
     _STALE_REMOVED.clear()
+    _REDACTION_REFUSED.clear()
+    _EMAIL_COUNTS.clear()
+    _preflight_redaction(require_identity_table=require_identity_table)
     all_specs = discover_sources()
+    _check_email_policy_names(all_specs)
     specs = [s for s in all_specs if s.name in only] if only else list(all_specs)
     if not specs:
         raise SystemExit(
@@ -612,8 +768,21 @@ def build(
 
         # A source may declare its own budget; otherwise it gets the build's.
         budget = spec.timeout if spec.timeout is not None else source_timeout
+        policy = _email_policy(spec.name)
         kept: list[Document] = []
+        # Fingerprints this source added to the shared `seen` set, so that
+        # discarding the source can also undo its claim on them. Without this a
+        # discarded source still suppresses an identical document in a later
+        # one, and the later source is then the one that looks short.
+        claimed: list[str] = []
+        refused = ""
+        # (rewritten, kept) address counts for this source. The parent's own
+        # pass and the child's are summed, because with the watchdog armed the
+        # child does the work and with --source-timeout 0 the parent does.
+        emails = [0, 0]
+        run_emails: tuple[int, int] | None = None
         with _source_documents(spec, cache_dir, budget) as run:
+            run_emails = run.emails
             if run.fatal:
                 # A failed fetch, a blown budget or a dead child all land here
                 # and are all handled the same way they always were: named,
@@ -640,19 +809,42 @@ def build(
                     #
                     # So it happens here, once, on the way in, where no future
                     # adapter can forget it. redact_identity refuses rather than
-                    # degrades: a survivor raises instead of being written, and
-                    # the raise is caught below as a source-level failure, which
-                    # is the correct blast radius — one bad source is skipped
-                    # and named, the corpus is not silently contaminated.
-                    doc = _redacted(doc)
+                    # degrades: a survivor raises instead of being written.
+                    #
+                    # **The blast radius of that refusal is the whole source**,
+                    # and the comment that used to sit here claimed the opposite
+                    # — "one bad source is skipped and named". It was not. The
+                    # `except` wraps this entire loop while `kept` is appended
+                    # to inside it, and `collected[spec.name] = kept` ran
+                    # unconditionally afterwards, so a refusal TRUNCATED the
+                    # source and wrote every document before the offending one
+                    # to disk. Those are precisely the documents that cannot be
+                    # trusted: they came out of the same adapter and the same
+                    # walk as the one caught carrying identity, and the only
+                    # thing distinguishing them is that the redactor had not
+                    # reached them yet. The run was then labelled `parse failed`
+                    # and the source appeared in the balance report as a healthy
+                    # contributor *and* in the failure list.
+                    #
+                    # This file's own standard, from _source_documents: "Skipped
+                    # and named is honest; truncated and counted is not." The
+                    # timeout path obeys it. Now so does this one.
+                    doc = _redacted(doc, policy, emails)
                     fp = doc.fingerprint
                     if fp in seen:
                         st.duplicates += 1
                         continue
                     seen.add(fp)
+                    claimed.append(fp)
                     kept.append(doc)
                     st.docs += 1
                     st.chars += doc.n_chars
+            except _RedactionRefused as exc:
+                # Not an error on the source's stats yet: the whole source is
+                # about to be discarded, so the counts those stats hold describe
+                # documents that will never be written and must not survive into
+                # the report.
+                refused = f"REDACTION REFUSED after {st.docs} docs: {exc}"
             except Exception as exc:
                 # Reached when documents() runs in this process (timeout
                 # disabled), and when the child's JSONL itself is unreadable.
@@ -664,16 +856,76 @@ def build(
                 # child, so the exception never crosses into this process. Worded
                 # identically, and with this process's post-dedup count, so the
                 # two paths are indistinguishable in a build log.
-                st.error = f"parse failed after {st.docs} docs: {run.partial}"
-                print(f"   ! {st.error}")
+                #
+                # Except for one case, which has to cross the process boundary
+                # as well: the child redacts before it writes its transport
+                # file, so a refusal can happen over there. The marker travels
+                # inside the message because that is the only channel the status
+                # record has, and treating it as a parse failure here would
+                # reinstate exactly the truncation this function just fixed.
+                if _REFUSAL_MARKER in run.partial:
+                    refused = f"REDACTION REFUSED after {st.docs} docs: {run.partial}"
+                else:
+                    st.error = f"parse failed after {st.docs} docs: {run.partial}"
+                    print(f"   ! {st.error}")
 
+        if refused:
+            # Discard the source whole. `collected` is never assigned, so the
+            # write loop below treats it exactly as it treats a timeout: no file
+            # is written, and any file a previous build left behind is removed
+            # and named, because a directory must not hold two builds at once.
+            seen.difference_update(claimed)
+            st.docs = st.chars = st.duplicates = 0
+            st.error = refused
+            _REDACTION_REFUSED.append((spec.name, refused))
+            print(f"   ! {refused}")
+            print(f"   ! {spec.name} discarded ENTIRELY — the documents before "
+                  f"the refusal came from the same walk and are not trusted")
+            continue
+
+        # The child's pass IS the redaction when the watchdog is armed; the
+        # parent's loop is an idempotent second sweep over text already clean.
+        # Summing them would double every address.
+        _EMAIL_COUNTS[spec.name] = (list(run_emails) if run_emails is not None
+                                    else emails)
         collected[spec.name] = kept
         _note_source(st)
-        if st.docs < spec.expect_min_docs:
+        if not kept and not st.error:
+            # A source that gave nothing, with nothing to blame. balance_report
+            # builds its register table from `[s for s in stats if s.docs]` and
+            # its failure list from `[s for s in stats if s.error]`, so this
+            # source would appear in NEITHER — it vanishes from the report and
+            # reads, to anyone looking, like a source that simply had nothing to
+            # give. _note_if_emptied already makes this argument for a source a
+            # cap reduced to zero, and is wired only into the caps; this is the
+            # same hole one door along. Recording it as an error is not a
+            # mischaracterisation: a whole upstream is missing from the corpus,
+            # and the failure list is the only channel the report already
+            # watches.
+            st.error = ("produced 0 documents and reported no failure — the "
+                        "whole source is absent from the corpus, and the "
+                        f"register table cannot show that (expected at least "
+                        f"{spec.expect_min_docs:,})")
+            print(f"   ! {st.error}")
+        elif st.docs < spec.expect_min_docs:
             print(f"   ! expected at least {spec.expect_min_docs:,} docs but got "
                   f"{st.docs:,} — upstream layout may have changed")
 
     _strip_boilerplate(collected, stats)
+
+    # Redaction has to be the LAST thing that touches the text, and until this
+    # call it was not. _redacted runs in the document loop above;
+    # _strip_boilerplate runs here and *mutates* text, so the guarantee the
+    # chokepoint comment implied — "every written byte passed redaction" — was
+    # really "every byte passed redaction and was then edited again". Boilerplate
+    # removal only deletes, so it cannot introduce a literal that was not
+    # already latent; it can delete the characters separating two halves of one.
+    #
+    # Re-redacting the documents it changed is cheaper than reasoning about
+    # whether line-granular deletion can ever join two fragments, and an
+    # invariant that rests on nobody adding a third transform later is not an
+    # invariant. Everything after this point only selects and drops.
+    _reredact_mutated(collected, stats)
 
     if max_source_share:
         _cap_source_share(collected, stats, max_source_share)
@@ -720,8 +972,20 @@ def build(
                     "ident": doc.ident,
                 }, ensure_ascii=False) + "\n")
 
+    # Verify the ARTIFACT, not the intention. Every finding in the audit this
+    # function was rewritten for comes back to one sentence: a redactor that was
+    # added but never run is indistinguishable, from the code, from one that ran
+    # and found nothing. The corpus on disk shipped an email address the adapter
+    # had learned to remove twenty days earlier, and nothing noticed, because
+    # nothing ever read the output back. One pass over the written JSONL would
+    # have caught it on day one — so here is the pass, over the bytes, after
+    # every transform, where no in-memory reasoning about ordering can be wrong.
+    gate = _verify_written(out_dir, stats)
+
     orphans = _write_provenance(out_dir, all_specs, stats)
     print("\n" + balance_report(stats))
+    if _EMAIL_COUNTS:
+        print("\n" + _email_report())
     if _TIMEOUTS:
         # Re-listed for the same reason import failures are, and it is the more
         # expensive mistake of the two: in the report above, a source that was
@@ -767,25 +1031,732 @@ def build(
               f"absent from the report above:")
         for name, err in _IMPORT_FAILURES:
             print(f"  ! {name}: {err}")
+    if _REDACTION_REFUSED:
+        # Its own list rather than a line in the timeout one, because the action
+        # is different. A timeout says re-run; a redaction refusal says an
+        # adapter in this tree is carrying identifying text and will refuse
+        # again, identically, forever, until it is fixed.
+        print(f"\n{len(_REDACTION_REFUSED)} source(s) were DISCARDED WHOLE "
+              f"because redaction refused a document:")
+        for name, why in _REDACTION_REFUSED:
+            print(f"  ! {name}: {why}")
+            print(f"    Nothing from {name} was written. Re-running will refuse "
+                  f"again — the fix is in the adapter, which is handing the "
+                  f"chokepoint text carrying this machine's identity.")
+    print("\n" + gate.report)
+    if not gate.ok:
+        raise CorpusGateFailed(gate.report)
     return stats
 
 
 
-def _redacted(doc):
-    """Substitute this machine's identity out of a document before it is kept.
+# ---------------------------------------------------------------------------
+# The chokepoint.
+#
+# Two kinds of identifier reach this corpus and they need different answers.
+#
+# THIS MACHINE'S IDENTITY — account name, home path, host name, per-user temp
+# directory — is removed by training.trajectories.redact_identity, which derives
+# its table from the operating system at runtime rather than from a configured
+# list. That distinction is the whole design: a configured list is a list of the
+# leaks somebody already noticed.
+#
+# EMAIL ADDRESSES are a different problem, and before this they were handled in
+# exactly one adapter as a courtesy. ownrepos.py grew a redactor because it swept
+# up a university project README listing four people by name with their
+# addresses — the author's own, and three .edu addresses belonging to other
+# students who never agreed to be in a training corpus. The redactor worked. It
+# had also never been run: its module's mtime was twenty days later than the
+# corpus file's, and the shipped document still carried all eight addresses with
+# not one placeholder anywhere in 208,346 documents.
+#
+# So email redaction moves here, where no adapter can forget it, and the policy
+# is written down instead of being whatever one adapter happened to do.
+# ---------------------------------------------------------------------------
+
+#: Address shape. Deliberately the same expression ownrepos.py used, so that
+#: moving the pass here cannot change which strings count as an address.
+#:
+#: The trailing ``\.[A-Za-z]{2,}`` is what keeps this off the corpus's enormous
+#: population of at-signs that are not addresses: ``pkg@1.2.3``, ``HEAD@{1}``,
+#: ``user@host`` in an ssh line and ``@staticmethod`` all fail it, because a
+#: dotted alphabetic suffix of two or more characters is the one part of an
+#: address that none of those have.
+_EMAIL = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+
+#: Local parts that name a *mailbox* rather than a person, from RFC 2142 plus
+#: the automated senders every log corpus is full of. ``security@vendor.example``
+#: in an advisory is a published reporting channel; rewriting it identifies
+#: nobody better and destroys signal a security model should have — that
+#: vulnerabilities go to ``security@`` and bounces come from ``mailer-daemon``.
+_EMAIL_ROLE_LOCALS = frozenset({
+    # RFC 2142 §3-5
+    "postmaster", "abuse", "noc", "security", "hostmaster", "webmaster",
+    "usenet", "news", "uucp", "ftp", "info", "marketing", "sales", "support",
+    # Automated senders and system accounts.
+    "noreply", "no-reply", "donotreply", "do-not-reply", "mailer-daemon",
+    "root", "admin", "administrator", "nobody", "daemon", "bounces",
+})
+
+#: Reserved for documentation and testing, and therefore *deliberate content*.
+#: RFC 2606 names the four TLDs and the three second-level domains; RFC 6761
+#: reserves ``localhost``. This corpus is full of them on purpose — a payload,
+#: a man page, an RFC example — and rewriting one corrupts the example while
+#: protecting nobody. Same discipline as not counting ``192.0.2.0/24`` as a leak.
+_EMAIL_RESERVED_TLDS = frozenset({"test", "example", "invalid", "localhost"})
+_EMAIL_RESERVED_DOMAINS = frozenset({"example.com", "example.net", "example.org"})
+
+#: The replacement for an address that belongs to the operator of this machine.
+#: One fixed literal, because there is no generalisation argument to make about
+#: a handful of occurrences and a single obvious marker is easier to grep for.
+_HOST_EMAIL_REPLACEMENT = "operator@example.invalid"
+
+#: The pseudonym vocabulary. 8 local parts x 8 buckets = 64 distinct
+#: placeholders, all under RFC 2606's ``.invalid``.
+#:
+#: **Why not one placeholder.** The obvious implementation substitutes a single
+#: string, and it passes the privacy gate while making the model worse. There
+#: are roughly 7,700 address occurrences in the sources this policy rewrites;
+#: collapsing them onto one 26-character literal creates a new high-frequency
+#: sequence in a corpus whose measured problem is already literals repeated
+#: hundreds of times each. Privacy is satisfied by *any* substitution.
+#: Generalisation is satisfied only by a varied one, and the two are the same
+#: pass but not the same problem.
+#:
+#: **Why not more than 64.** The bucket is derived from the address, so it is
+#: information about it. 64 buckets over ~3,900 distinct addresses puts about 60
+#: real addresses in each — the bucket is a lossy class label, not a
+#: fingerprint, and no amount of corpus reading recovers an address from it.
+#: Push the count up for more variety and each bucket narrows toward identifying
+#: its members; this is where that trade stops being worth taking.
+#:
+#: ``operator`` is deliberately absent: it is redact_identity's own replacement
+#: for the account name, and two redactors sharing a placeholder makes every
+#: later question about which one produced a string unanswerable.
+_EMAIL_LOCAL_VOCAB = (
+    "contributor", "maintainer", "author", "reporter",
+    "reviewer", "analyst", "engineer", "researcher",
+)
+_EMAIL_BUCKETS = 8
+
+#: Sources exempt from third-party email redaction, and *why*, per source. The
+#: default is to redact; this table is the whole of the exception, which is the
+#: point — "the public standards policy" was previously an accident (no source
+#: redacted anything except ownrepos) and is now four lines somebody can argue
+#: with.
+#:
+#: The line drawn here: an address is kept only where the address is part of the
+#: licensed artifact rather than incidental to it. Those two sources carry ~72%
+#: of all address occurrences in the corpus, so this is not a rounding decision.
+#:
+#: Everything else redacts, including upstream material that is already public.
+#: Three reasons. (1) Nothing requires it: the CC-BY and CC-BY-SA sources here
+#: satisfy attribution with the provenance line each adapter already writes,
+#: naming the repository and its licence — not with an address in a document
+#: body. (2) A published checkpoint memorises what it is shown and cannot be
+#: grepped afterwards, so "already public" is not the same as "safe to bake in".
+#: (3) For the detection sources, where an address is sometimes an indicator of
+#: compromise, the signal a from-scratch model needs is that a YARA rule matches
+#: on address-shaped strings — not the exact address of a mail drop from 2019,
+#: which is both stale and the only part that is somebody's identity.
+#:
+#: A new adapter therefore defaults to the safe side, and the per-source counts
+#: printed after every balance report are how an over-redaction gets noticed in
+#: one build instead of in a checkpoint.
+_EMAIL_KEEP: dict[str, str] = {
+    "rfc": ("IETF Trust Legal Provisions permit reproduction and distribution "
+            "of an RFC *in full*. The author block is part of the document, so "
+            "a copy with the addresses rewritten is no longer the copy the "
+            "licence permits."),
+    "kerneldocs": ("Author, maintainer and Signed-off-by lines are the kernel's "
+                   "Developer Certificate of Origin record. Rewriting them does "
+                   "not anonymise a contributor who signed publicly — it "
+                   "misrepresents who certified the contribution."),
+}
+
+#: Sources whose text comes from THIS machine's filesystem rather than from a
+#: declared upstream. They redact by default like everything else; they are
+#: named so the decision is affirmative rather than inherited, because these are
+#: the ones where an address is in the corpus purely as a consequence of where
+#: the build ran, with nobody's consent and no licence covering it.
+_EMAIL_HOST_DERIVED = ("ownrepos", "trajectories", "manpages")
+
+#: Marker that carries a redaction refusal across the parent/child boundary.
+#: The child records ``f"{type(exc).__name__}: {exc}"``, so the class name *is*
+#: the wire format; deriving it rather than retyping it means a rename cannot
+#: silently turn a refusal back into a "parse failed".
+_REFUSAL_MARKER = _RedactionRefused.__name__
+
+
+@dataclass(frozen=True)
+class _EmailPolicy:
+    """What to do about third-party addresses in one source, and why."""
+
+    source: str
+    keep_third_party: bool
+    reason: str
+
+
+def _email_policy(name: str) -> _EmailPolicy:
+    """Resolve one source's email policy. Unknown sources redact."""
+    if name in _EMAIL_KEEP:
+        return _EmailPolicy(name, True, _EMAIL_KEEP[name])
+    if name in _EMAIL_HOST_DERIVED:
+        return _EmailPolicy(name, False, "built from this machine's filesystem")
+    return _EmailPolicy(name, False, "third-party upstream, default policy")
+
+
+def _check_email_policy_names(specs: list[SourceSpec]) -> None:
+    """Name a policy entry that applies to no source. Costs nothing, catches a rename.
+
+    A keep entry for a source that no longer exists is a policy nobody is
+    getting — the same silent-omission shape :func:`discover_sources` refuses a
+    hand-maintained registry for. Checked against every *discovered* source, not
+    the selection, so ``--only sigma`` does not accuse the other forty-six.
+    """
+    from . import sources as sources_pkg
+
+    # Read the package rather than ``specs``: the question is whether an
+    # adapter *file* was renamed, and answering it from a list the caller
+    # supplied would make every build with a narrowed selection — and every
+    # test that substitutes its own sources — accuse the other forty-six.
+    known = {info.name for info in pkgutil.iter_modules(sources_pkg.__path__)}
+    known |= {s.name for s in specs}
+    named = set(_EMAIL_KEEP) | set(_EMAIL_HOST_DERIVED)
+    stale = sorted(named - known)
+    if stale:
+        print(f"  ! email policy names {len(stale)} source(s) that do not "
+              f"exist: {', '.join(stale)} — a renamed adapter has silently "
+              f"fallen back to the default", file=sys.stderr)
+
+
+@lru_cache(maxsize=1)
+def _host_email_needles() -> frozenset[str]:
+    """This machine's own addresses, derived at runtime and never persisted.
+
+    Derived, not configured, for the reason the identity table is: a list of
+    identifiers written into a file is a list of the leaks somebody already
+    noticed, and the file itself becomes the next leak. The audit that found
+    these problems proved that the hard way — six of its own working files wrote
+    live addresses to disk as cleartext while its report said it had not.
+
+    So these come from ``git config`` and the environment, they live only in
+    this process, and nothing in this module ever prints one, writes one or puts
+    one in an exception message. The build reports a *count*.
+
+    An empty result is not a silent fail-open: every source that is built from
+    this machine's own filesystem redacts all addresses anyway, so this set only
+    does work in the two sources exempted by policy. The preflight prints its
+    size so that "nothing was found" and "nothing was looked for" are different
+    lines in the log.
+    """
+    found: set[str] = set()
+    for var in ("EMAIL", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"):
+        value = os.environ.get(var, "").strip().lower()
+        if value:
+            found.add(value)
+    for args in (["config", "--get-all", "user.email"],
+                 ["config", "--global", "--get-all", "user.email"]):
+        try:
+            out = subprocess.run(["git", *args], capture_output=True, text=True,
+                                 timeout=10, check=False)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        for line in out.stdout.splitlines():
+            value = line.strip().lower()
+            if value:
+                found.add(value)
+    # Only well-formed addresses: a misconfigured user.email of "me" would
+    # otherwise become a needle that matches a substring of ordinary prose.
+    return frozenset(v for v in found if _EMAIL.fullmatch(v))
+
+
+def _is_reserved_email_domain(domain: str) -> bool:
+    """True for the documentation and testing domains RFC 2606/6761 reserve."""
+    if domain in _EMAIL_RESERVED_DOMAINS:
+        return True
+    if any(domain.endswith("." + d) for d in _EMAIL_RESERVED_DOMAINS):
+        return True
+    return domain.rpartition(".")[2] in _EMAIL_RESERVED_TLDS
+
+
+def _email_pseudonym(address: str) -> str:
+    """A stable, varied, shape-preserving placeholder for one address.
+
+    ``blake2b`` rather than :func:`hash`, which is salted per process: the same
+    address must map to the same placeholder in every build and on every
+    machine, or the corpus is not reproducible and the dedup fingerprints move
+    under it. Same argument :func:`_cap_source_share` makes for its selection.
+    """
+    digest = hashlib.blake2b(address.encode("utf-8"), digest_size=8).digest()
+    h = int.from_bytes(digest, "big")
+    local = _EMAIL_LOCAL_VOCAB[h % len(_EMAIL_LOCAL_VOCAB)]
+    bucket = (h // len(_EMAIL_LOCAL_VOCAB)) % _EMAIL_BUCKETS
+    return f"{local}-{bucket}@example.invalid"
+
+
+def _email_replacement(address: str, policy: _EmailPolicy) -> str | None:
+    """What one address becomes, or ``None`` to leave it alone.
+
+    The order of these four tests is the policy, and the first one is the only
+    rule with no exception anywhere: an address of the operator's is removed from
+    every source including the exempt ones. He can publish his own address on
+    his own website whenever he likes; a checkpoint is not a place he can
+    un-publish it from.
+    """
+    low = address.lower()
+    if low in _host_email_needles():
+        return _HOST_EMAIL_REPLACEMENT
+    local, _, domain = low.rpartition("@")
+    if _is_reserved_email_domain(domain):
+        return None                       # documentation, on purpose
+    if local in _EMAIL_ROLE_LOCALS:
+        return None                       # a mailbox, not a person
+    if policy.keep_third_party:
+        return None                       # named in _EMAIL_KEEP, with a reason
+    return _email_pseudonym(low)
+
+
+def _redact_emails(text: str, policy: _EmailPolicy) -> tuple[str, int, int]:
+    """Apply the policy to ``text``. Returns (text, rewritten, kept).
+
+    Both counts are returned because only reporting the rewrites would make an
+    all-keep policy look identical to a redactor that never ran, which is the
+    failure this whole pass exists to end.
+    """
+    if "@" not in text:
+        return text, 0, 0
+    tally = [0, 0]
+
+    def _one(match: re.Match[str]) -> str:
+        address = match.group(0)
+        replacement = _email_replacement(address, policy)
+        if replacement is None:
+            tally[1] += 1
+            return address
+        tally[0] += 1
+        return replacement
+
+    return _EMAIL.sub(_one, text), tally[0], tally[1]
+
+
+def _scrubbed(text: str, policy: _EmailPolicy) -> tuple[str, int, int]:
+    """Addresses then identity, in that order, with every failure a refusal.
+
+    **Emails first, and the order is load-bearing.** The identity table holds
+    the account name, and on this machine the account name is a substring of the
+    operator's own address. Redacting identity first turns that address into
+    ``operator@<provider>`` — which no longer matches the host needle set, so
+    the one rule with no exception would silently stop firing. Addresses are
+    matched whole, before anything mangles them.
+
+    Any exception out of the identity redactor becomes :class:`_RedactionRefused`.
+    It documents a ``RuntimeError`` for a survivor, and it is also capable of a
+    ``KeyError`` when a Unicode case-fold matches its case-insensitive pattern
+    but is not a key of its own table. The two mean the same thing here: the
+    redactor did not complete, so nothing about this document is known.
+    """
+    from training.trajectories import redact_identity
+
+    out, rewritten, kept = _redact_emails(text, policy)
+    try:
+        out = redact_identity(out)
+    except _RedactionRefused:
+        raise
+    except Exception as exc:
+        # The message carries the exception type and the redactor's own words,
+        # which name the surviving FORM (a table key such as "the home path"),
+        # never a value — redact_identity reports forms, and this must not be
+        # the place that starts reporting values.
+        raise _RedactionRefused(f"{type(exc).__name__}: {exc}") from exc
+    return out, rewritten, kept
+
+
+def _redacted(doc, policy: _EmailPolicy | None = None,
+              tally: list[int] | None = None):
+    """Remove this machine's identity and policy-covered addresses from a document.
 
     Imported lazily because :mod:`training.trajectories` pulls in the kernel and
     the adapters, and the corpus builder has no other reason to depend on them.
     If that import ever fails the build must FAIL rather than quietly write
     unredacted text — a corpus that is clean only when an optional import
-    succeeds is a corpus nobody can make a claim about.
+    succeeds is a corpus nobody can make a claim about. :func:`build` therefore
+    does the import once in its preflight, before a single byte is fetched.
+
+    **``ident`` as well as ``text``.** This used to touch ``text`` only, and
+    ``ident`` is written into the shipped JSONL beside it. Several adapters build
+    ``ident`` from a filesystem path — ``logsamples`` from the repository path,
+    ``metasploit`` from the module path, ``cloudsec``/``sigma``/``nuclei``/
+    ``elastic`` from relative paths — so an absolute path off this machine in any
+    adapter's ``ident`` landed in the corpus with no redaction and no check. It
+    does not reach the tokenizer, which reads ``row["text"]`` only; it reaches
+    everybody who reads or is sent the corpus file, which is the population this
+    is about.
+
+    ``getattr`` rather than attribute access because the field is optional on
+    the Document and because this function is called directly by tests with
+    minimal stand-ins, and a redactor that requires a particular shape of input
+    is a redactor somebody will route around.
     """
     from dataclasses import replace
 
-    from training.trajectories import redact_identity
+    if policy is None:
+        policy = _email_policy(getattr(doc, "source", ""))
 
-    clean = redact_identity(doc.text)
-    return doc if clean == doc.text else replace(doc, text=clean)
+    updates = {}
+    text, rewritten, kept = _scrubbed(doc.text, policy)
+    if text != doc.text:
+        updates["text"] = text
+
+    ident = getattr(doc, "ident", "") or ""
+    if ident:
+        clean, r_ident, k_ident = _scrubbed(ident, policy)
+        rewritten += r_ident
+        kept += k_ident
+        if clean != ident:
+            updates["ident"] = clean
+
+    if tally is not None:
+        tally[0] += rewritten
+        tally[1] += kept
+    return replace(doc, **updates) if updates else doc
+
+
+def _reredact_mutated(
+    collected: dict[str, list[Document]], stats: list[BuildStats]
+) -> None:
+    """Re-run the chokepoint after the last transform that edits text.
+
+    Expected to be a no-op on every document, and that is exactly why it is
+    here: the alternative is an argument that line-granular deletion can never
+    join two halves of a literal, and an invariant that rests on an argument
+    about a transform somebody else will add later is not an invariant. When it
+    is *not* a no-op, that is a finding and it says so.
+
+    A refusal at this point discards the source the same way the document loop
+    does. Nothing has been written yet, so the blast radius is identical.
+    """
+    st_by_name = {s.name: s for s in stats}
+    changed = 0
+    for name in list(collected):
+        policy = _email_policy(name)
+        try:
+            rebuilt = [_redacted(d, policy) for d in collected[name]]
+        except _RedactionRefused as exc:
+            why = (f"REDACTION REFUSED after boilerplate removal: {exc}. "
+                   f"Stripping a recurring line re-exposed a literal, which "
+                   f"means the in-loop redaction was not the last word")
+            del collected[name]
+            st = st_by_name.get(name)
+            if st is not None:
+                st.docs = st.chars = st.duplicates = 0
+                st.error = why
+            _REDACTION_REFUSED.append((name, why))
+            print(f"   ! {name}: {why}")
+            continue
+        changed += sum(1 for old, new in zip(collected[name], rebuilt)
+                       if new.text != old.text or new.ident != old.ident)
+        collected[name] = rebuilt
+        st = st_by_name.get(name)
+        if st is not None:
+            st.chars = sum(d.n_chars for d in rebuilt)
+            st.docs = len(rebuilt)
+    if changed:
+        print(f"\n  ! REDACTION FIRED AFTER BOILERPLATE REMOVAL on {changed:,} "
+              f"document(s). Deleting a recurring line joined two fragments "
+              f"into a literal the in-loop pass could not see. The documents are "
+              f"clean — this pass is why — but the boilerplate keys are worth "
+              f"looking at.")
+
+
+def _preflight_redaction(*, require_identity_table: bool) -> None:
+    """Prove the redactor can work before anything is fetched.
+
+    Two refusals, both before the first byte of download, for the same reason
+    :func:`build` refuses an unsatisfiable share cap up front: the condition is
+    knowable from the start and discovering it after an hour of fetching costs
+    the hour.
+
+    The import is first because :func:`_redacted`'s contract is that a failed
+    import fails the build. Left to happen lazily inside the document loop it
+    was caught as a per-source ``parse failed`` and the build carried on writing
+    unredacted text for forty-seven sources.
+
+    The empty-table check is the fail-open. ``redact_identity`` opens with
+    ``pattern = _identity_pattern(); if pattern is None: return text`` — so on a
+    host with nothing identifying to find, every document is returned
+    byte-for-byte and nothing is logged. A build with an empty table produces
+    the same output and the same log as a build where redaction ran and found
+    nothing, which is the one shape this codebase has already been bitten by.
+    ``_identity_table`` is private and is imported anyway: it is the only way to
+    ask the redactor whether it has anything to do, and the alternative is to
+    assume.
+    """
+    try:
+        from training.trajectories import _identity_table, redact_identity
+        # Called, not merely imported. A name that imports and then raises on
+        # its first use is precisely the failure this preflight exists to move
+        # to the front of the build, and the empty string is enough to force
+        # the table build and the pattern compile.
+        redact_identity("")
+    except Exception as exc:
+        raise SystemExit(
+            f"the identity redactor will not import ({type(exc).__name__}: "
+            f"{exc}), so no corpus built now could be claimed to be redacted. "
+            f"Fix the import rather than building — a corpus that is clean only "
+            f"when an optional import succeeds is a corpus nobody can make a "
+            f"claim about."
+        ) from exc
+
+    forms = len(_identity_table())
+    needles = len(_host_email_needles())
+    print(f"redaction: {forms} identity form(s) for this host, {needles} host "
+          f"email identity/ies, {len(_EMAIL_KEEP)} source(s) exempt from "
+          f"third-party email redaction by policy")
+    if forms or not require_identity_table:
+        if not forms:
+            print("  ! identity redaction is INACTIVE and the build was asked "
+                  "to proceed anyway. Nothing this run writes carries an "
+                  "identity guarantee.", file=sys.stderr)
+        return
+    raise SystemExit(
+        "identity redaction would be a no-op on this host: the table is empty, "
+        "so redact_identity returns every document unchanged and says nothing "
+        "about it. That is indistinguishable, in the output and in this log, "
+        "from a build where redaction ran and found nothing — which is the "
+        "exact failure this chokepoint exists to prevent. Pass "
+        "require_identity_table=False (--allow-unidentified-host) if this host "
+        "genuinely has no identity to protect."
+    )
+
+
+def _email_report() -> str:
+    """Per-source address counts and the policy that produced them.
+
+    Printed on every build. A redactor that cannot show what it did on this run
+    is a redactor nobody can distinguish from one that was never called, and
+    that distinction is what twenty days of a shipped corpus cost.
+    """
+    lines = ["email policy", "-" * 58,
+             f"{'source':<18}{'rewritten':>11}{'kept':>8}   policy"]
+    for name in sorted(_EMAIL_COUNTS):
+        rewritten, kept = _EMAIL_COUNTS[name]
+        if not (rewritten or kept):
+            continue
+        keep = name in _EMAIL_KEEP
+        label = "KEEP (exempt)" if keep else "redact"
+        lines.append(f"{name:<18}{rewritten:>11,}{kept:>8,}   {label}")
+    lines += [
+        "",
+        "kept = reserved documentation domains (RFC 2606), role mailboxes "
+        "(RFC 2142),",
+        "       and the sources exempted by policy:",
+    ]
+    for name, reason in sorted(_EMAIL_KEEP.items()):
+        lines.append(f"  {name}: {reason}")
+    return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class _GateResult:
+    """Whether the written corpus passed verification, and what to print."""
+
+    ok: bool
+    report: str
+
+
+def _verify_written(out_dir: Path, stats: list[BuildStats]) -> _GateResult:
+    """Scan the JSONL that was just written and decide whether it may be used.
+
+    This is the piece whose absence produced every finding in the audit. The
+    redactor was correct, the adapter's fix was correct, and the corpus on disk
+    carried four people's email addresses for twenty days — because *nothing
+    ever read the output back*. From the code alone, a redactor that was added
+    but never run is indistinguishable from one that ran and found nothing. The
+    only thing that tells those apart is a pass over the bytes.
+
+    Over the bytes, deliberately, and not over the in-memory documents: that
+    makes the ordering of every transform above irrelevant, which is the right
+    way to hold this invariant rather than by inspecting call sites.
+
+    Nothing is deleted on a failure. The leaking file is the evidence that names
+    the adapter, and :data:`GATE_MARKER` is what stops the corpus being read —
+    :func:`read_documents` refuses to stream from a directory whose marker says
+    FAIL, so one gate run protects the tokenizer, the shard writer and the data
+    loader without any of them having to remember to ask.
+
+    When ``verify.py`` is not importable the build does NOT fail, and that is a
+    deliberate, uncomfortable exception: refusing would make this module
+    unusable until the scanner lands. It is written into the marker as
+    UNVERIFIED and printed in capitals, because the one thing it must not be
+    is quiet.
+    """
+    written = sorted(p.name for p in out_dir.glob("*.jsonl"))
+    marker = out_dir / GATE_MARKER
+    try:
+        from .verify import host_needles, render, verify_corpus
+    except Exception as exc:
+        body = (f"CORPUS GATE: UNVERIFIED — training.corpus.verify is not "
+                f"importable ({type(exc).__name__}: {exc}).\n"
+                f"  {len(written)} file(s) were written and NOTHING read them "
+                f"back. Do not publish a checkpoint trained on this directory: "
+                f"a redactor that was added but never run looks exactly like "
+                f"one that ran and found nothing, and this build cannot tell "
+                f"you which it was.")
+        _write_marker(marker, "UNVERIFIED", body)
+        return _GateResult(True, body)
+
+    try:
+        needles = host_needles()
+        leaks = verify_corpus(out_dir, needles=needles)
+    except Exception as exc:
+        # Fail CLOSED. A scanner that crashed did not certify anything, and
+        # "we could not check" has to resolve the same way as "it is dirty".
+        body = (f"CORPUS GATE: FAILED — the verifier itself raised "
+                f"{type(exc).__name__}: {exc}. Nothing was certified, so "
+                f"nothing may be trained on. This is not a verifier bug to work "
+                f"around; until it answers, the corpus is unverified.")
+        _write_marker(marker, "FAIL", body)
+        return _GateResult(False, body)
+
+    # Split on what becomes weights. A leak in a *.jsonl is a training document
+    # and the gate's whole purpose; a leak in anything else in the directory
+    # ships with the corpus but is read by nothing that trains. The distinction
+    # matters because PROVENANCE.md deliberately names each source's author and
+    # URL — for `ownrepos` that is this operator's own GitHub handle, and it is
+    # there as the attribution the MIT licence is satisfied by. A gate that
+    # refused its own licence record would have exactly one stable state, which
+    # is switched off. So those are reported in full and not enforced, and the
+    # reader decides.
+    docs_leaks = [leak for leak in leaks if leak.path.endswith(".jsonl")]
+    other_leaks = [leak for leak in leaks if not leak.path.endswith(".jsonl")]
+
+    notes: list[str] = []
+    gaps = needles.gaps()
+    if gaps:
+        notes += [
+            "",
+            f"INSTRUMENT INCOMPLETE — no needles were derived for: "
+            f"{', '.join(gaps)}. '0 leaks' from a thin table means nothing was "
+            f"looked for, which is the same fail-open as a redactor with an "
+            f"empty table. This is a statement about the scanner, not about the "
+            f"corpus, so it does not fail the build — it withholds the PASS.",
+        ]
+    if other_leaks:
+        notes += [
+            "",
+            f"Also found, OUTSIDE the training documents ({len(other_leaks)} "
+            f"occurrence(s)). Nothing trains on these files, so they do not "
+            f"fail the build; they do ship beside the corpus:",
+            render(other_leaks),
+        ]
+
+    # Provenance, before the verdict. One kind of finding is ambiguous by
+    # construction — an RFC1918 address bound here is the same bytes as one used
+    # as an example in an Nmap script — so it is resolved by asking whether the
+    # value is in that source's own raw upstream download, which was fetched
+    # from the upstream and has never seen this machine's network config. The
+    # rule lives in training.corpus.provenance so that this gate,
+    # training.data.require_clean_corpus and scripts/gate_corpus.py cannot
+    # disagree about it; three copies of a security policy is three chances for
+    # the quiet one to be wrong. identity/email/mac/ipv6-global/volume are never
+    # exonerable there, whatever any cache says.
+    exonerated: list = []
+    if docs_leaks:
+        try:
+            from .provenance import partition
+            # partition() returns (leak, why) PAIRS on both sides. Unpack the
+            # real side back to bare leaks — assigning the pairs straight to
+            # docs_leaks made the failure path do `leak.path` on a tuple, which
+            # this module's own gate tests caught immediately.
+            real_pairs, exonerated = partition(docs_leaks)
+            docs_leaks = [leak for leak, _ in real_pairs]
+        except Exception as exc:  # fail CLOSED: an unavailable rule excuses nothing
+            notes += ["", f"Provenance check unavailable ({type(exc).__name__}: "
+                          f"{exc}); every finding is treated as real."]
+    if exonerated:
+        notes += [
+            "",
+            f"Exonerated by provenance ({len(exonerated)} occurrence(s)) — present "
+            f"in the source's own raw upstream download, so the upstream shipped "
+            f"them and they are not this host's data. Printed because 'passed' and "
+            f"'found nothing' are different sentences:",
+            *(f"  {leak.kind:<13} {leak.path}  {leak.fingerprint}  — {why}"
+              for leak, why in exonerated),
+        ]
+
+    if docs_leaks:
+        files = sorted({leak.path for leak in docs_leaks})
+        body = "\n".join([
+            f"CORPUS GATE: FAILED — {len(docs_leaks):,} leak(s) in "
+            f"{len(files)} training file(s) this build just wrote.",
+            "",
+            render(docs_leaks),
+            "",
+            "Values are reported as kind, length and a sha256 prefix and never "
+            "printed: the audit that found these problems created a new leak by "
+            "writing its own needle table to a JSON file, and this gate will "
+            "not repeat it. Paths are scrubbed by the same needle set, because "
+            "this corpus lives under a volume whose name is itself a needle.",
+            "",
+            "Nothing was deleted. The files below are the evidence that names "
+            "the leaking adapter:",
+            *(f"  {name}" for name in files),
+            "",
+            f"{GATE_MARKER} now says FAIL, and read_documents() refuses to "
+            f"stream from this directory until it does not. Fix the adapter and "
+            f"rebuild; do not delete the marker.",
+            *notes,
+        ])
+        _write_marker(marker, "FAIL", body)
+        return _GateResult(False, body)
+
+    docs = sum(s.docs for s in stats if s.docs)
+    verdict = "UNVERIFIED" if gaps else "PASS"
+    body = "\n".join([
+        f"CORPUS GATE: {verdict} — {len(written)} training file(s), "
+        f"{docs:,} document(s) read back from disk and scanned for this host's "
+        f"identifiers, addresses, networks and paths. 0 leaks in the training "
+        f"documents.",
+        *notes,
+    ])
+    _write_marker(marker, verdict, body)
+    return _GateResult(True, body)
+
+
+def _write_marker(path: Path, verdict: str, body: str) -> None:
+    """Record the gate's verdict beside the corpus it describes.
+
+    Beside the data for the same reason PROVENANCE.md is: a verdict that lives
+    somewhere else drifts out of date, and the directory is what every consumer
+    actually opens. The body is the printed report, which carries fingerprints
+    and never values.
+    """
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    with contextlib.suppress(OSError):
+        path.write_text(f"{verdict}\n{stamp}\n\n{body}\n", encoding="utf-8")
+
+
+def _refuse_failed_gate(clean_dir: Path) -> None:
+    """Raise if this directory's last build failed verification.
+
+    The honest place for this check. ``read_documents`` is the one door the
+    tokenizer and the shard writer are documented to come through, so a verdict
+    enforced here reaches all of them; a verdict enforced in each of them
+    reaches whichever ones remembered.
+    """
+    marker = clean_dir / GATE_MARKER
+    try:
+        first = marker.read_text(encoding="utf-8").split("\n", 1)[0].strip()
+    except OSError:
+        return
+    if first == "FAIL":
+        raise CorpusGateFailed(
+            f"{marker} says the last build of this corpus FAILED verification, "
+            f"so it will not be streamed. Read the marker for the fingerprints, "
+            f"fix the adapter it names and rebuild. Deleting the marker makes "
+            f"the refusal go away and the leak stay."
+        )
 
 
 def _note_source(st: BuildStats) -> None:
@@ -1407,7 +2378,16 @@ def read_documents(clean_dir: Path, *, registers: Iterable[Register] | None = No
     globbing raw text, so metadata survives all the way to the point where it
     can be used — which is what lets a tokenizer be fitted to a deliberately
     chosen register mix instead of whatever happened to be on disk.
+
+    It is also where the verification gate is enforced, for that same reason:
+    this is the one door every consumer is documented to come through, so a
+    verdict checked here reaches all of them, while a verdict checked in each of
+    them reaches whichever ones remembered. A directory whose last build failed
+    verification is not streamed at all. The check fires on the first
+    ``next()`` rather than at call time, because this is a generator — which is
+    soon enough, since nothing can consume a document without reaching it.
     """
+    _refuse_failed_gate(clean_dir)
     wanted = {r.value for r in registers} if registers else None
     for path in sorted(clean_dir.glob("*.jsonl")):
         with path.open("r", encoding="utf-8") as fh:
@@ -1422,10 +2402,14 @@ def read_documents(clean_dir: Path, *, registers: Iterable[Register] | None = No
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Build the Whetstone corpus.")
-    p.add_argument("--out", type=Path,
-                   default=Path("/Volumes/at0m_b0mb/whetstone/corpus/clean"))
-    p.add_argument("--cache", type=Path,
-                   default=Path("/Volumes/at0m_b0mb/whetstone/corpus/raw"))
+    # Relative, through the repository's own `data` symlink, which is what this
+    # module's usage line has always documented. The absolute default these
+    # replaced named one machine's mount point — wrong for anybody else, and a
+    # host identifier in a published source file, which is what makes the
+    # self-scan in tests/test_build_chokepoint.py possible at all. Every caller
+    # in scripts/ passes --out explicitly, so nothing depended on the old value.
+    p.add_argument("--out", type=Path, default=Path("data/corpus/clean"))
+    p.add_argument("--cache", type=Path, default=Path("data/corpus/raw"))
     p.add_argument("--only", nargs="*", help="build only these sources")
     p.add_argument("--balance", action="store_true",
                    help="subsample over-represented registers toward target")
@@ -1444,6 +2428,11 @@ def main(argv: list[str] | None = None) -> int:
                         "it is killed, skipped and re-listed after the report. "
                         "0 runs every source in-process with no budget, which "
                         "is how one runaway regex once burned 7.5 hours.")
+    p.add_argument("--allow-unidentified-host", action="store_true",
+                   help="build even though identity redaction would be a no-op "
+                        "on this host (an empty identity table). Nothing the "
+                        "build writes then carries an identity guarantee, and "
+                        "the log says so.")
     p.add_argument("--report", action="store_true",
                    help="report on an existing build without fetching")
     args = p.parse_args(argv)
@@ -1466,7 +2455,8 @@ def main(argv: list[str] | None = None) -> int:
     build(args.out, args.cache, only=args.only, balance=args.balance,
           max_source_share=args.max_source_share,
           max_register_multiple=args.max_register_multiple,
-          source_timeout=args.source_timeout)
+          source_timeout=args.source_timeout,
+          require_identity_table=not args.allow_unidentified_host)
     return 0
 
 
