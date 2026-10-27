@@ -457,10 +457,13 @@ class Probe:
     exemplar: str = ""
     #: The cheapest constant a cheater could emit — a lookup table's answer,
     #: with no model behind it. Scored and PRINTED beside the real rate rather
-    #: than assumed to fail, because for eight of the nine probes here it does
+    #: than assumed to fail, because for **every** probe in this file it does
     #: not fail: it wins outright. A probe whose constant wins is a probe whose
     #: high scores mean nothing, and that is a fact about this instrument that
-    #: belongs in its own output.
+    #: belongs in its own output. The count is pinned by
+    #: ``test_every_probe_is_won_by_its_own_degenerate_constant`` rather than
+    #: stated here, because this comment once read "eight of the nine" and went
+    #: stale when the probe set changed — a number in prose cannot notice that.
     degenerate: str | None = None
     samples: int = 100
     max_tokens: int = 90
@@ -927,9 +930,9 @@ class ProbeScore:
         if "constant" not in kinds:
             raise FloorMissingError(
                 f"probe {self.name!r} has no degenerate floor. Measure what the "
-                "cheapest constant scores and print it: on eight of the nine "
-                "probes in this file a one-line constant scores 100%, and a "
-                "rate printed without that fact beside it reads as knowledge.")
+                "cheapest constant scores and print it: on every probe in this "
+                "file a one-line constant scores 100%, and a rate printed "
+                "without that fact beside it reads as knowledge.")
 
     @property
     def rate(self) -> float:

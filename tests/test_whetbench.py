@@ -398,3 +398,29 @@ class TestRunBenchScoresTheContinuation:
         monkeypatch.setattr(PROBES[0], "check", check_shell, raising=True)
         with pytest.raises(ProbeDesignError):
             _stub_run(monkeypatch, tmp_path, SHELL_CONTINUATION)
+
+def test_every_probe_is_won_by_its_own_degenerate_constant():
+    """The instrument's worst fact about itself, measured instead of narrated.
+
+    Two comments in ``whetbench.py`` used to say "eight of the nine probes".
+    There are eight probes and a constant wins **all** of them, so the prose was
+    both stale and flattering — and one of the two copies was a string the tool
+    *prints*, which means the instrument stated a false count about itself. A
+    number that lives in prose cannot notice the probe set changing underneath
+    it. This can.
+
+    If this test ever fails because a probe genuinely resists its constant, that
+    is good news and the fix is to narrow the assertion to name the survivor,
+    not to delete the test.
+    """
+    from bench.whetbench import PROBES
+
+    scored = [(p.name, p.check(p.degenerate)[0])
+              for p in PROBES if p.degenerate is not None]
+    assert len(scored) == len(PROBES), (
+        "every probe must declare a degenerate constant; "
+        f"{len(PROBES) - len(scored)} do not")
+    losers = [name for name, won in scored if not won]
+    assert not losers, (
+        "these probes are NOT won by their constant, so the claim in "
+        f"whetbench.py is now wrong in the other direction: {losers}")
