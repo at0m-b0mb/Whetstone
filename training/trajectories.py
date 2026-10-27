@@ -117,9 +117,11 @@ armed; failing that, the ``<|host|>`` diversity in this corpus is ``macos`` and
 from __future__ import annotations
 
 import argparse
+import ctypes
+import ctypes.util
 import getpass
-import glob
 import hashlib
+import ipaddress
 import json
 import os
 import platform
@@ -127,12 +129,14 @@ import random
 import re
 import shutil
 import socket
+import sys
 import tempfile
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, Sequence
+from typing import (Any, Callable, Iterable, Iterator, Mapping,
+                    Sequence)
 
 import whetstone.verbs  # noqa: F401  (registers and freezes the catalogue)
 from whetstone.actions import (REGISTRY, Action, Intent, Observation,
@@ -2078,6 +2082,74 @@ def build_scenarios(rng: random.Random, *, include_lab: bool = True,
 # world in which nothing runs as root. A redactor that quietly corrupts the
 # corpus is worse than the leak it was added to fix, so generic names are left
 # exactly as observed and the reason is written down below.
+#
+# **The network layer, and why it is the half that matters.** For most of this
+# module's life the table read four things — account name, display name, home
+# path, per-user temp directory — and a host name. That was a stated boundary
+# and it was the wrong boundary, because the identifiers it left out are the
+# ones the operator *cannot change*. A host can be renamed in a second. A
+# burned-in interface MAC cannot be renamed at all, and a provider-delegated
+# IPv6 /64 is a geographic and subscriber identifier that reaches every device
+# behind it. An audit of a built corpus found a live global-unicast IPv6
+# address of this Mac in 3,540 documents, its /64 prefix in 10,620, three
+# hardware MACs of the ``anpi`` interfaces in 1,770, and the name of a mounted
+# external volume in 1,776 — all still valid weeks and a reboot later, and none
+# of them in the table. They arrive through ordinary observations, exactly like
+# the account name does: ``enum.network`` reports interfaces, a sandbox path
+# names the volume it lives on. So the table now reads the network too, from
+# the operating system and never from configuration, because a configured list
+# is a list of the leaks somebody already noticed and a *persisted* list is a
+# new leak.
+#
+# **The prefix is substituted as well as the address, and that is deliberate.**
+# Two of the addresses the audit found belong to *other* devices on the same
+# /64 — observed, not bound here, so no amount of reading this machine's
+# interfaces can enumerate them. The /64 entry is the only one that reaches
+# them: it rewrites the network half of an address this machine never held,
+# which is the half that identifies the subscriber line.
+#
+# **Calibration, because an uncalibrated address scanner is useless here.**
+# This is a security corpus: it is full of ``192.0.2.0/24``,
+# ``198.51.100.0/24``, ``2001:db8::/32`` and reserved MAC addresses *on
+# purpose*, because that is what standards documents and detection rules use
+# for examples. Substituting those would corrupt thousands of documents and
+# bury the real findings underneath them. Every classifier below therefore
+# answers "not identity" for documentation space, and the replacements are
+# drawn from documentation space so that a redacted observation and an RFC
+# example agree on what an example address looks like.
+#
+# **Fail closed, not open.** An earlier version of this section opened with
+# ``if pattern is None: return text`` — so a table that came back empty because
+# a lookup failed returned Mac-captured text unchanged and silently, which is
+# precisely the failure the paragraph above calls worse than no redactor at
+# all. The two cases are now separated: a machine that genuinely has nothing
+# identifying about it (``root`` in ``/root`` on a hex-named container with
+# nothing routable bound) is leaking nothing and passes through, while a lookup
+# that *failed* raises and names which lookup it was. Nothing is swallowed on
+# the way either: the per-candidate ``except OSError`` in the temp-directory
+# scan used to drop a candidate silently, and a candidate that cannot be
+# classified is exactly the one that cannot be ruled out.
+#
+# **One matcher, not two folds.** The substituter used to compile the table
+# with ``re.IGNORECASE`` while the verifier compared ``str.lower()``
+# substrings, and those two disagree in both directions — ``re`` matches ``i``
+# against U+0130 while ``.lower()`` turns U+0130 into two code points, so a
+# document could be rewritten by a check that called it clean, or called clean
+# by a check the substituter would have rewritten. On this account name the
+# disagreement is reachable, and the substituter's own reverse lookup raises
+# ``KeyError`` on it mid-build. Both now run the *same compiled pattern* and
+# resolve the replacement by group index, so there is no fold left to disagree
+# about: the verifier reports exactly the set of literals the substituter would
+# rewrite.
+#
+# **Privacy and generalisation are one pass and two problems.** Privacy is
+# satisfied by *any* substitution. Generalisation is satisfied only by a
+# *varied* one: 253 distinct machine literals collapsed into a single
+# ``<HOST>`` token passes every privacy gate and makes the model worse, because
+# it teaches a new constant where there used to be a distribution. So each
+# network kind draws its replacement from a small vocabulary, keyed on a digest
+# of the literal — see the vocabulary block below for the sizes and the
+# arithmetic behind them.
 # ---------------------------------------------------------------------------
 
 #: What an identifying account name is replaced by. ``operator`` is not an
@@ -2113,6 +2185,25 @@ _NOT_IDENTITY = frozenset({
 _MIN_IDENTIFYING = 4
 
 
+def _fold(text: str) -> str:
+    """The one case fold this module compares with.
+
+    ``str.lower`` rather than ``str.casefold`` on purpose: ``casefold`` folds
+    ``ß`` to ``ss``, which would merge two genuinely different literals into
+    one table entry, and a merged entry means one of them loses its
+    replacement. ``lower`` is also the closest thing to what ``re.IGNORECASE``
+    does.
+
+    Nothing about *matching* depends on this any more — the substituter and the
+    verifier share one compiled pattern and resolve by group index — so a
+    residual disagreement between this fold and ``re.IGNORECASE`` can only
+    produce a redundant table entry, never a missed literal. It is used for
+    assembling the table: deduplication, and the two guards that stop a
+    replacement from re-introducing a literal.
+    """
+    return text.lower()
+
+
 def _is_identifying(name: str) -> bool:
     """True when ``name`` is specific enough that substituting it is worth it.
 
@@ -2122,11 +2213,11 @@ def _is_identifying(name: str) -> bool:
     in the second corrupts. The length floor and the generic-name set are what
     keep the second kind of mistake out.
     """
-    return len(name) >= _MIN_IDENTIFYING and name.lower() not in _NOT_IDENTITY
+    return len(name) >= _MIN_IDENTIFYING and _fold(name) not in _NOT_IDENTITY
 
 
 def _spellings(secret: str, replacement: str) -> list[tuple[str, str]]:
-    """The spellings one value can take in a rendered document, each paired
+    """The spellings one value can take **once it is inside JSON**, each paired
     with a replacement spelled the same way.
 
     ``render_episode`` serialises payloads with ``json.dumps``, which leaves a
@@ -2140,6 +2231,11 @@ def _spellings(secret: str, replacement: str) -> list[tuple[str, str]]:
     string produces ``\\U``, which is not a valid escape, and the document stops
     parsing. Pairing the transforms here means a caller cannot get that wrong by
     reaching for the literal.
+
+    This function is the *escape* axis only, which is why a POSIX path really
+    does have one spelling here and a test says so. The *separator* axis is
+    :func:`_separator_forms`, and :func:`_identity_table` composes the two —
+    see the note there for the leak that cost.
     """
     forms = [(secret, replacement)]
     if "\\" in secret:
@@ -2150,66 +2246,790 @@ def _spellings(secret: str, replacement: str) -> list[tuple[str, str]]:
     return forms
 
 
+def _separator_forms(value: str) -> list[str]:
+    """Every path-separator spelling of ``value``, primary spelling first.
+
+    :func:`_spellings` derives a backslash variant only when the value it was
+    handed already contains one, which is a Windows-only condition — so a POSIX
+    home directory could not generate its separator-flattened spelling at all.
+    An audit put ``\\Users\\<name>`` past the table and :func:`identity_leaks`
+    called it clean, because the literal the table was looking for was spelled
+    with the other separator. Tools that normalise paths, logs copied out of a
+    Windows host and anything that round-trips a path through a
+    Windows-flavoured library all produce that spelling, and the leak does not
+    care which of them did it.
+
+    A value with no separator in it has one spelling and is returned unchanged,
+    so this is free for account names, host names, MAC addresses and
+    addresses.
+    """
+    if "/" not in value and "\\" not in value:
+        return [value]
+    forms = [value]
+    for alt in (value.replace("\\", "/"), value.replace("/", "\\")):
+        if alt not in forms:
+            forms.append(alt)
+    return forms
+
+
+# ---------------------------------------------------------------------------
+# replacement vocabularies
+#
+# Sized on one measurement and one principle. The measurement: this Mac binds
+# 15 distinct interface MACs and 12 addresses across 1 global prefix, holds 2
+# RFC1918 addresses and mounts 2 non-boot volumes, and the audited corpus
+# repeats each of those literals between 1,770 and 3,540 times. The principle:
+# a pool has to be **larger than the number of distinct literals of its kind**,
+# so the assignment is injective — two interfaces must not come out with the
+# same MAC, because that is not a world that exists — and **very much smaller
+# than the number of occurrences**, so the model meets each replacement
+# thousands of times and learns the shape of an address rather than memorising
+# a hapax. A pool of one is the ``<HOST>`` failure: it passes the privacy gate
+# and teaches a constant. A pool as large as the occurrence count is a
+# relabelling that teaches nothing. Every pool below is at least double the
+# distinct count measured here, and a pool that still runs out is reported as a
+# lookup failure rather than wrapping around and handing two interfaces one
+# address.
+# ---------------------------------------------------------------------------
+
+#: Documentation /64 prefixes, from RFC 3849's ``2001:db8::/32``. Sixteen, for
+#: one delegated prefix plus whatever tunnel prefixes a VPN adds.
+_DOC_V6_PREFIXES = (
+    "2001:db8:a1:1", "2001:db8:a2:12", "2001:db8:b3:23", "2001:db8:b4:34",
+    "2001:db8:c5:45", "2001:db8:c6:56", "2001:db8:d7:67", "2001:db8:d8:78",
+    "2001:db8:e9:89", "2001:db8:ea:9a", "2001:db8:fb:ab", "2001:db8:fc:bc",
+    "2001:db8:1d:cd", "2001:db8:2e:de", "2001:db8:3f:ef", "2001:db8:40:f0",
+)
+
+#: Interface identifiers — the host half of an address. Thirty-two, for twelve
+#: bound addresses with room for a laptop that wakes on a different network.
+#: Deliberately varied in shape: some read like a stable SLAAC identifier, some
+#: like a macOS privacy address, some short, because all three occur in a real
+#: observation and a model that only ever saw one would learn that the second
+#: half of an address is always eight hex digits long.
+_DOC_V6_IIDS = (
+    "0:0:0:1a", "0:0:0:2b", "0:0:0:3c", "0:0:0:4d",
+    "a10b:c20d:e30f:1a2b", "b21c:d32e:f43a:2b3c", "c32d:e43f:a54b:3c4d",
+    "d43e:f54a:b65c:4d5e", "e54f:a65b:c76d:5e6f", "f65a:b76c:d87e:6f70",
+    "a76b:c87d:e98f:7081", "b87c:d98e:fa90:8192", "c98d:ea9f:0ba1:92a3",
+    "da9e:fba0:1cb2:a3b4", "eba1:0cb2:2dc3:b4c5", "fcb2:1dc3:3ed4:c5d6",
+    "1dc3:2ed4:4fe5:d6e7", "2ed4:3fe5:50f6:e7f8", "3fe5:40f6:6107:f809",
+    "40f6:5107:7218:91a", "5107:6218:8329:1a2b", "6218:7329:943a:2b3c",
+    "7329:843a:a54b:3c4d", "843a:954b:b65c:4d5e", "954b:a65c:c76d:5e6f",
+    "a65c:b76d:d87e:6f70", "b76d:c87e:e98f:7081", "c87e:d98f:fa90:8192",
+    "0:0:5e:53", "0:0:5e:54", "0:0:5e:55", "0:0:5e:56",
+)
+
+#: Documentation MAC addresses: RFC 7042 §2.1.2 reserves
+#: ``00-00-5E-00-53-00`` through ``00-00-5E-00-53-FF`` for exactly this.
+#: Sixty-four of the 256, four times the fifteen interfaces this Mac has.
+_DOC_MACS = tuple(f"00:00:5e:00:53:{n:02x}" for n in range(0x40))
+
+#: Host-octet tails for an RFC1918 address. The block is kept — a ``10/8``
+#: address stays a ``10/8`` address — and only the host bits move, because the
+#: block is what tells a reader a flat home network from a routed lab, and that
+#: distinction is signal rather than identity. Twenty-four tuples, and no octet
+#: is ``0``, ``1``, ``2``, ``100``, ``254`` or ``255``: those are the ones every
+#: networking example already uses, and landing on one would make a substituted
+#: address indistinguishable from a documentation address somebody wrote on
+#: purpose.
+_DOC_V4_TAILS = (
+    (17, 43, 219), (23, 58, 131), (29, 67, 173), (31, 74, 197),
+    (37, 86, 211), (41, 93, 149), (43, 107, 167), (47, 113, 181),
+    (53, 127, 193), (59, 134, 157), (61, 143, 179), (67, 151, 203),
+    (71, 163, 227), (73, 169, 139), (79, 177, 151), (83, 181, 163),
+    (89, 191, 171), (97, 199, 183), (101, 211, 189), (103, 217, 197),
+    (107, 223, 209), (109, 229, 213), (113, 233, 221), (127, 239, 231),
+)
+
+#: Volume names. Every one of these is also in :data:`_NOT_IDENTITY_VOLUMES`,
+#: and that is the point: a volume really called ``Backup`` is left alone,
+#: because the word discloses nothing and substituting it would rewrite every
+#: occurrence of ``backup`` in 625 MB of security prose, while a volume named
+#: after its owner is renamed *to* one of these and the result reads like a
+#: volume name instead of like a redaction.
+_DOC_VOLUMES = (
+    "Backup", "Archive", "External", "Scratch", "Storage", "Transit",
+    "Vault", "Workbench", "Shuttle", "Satchel", "Toolbox", "Locker",
+)
+
+#: Volume names that identify nobody. The macOS system volumes are here
+#: because every Mac has them; the generic words are here for the reason
+#: :data:`_DOC_VOLUMES` gives.
+_NOT_IDENTITY_VOLUMES = frozenset(_fold(name) for name in (
+    "Macintosh HD", "Macintosh HD - Data", "Data", "Preboot", "Recovery",
+    "Update", "VM", "xarts", "iSCPreboot", "Hardware", "home", "net",
+    "Time Machine Backups", "TimeMachine", "Untitled", "NO NAME", "NONAME",
+    "BOOTCAMP", "EFI", "USB", "External", "Backup", "Backups", "Archive",
+    "Scratch", "Storage", "Transit", "Vault", "Workbench", "Shuttle",
+    "Satchel", "Toolbox", "Locker", "Media", "Music", "Photos", "Movies",
+))
+
+#: MAC addresses that identify nobody: the null and broadcast addresses, the
+#: whole RFC 7042 documentation range, and the handful of made-up addresses
+#: security writing uses as examples. A real interface carrying one of these is
+#: carrying a value thousands of documents already contain.
+_NOT_IDENTITY_MACS = frozenset(
+    {"00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff",
+     "00:11:22:33:44:55", "11:22:33:44:55:66", "aa:bb:cc:dd:ee:ff",
+     "de:ad:be:ef:de:ad", "de:ad:be:ef:00:01", "12:34:56:78:9a:bc",
+     "01:23:45:67:89:ab", "00:1a:2b:3c:4d:5e", "08:00:27:00:00:00"}
+    | {f"00:00:5e:00:53:{n:02x}" for n in range(256)}
+)
+
+#: RFC1918 addresses that identify nobody. ``.1`` and ``.254`` are what every
+#: diagram calls the gateway, ``.2`` is what every hypervisor hands its first
+#: guest, ``.100`` is the DHCP pool start in every tutorial, and the repdigit
+#: addresses are what people reach for when inventing one. Substituting any of
+#: them would rewrite documentation rather than remove a leak.
+_NOT_IDENTITY_V4 = frozenset(
+    {f"{net}.{host}"
+     for net in ("10.0.0", "10.0.1", "10.1.1", "10.10.10",
+                 "172.16.0", "172.16.1", "172.17.0", "172.20.0",
+                 "192.168.0", "192.168.1", "192.168.2", "192.168.56",
+                 "192.168.100", "192.168.122")
+     for host in (0, 1, 2, 10, 100, 101, 200, 254, 255)}
+    | {"10.10.10.10", "172.16.16.16", "192.168.168.168"}
+)
+
+#: The blocks RFC1918 reserves. Written out rather than taken from
+#: ``is_private``, which also answers True for the documentation ranges, the
+#: benchmarking range and carrier-grade NAT — exactly the space that must not
+#: be touched.
+_RFC1918 = tuple(ipaddress.ip_network(cidr) for cidr in
+                 ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+
+#: IPv4 space reserved for writing about rather than addressing with: the three
+#: TEST-NET ranges, the benchmarking range, ``192.0.0.0/24`` and the
+#: ``233.252.0.0/24`` multicast example block. A bound address inside one of
+#: these is a lab fixture, and this corpus is full of them on purpose.
+_DOC_V4_NETS = tuple(ipaddress.ip_network(cidr) for cidr in
+                     ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24",
+                      "198.18.0.0/15", "192.0.0.0/24", "233.252.0.0/24"))
+
+#: Where a bound *public* IPv4 address is sent. TEST-NET-2, so the replacement
+#: is still a non-private address and the document still reads as one.
+_DOC_V4_PUBLIC = ipaddress.ip_network("198.51.100.0/24")
+
+#: IPv6 space reserved for documentation, and for protocols whose identifiers
+#: must not be mistaken for addresses: RFC 3849's prefix, RFC 9637's second
+#: documentation prefix, ORCHIDv2, the discard prefix, the dead 6bone range and
+#: 6to4. ``3fff::/20`` is the one worth naming: it was reserved in 2024, which
+#: is recent enough that a scanner written from memory misses it, and the
+#: calibration fixture caught exactly that.
+_DOC_V6_NETS = tuple(ipaddress.ip_network(cidr) for cidr in
+                     ("2001:db8::/32", "3fff::/20", "2001:20::/28",
+                      "100::/64", "3ffe::/16", "2002::/16"))
+
+#: Global unicast, as currently allocated, and the unique-local range. A ULA
+#: prefix is randomly generated per site, so it identifies the site exactly the
+#: way a delegated prefix identifies the subscriber.
+_GLOBAL_V6 = ipaddress.ip_network("2000::/3")
+_ULA_V6 = ipaddress.ip_network("fc00::/7")
+
+#: Below this, a *link-local* interface identifier is a documentation shape
+#: rather than a machine: ``fe80::1`` is in every routing diagram ever drawn
+#: and the dozen addresses that look like it are shared by millions of hosts. A
+#: real SLAAC or privacy identifier fills the low 64 bits. It is not applied to
+#: global addresses — see :func:`_identifying_ipv6` for the address this cost.
+_MIN_IID = 0x10000
+
+
+def _digest_index(literal: str) -> int:
+    """A stable index derived from ``literal``.
+
+    ``hash()`` is salted per process, so two builds of the same corpus would
+    disagree about which replacement a literal gets and the shards would stop
+    being reproducible. A digest is the same everywhere, forever, which is what
+    makes "the same literal maps to the same replacement" true across a build
+    that forks a child per source.
+    """
+    return int.from_bytes(hashlib.sha256(literal.encode("utf-8")).digest()[:8],
+                          "big")
+
+
+def _assign(pool: Sequence[Any], literal: str, literals: Sequence[str],
+            taken: set[Any], render: Callable[[Any], str] = str) -> Any:
+    """Pick ``literal``'s replacement out of ``pool``, deterministically.
+
+    Starts at a digest-derived offset so the choice is varied and stable, then
+    walks forward past anything already handed out and anything whose rendered
+    replacement contains a literal this table is going to substitute. That
+    second check is not fussiness: if a replacement contained another entry's
+    literal, the cross-pair guard at the end of :func:`_identity_table` would
+    drop that entry to break the loop, and the dropped entry is a leak. It is
+    also what makes a second :func:`redact_identity` pass a no-op, because no
+    replacement can match the pattern that produced it.
+
+    ``render`` composes the pool item into the replacement that will actually
+    be written — a host-octet tuple into an address, an interface identifier
+    into a full address — so the containment check tests the real string rather
+    than the ingredient.
+
+    Returns ``None`` when the pool is exhausted, which the caller records as a
+    lookup failure rather than papering over by reusing a replacement. Two
+    interfaces with the same MAC is not a world that exists, and teaching the
+    model that it is would be worse than refusing the build.
+    """
+    folded = [_fold(item) for item in literals]
+    start = _digest_index(literal)
+    for offset in range(len(pool)):
+        candidate = pool[(start + offset) % len(pool)]
+        if candidate in taken:
+            continue
+        text = _fold(render(candidate))
+        if any(lit in text for lit in folded):
+            continue
+        taken.add(candidate)
+        return candidate
+    return None
+
+
+# ---------------------------------------------------------------------------
+# reading the network, without running a command
+#
+# ``getifaddrs(3)`` through :mod:`ctypes` rather than parsing ``ifconfig``,
+# because this module has to be able to build its table without running a
+# command — the same reason the display name is read from :mod:`pwd` instead of
+# from ``dscl`` and the temp directories are found by ownership instead of by
+# ``getconf``. A subprocess is a second failure mode (missing binary, different
+# locale, a shell in a sandbox) and it would put this machine's addresses into
+# another process's argv and output, which is how a reporting pass becomes a
+# leak.
+# ---------------------------------------------------------------------------
+
+#: ``AF_LINK`` on the BSDs, ``AF_PACKET`` on Linux. Neither is in :mod:`socket`
+#: on macOS, so both are written down.
+_AF_LINK, _AF_PACKET = 18, 17
+
+
+class _IfAddrs(ctypes.Structure):
+    """``struct ifaddrs`` — the same shape on macOS, the BSDs and Linux."""
+
+
+_IfAddrs._fields_ = [
+    ("ifa_next", ctypes.POINTER(_IfAddrs)),
+    ("ifa_name", ctypes.c_char_p),
+    ("ifa_flags", ctypes.c_uint),
+    ("ifa_addr", ctypes.c_void_p),
+    ("ifa_netmask", ctypes.c_void_p),
+    ("ifa_dstaddr", ctypes.c_void_p),
+    ("ifa_data", ctypes.c_void_p),
+]
+
+
+def _getifaddrs_records() -> list[tuple[str, str]]:
+    """``(kind, value)`` for every address bound to a local interface.
+
+    The struct layout differs in exactly one place that matters. ``sockaddr``
+    on the BSDs begins with a one-byte length and then the family; on Linux the
+    family is a 16-bit field at offset zero. The address itself sits at the same
+    offset in both: 4 into ``sockaddr_in``, 8 into ``sockaddr_in6``. The
+    hardware address is the one genuinely different structure — ``sockaddr_dl``
+    carries it at ``sdl_data[sdl_nlen:]``, ``sockaddr_ll`` at a fixed offset.
+
+    Interfaces that are down are included deliberately: a burned-in MAC is the
+    machine's whether or not anything is using it, and ``enum.network`` reports
+    the interface list rather than only the live ones.
+
+    Raises :class:`OSError` when the lookup cannot be made, so the caller can
+    record a failure instead of mistaking "no addresses" for "no addresses
+    found".
+    """
+    bsd = platform.system() != "Linux"
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+    except OSError:
+        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    if not hasattr(libc, "getifaddrs"):
+        raise OSError("getifaddrs is not available in libc")
+
+    head = ctypes.POINTER(_IfAddrs)()
+    if libc.getifaddrs(ctypes.byref(head)) != 0:
+        raise OSError(ctypes.get_errno(), "getifaddrs failed")
+
+    records: list[tuple[str, str]] = []
+    try:
+        node = head
+        while node:
+            entry = node.contents
+            addr = entry.ifa_addr
+            if addr:
+                lead = ctypes.string_at(addr, 2)
+                family = lead[1] if bsd else int.from_bytes(lead, sys.byteorder)
+                if family == socket.AF_INET:
+                    raw = ctypes.string_at(addr, 8)[4:8]
+                    records.append(("ipv4", str(ipaddress.IPv4Address(raw))))
+                elif family == socket.AF_INET6:
+                    raw = ctypes.string_at(addr, 28)[8:24]
+                    records.append(("ipv6", str(ipaddress.IPv6Address(raw))))
+                elif family == (_AF_LINK if bsd else _AF_PACKET):
+                    blob = ctypes.string_at(addr, 32)
+                    if bsd:
+                        nlen, alen = blob[5], blob[6]
+                        hardware = blob[8 + nlen:8 + nlen + alen]
+                    else:
+                        hardware = blob[12:12 + blob[11]]
+                    if len(hardware) == 6:
+                        records.append(
+                            ("mac", ":".join(f"{b:02x}" for b in hardware)))
+            node = entry.ifa_next
+    finally:
+        libc.freeifaddrs(head)
+    return records
+
+
+def _sysfs_records() -> list[tuple[str, str]]:
+    """The Linux fallback: hardware addresses from ``/sys`` and IPv6 from
+    ``/proc``, both of which are ordinary file reads.
+
+    It cannot see IPv4 — there is no procfs file that lists the addresses bound
+    to an interface, only routes — so the caller records that gap as a failure
+    rather than reporting a network layer it did not finish reading.
+    """
+    records: list[tuple[str, str]] = []
+    for entry in sorted(os.scandir("/sys/class/net"), key=lambda e: e.name):
+        try:
+            with open(os.path.join(entry.path, "address"),
+                      encoding="utf-8") as handle:
+                mac = handle.read().strip()
+        except OSError:
+            continue
+        if len(mac) == 17:
+            records.append(("mac", _fold(mac)))
+    try:
+        with open("/proc/net/if_inet6", encoding="utf-8") as handle:
+            for line in handle:
+                fields = line.split()
+                if not fields or len(fields[0]) != 32:
+                    continue
+                records.append(
+                    ("ipv6", str(ipaddress.IPv6Address(
+                        bytes.fromhex(fields[0])))))
+    except OSError:
+        pass
+    return records
+
+
+def _host_addresses() -> tuple[list[tuple[str, str]], list[str], list[str]]:
+    """``(records, failures, notes)`` for this machine's bound addresses.
+
+    One seam, so a test can fabricate a machine without fabricating a kernel,
+    and so the two empty cases stay distinguishable: empty ``records`` with
+    empty ``failures`` means this host really has nothing bound worth hiding,
+    while anything in ``failures`` means the table cannot certify a document
+    and :func:`redact_identity` must refuse rather than return the text.
+
+    A failure or a note names the lookup and the exception class. Neither ever
+    carries a value — the whole reason this module exists is that writing
+    values down while reporting on values is how an audit becomes a leak.
+    """
+    try:
+        return _getifaddrs_records(), [], []
+    except Exception as exc:
+        first = f"interfaces:getifaddrs:{type(exc).__name__}"
+    if platform.system() == "Linux":
+        try:
+            return _sysfs_records(), ["interfaces:ipv4-unavailable"], [first]
+        except OSError as exc:
+            return [], [first, f"interfaces:sysfs:{type(exc).__name__}"], []
+    return [], [first, "interfaces:no-reader-for-platform"], []
+
+
+def _host_volumes() -> tuple[list[str], list[str], list[str]]:
+    """``(names, failures, notes)`` for mounted volumes other than the boot
+    volume.
+
+    The names, not the mount paths: a volume name appears inside a sandbox
+    path, inside a tool's error message and on its own, and substituting the
+    name covers all three. The boot volume is excluded by resolving to ``/``
+    rather than by matching ``Macintosh HD``, because a renamed boot volume is
+    still the boot volume — and its name is in the generic set anyway.
+    """
+    darwin = platform.system() == "Darwin"
+    roots = ["/Volumes"] if darwin else ["/media", "/mnt", "/run/media"]
+    names: list[str] = []
+    failures: list[str] = []
+    notes: list[str] = []
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        try:
+            entries = list(os.scandir(root))
+        except OSError as exc:
+            failures.append(f"volumes:scandir:{type(exc).__name__}")
+            continue
+        for entry in entries:
+            try:
+                if os.path.realpath(entry.path) == os.sep:
+                    continue
+            except OSError as exc:
+                # Kept rather than skipped: a name we cannot resolve is a name
+                # we cannot rule out, and substituting the boot volume's name
+                # by mistake costs nothing because it is generic anyway.
+                notes.append(f"volumes:realpath:{type(exc).__name__}")
+            names.append(entry.name)
+            if root in ("/media", "/run/media"):
+                # ``/media/<user>/<label>`` is where most Linux desktops mount,
+                # so one level down is a volume name too. One level, not a
+                # walk: deeper is the volume's own contents, and os.walk down a
+                # mounted disk is how a source once pulled the corpus cache
+                # back in as prose.
+                try:
+                    names.extend(child.name for child in os.scandir(entry.path))
+                except OSError as exc:
+                    notes.append(f"volumes:nested:{type(exc).__name__}")
+    return names, failures, notes
+
+
+def _temp_directories() -> tuple[list[str], list[str], list[str]]:
+    """``(paths, failures, notes)`` for every temp directory this account owns.
+
+    Not only the one ``TMPDIR`` names right now. ``gettempdir()`` follows
+    ``TMPDIR``, so pointing the corpus build's scratch at the external volume —
+    which this project now does, because forty-four sources unpacking into the
+    internal disk filled it and took the machine down mid-build — drops the
+    per-user ``/var/folders`` path straight out of this table, while every
+    document captured before the move still carries it. That is not a
+    hypothetical: it put a real ``/var/folders/<x>/<hash>/T`` into a built
+    corpus, seven times in one document, and the build reported zero leaks
+    because the literal it was checking for was no longer the literal that was
+    there. A directory identifies its owner whether or not anything is using
+    it, so the table is keyed on ownership rather than on the environment.
+
+    Found by ownership rather than by ``getconf``: this module must build its
+    table without running a command, and ``CS_DARWIN_USER_TEMP_DIR`` is not in
+    every build's ``os.confstr_names``. Walked with :func:`os.scandir` rather
+    than :func:`glob.glob`, because ``glob`` swallows a permission error and
+    returns a short list that looks exactly like a complete one.
+
+    A candidate that cannot be stat'ed used to be dropped by a bare
+    ``except OSError: continue`` — the silent half of the fail-open this
+    section is about, since the one candidate that cannot be classified is
+    exactly the one that cannot be ruled out. It is now **kept** and recorded:
+    a ``/var/folders/<x>/<28 chars>/T`` path identifies whoever owns it, and
+    substituting one that turns out to belong to another account costs nothing,
+    while leaving one that turns out to be ours costs the corpus. Because the
+    candidate is kept, the record is a note rather than a failure: no coverage
+    was lost, so there is nothing for a caller to refuse over.
+    """
+    paths = [tempfile.gettempdir()]
+    failures: list[str] = []
+    notes: list[str] = []
+    root = "/var/folders"
+    if not os.path.isdir(root):
+        return paths, failures, notes
+    try:
+        outer = list(os.scandir(root))
+    except OSError as exc:
+        return paths, [f"tempdirs:scandir:{type(exc).__name__}"], notes
+    for first in outer:
+        try:
+            inner = list(os.scandir(first.path))
+        except OSError as exc:
+            failures.append(f"tempdirs:scandir:{type(exc).__name__}")
+            continue
+        for second in inner:
+            candidate = os.path.join(second.path, "T")
+            try:
+                mine = os.stat(candidate).st_uid == os.getuid()
+            except FileNotFoundError:
+                # Raced away between the scan and the stat. It cannot be in a
+                # document this build is about to write, because it no longer
+                # exists to be observed.
+                continue
+            except OSError as exc:
+                notes.append(f"tempdirs:stat:{type(exc).__name__}")
+                mine = True
+            if mine:
+                paths.append(candidate)
+    return paths, failures, notes
+
+
+# ---------------------------------------------------------------------------
+# classifiers: what is identity and what is documentation
+# ---------------------------------------------------------------------------
+
+def _identifying_mac(value: str) -> bool:
+    """True for a hardware address that belongs to this machine and to nobody
+    else's documentation.
+
+    Group addresses are rejected because they are not interface identities. The
+    locally-administered bit is deliberately *not* consulted: macOS randomises
+    Wi-Fi and AWDL addresses with that bit set, and those are still this
+    machine for as long as they are bound.
+    """
+    if len(value) != 17 or _fold(value) in _NOT_IDENTITY_MACS:
+        return False
+    parts = value.split(":")
+    if len(parts) != 6:
+        return False
+    try:
+        octets = [int(part, 16) for part in parts]
+    except ValueError:
+        return False
+    return not octets[0] & 0x01
+
+
+def _identifying_ipv4(value: str) -> str | None:
+    """``'private'``, ``'public'`` or ``None`` for an address bound here.
+
+    The ranges are written out rather than taken from
+    :attr:`ipaddress.IPv4Address.is_private`, which answers True for the
+    documentation ranges this corpus is full of. The input is an address read
+    from the kernel, never a token lifted out of text, which is why there is no
+    risk of the mistake an audit scanner made when it routed the version string
+    ``3.0.11.2`` and the SNMP OID ``2.6.32.5`` into "public routable": a
+    dotted-quad-shaped substring of prose never reaches this function.
+    """
+    try:
+        addr = ipaddress.IPv4Address(value)
+    except ValueError:
+        return None
+    if (addr.is_loopback or addr.is_link_local or addr.is_multicast
+            or addr.is_unspecified or addr.is_reserved):
+        return None
+    if any(addr in net for net in _DOC_V4_NETS):
+        return None
+    if value in _NOT_IDENTITY_V4:
+        return None
+    if any(addr in net for net in _RFC1918):
+        return "private"
+    return "public"
+
+
+def _identifying_ipv6(value: str) -> str | None:
+    """``'global'``, ``'local'`` or ``None`` for an address bound here.
+
+    ``'global'`` means the /64 is the operator's to lose — a provider-delegated
+    prefix, or a unique-local prefix a site generated — and the prefix
+    therefore earns a table entry of its own. ``'local'`` is a link-local
+    address, whose ``fe80::`` prefix is the same on every machine on earth and
+    identifies nobody; only its interface identifier does, and that identifier
+    is frequently derived from the MAC, which is why a link-local address is in
+    scope at all.
+    """
+    try:
+        addr = ipaddress.IPv6Address(value)
+    except ValueError:
+        return None
+    if addr.is_loopback or addr.is_unspecified or addr.is_multicast:
+        return None
+    if any(addr in net for net in _DOC_V6_NETS):
+        return None
+    if addr.is_link_local:
+        # The floor applies here and only here. ``fe80::1`` and its dozen
+        # neighbours are in every routing diagram ever drawn and are shared by
+        # millions of hosts, so substituting one would rewrite documentation.
+        # A *global* address is a different question whatever its identifier is
+        # worth: ``<delegated prefix>::ea97`` is a DHCPv6 lease on this line,
+        # not an example, and an earlier version of this function applied the
+        # floor to both and dropped one of this machine's three real global
+        # addresses because its identifier happened to be sixteen bits. The
+        # prefix entry would have rewritten the network half and left the lease
+        # standing.
+        return "local" if int(addr) & ((1 << 64) - 1) >= _MIN_IID else None
+    if addr in _GLOBAL_V6 or addr in _ULA_V6:
+        return "global"
+    return None
+
+
+def _identifying_volume(name: str) -> bool:
+    """True for a volume name that names its owner rather than its job."""
+    return _is_identifying(name) and _fold(name) not in _NOT_IDENTITY_VOLUMES
+
+
+# ---------------------------------------------------------------------------
+# spellings for the network kinds
+#
+# None of these deduplicate, and that is load-bearing: the table pairs a
+# literal's spellings with the replacement's spellings positionally, so the two
+# lists have to stay the same length. A spelling that happens to coincide with
+# another contributes a duplicate pair, which the table's own deduplication
+# collapses; a list that quietly got shorter would drop a spelling of a real
+# value off the end of a ``zip`` and leave it in the corpus.
+# ---------------------------------------------------------------------------
+
+def _mac_forms(value: str) -> list[str]:
+    """Every spelling of a MAC address a tool in this corpus emits.
+
+    Colons are what ``ifconfig`` and ``ip link`` print, hyphens are what
+    Windows prints, the dotted form is Cisco's, and the bare form is what
+    ``/sys``, a lot of JSON APIs and most log pipelines carry. Case is not a
+    spelling here: the pattern is compiled case-insensitively, which covers the
+    upper-case variants without doubling the table.
+
+    The bare form is the one worth justifying, because twelve hex characters
+    could in principle land inside a digest. The arithmetic: a bare form has
+    16**12 ≈ 2.8e14 possible values and this corpus holds on the order of 1e8
+    hex characters, so the expected number of accidental hits across fifteen
+    interfaces is about 5e-6. A hardware address the operator cannot change is
+    worth that.
+    """
+    low = _fold(value)
+    plain = low.replace(":", "")
+    return [low, low.replace(":", "-"),
+            ".".join(plain[i:i + 4] for i in range(0, 12, 4)), plain]
+
+
+def _v6_forms(addr: ipaddress.IPv6Address) -> list[str]:
+    """The three spellings of an IPv6 address that occur in observations.
+
+    ``str()`` gives the canonical zero-compressed form, ``exploded`` gives the
+    fully padded one some tools print, and the third — trimmed hextets with no
+    ``::`` run — is what a tool that strips leading zeros without compressing
+    emits. All three are the same address and only one of them is what Python
+    handed us.
+    """
+    hextets = addr.exploded.split(":")
+    return [str(addr), addr.exploded,
+            ":".join(part.lstrip("0") or "0" for part in hextets)]
+
+
+def _v6_prefix_forms(addr: ipaddress.IPv6Address) -> list[str]:
+    """The spellings of a /64 prefix: the first four hextets, trimmed and
+    padded.
+
+    No ``::`` form is needed — ``2001:db8:a1:1::`` begins with the trimmed
+    spelling, so the trimmed entry already covers it, and a shorter entry that
+    is a prefix of a longer one is exactly what the longest-first ordering in
+    :func:`_identity_table` exists to resolve.
+    """
+    hextets = addr.exploded.split(":")[:4]
+    return [":".join(part.lstrip("0") or "0" for part in hextets),
+            ":".join(hextets)]
+
+
+def _dedupe(values: Iterable[str]) -> list[str]:
+    """Order-preserving deduplication, for the literal lists where a repeated
+    entry would mean an entity is counted twice."""
+    seen: dict[str, None] = {}
+    for value in values:
+        seen.setdefault(value, None)
+    return list(seen)
+
+
+def _v6_network(addr: ipaddress.IPv6Address) -> str:
+    """The /64 this address sits in, as a canonical string. Used as the key
+    that makes every address on one real network land on one documentation
+    network — "these two addresses are on the same /64" is a fact about the
+    text that should survive redaction."""
+    return str(ipaddress.IPv6Address(int(addr) >> 64 << 64))
+
+
+#: Set by :func:`_identity_table` on every build. Module globals rather than a
+#: second :func:`lru_cache`, and the reason is a test: the fixture that clears
+#: the memoised table between tests clears *that* function's cache, and a
+#: separately cached failure list would survive it and poison the next test
+#: with a fabricated failure. One cache, one lookup pass, one place to clear.
+#:
+#: A **failure** means coverage was lost: a source this table needs could not
+#: be read, so no document can be certified and the callers below refuse. A
+#: **note** means a candidate could not be classified and was therefore kept —
+#: coverage is intact, the conservative branch was taken, and a caller has
+#: nothing to refuse over but should still be able to see it happened.
+_LOOKUP_FAILURES: tuple[str, ...] = ()
+_LOOKUP_NOTES: tuple[str, ...] = ()
+
+
 @lru_cache(maxsize=1)
 def _identity_table() -> tuple[tuple[str, str], ...]:
     """Every literal this machine can leak, paired with what replaces it.
 
     Read from the operating system rather than configured, because a configured
-    list is a list of the leaks somebody already noticed. The four sources below
-    are the ones an adapter can put into an observation without being asked:
-    ``enum.privileges`` returns the account name, ``enum.persistence`` and
-    ``vuln.credential_exposure`` return paths under the home directory,
-    ``enum.host`` returns the host name, and every sandbox world is built under
-    the per-user temp directory — which on macOS is
-    ``/var/folders/<two>/<28 characters>/T``, a stable per-user identifier for
-    one machine and, incidentally, proof that a host labelled ``sandbox-linux``
-    is really a Mac.
+    list is a list of the leaks somebody already noticed — and a *persisted*
+    list is a new leak. The sources are the ones an adapter can put into an
+    observation without being asked: ``enum.privileges`` returns the account
+    name, ``enum.persistence`` and ``vuln.credential_exposure`` return paths
+    under the home directory, ``enum.host`` returns the host name, every
+    sandbox world is built under the per-user temp directory, ``enum.network``
+    returns interface addresses, and a sandbox path names the volume it lives
+    on.
 
     **What it cannot reach, stated rather than hidden.** A *derived* display
     string is only caught when it contains one of these literals. macOS
     ``ComputerName`` is usually ``<account>'s MacBook Pro``, so it goes with the
     account name — but a machine renamed by hand, and the ``real_name`` of any
     *other* local account ``enum.users`` enumerates, are names this table was
-    never told and cannot invent. The corpus that feeds a training run should be
-    read once with :func:`identity_leaks` and once with human eyes, and anything
-    found that way belongs in this function rather than in a scrub script,
-    because a scrub script only ever cleans the file somebody remembered.
+    never told and cannot invent. An address belonging to another device on the
+    same network is reachable only through its /64 prefix, which is why the
+    prefix is an entry in its own right. The corpus that feeds a training run
+    should be read once with :func:`identity_leaks` and once with human eyes,
+    and anything found that way belongs in this function rather than in a scrub
+    script, because a scrub script only ever cleans the file somebody
+    remembered.
 
     The second thing it cannot reach is a literal cut in half by
     :data:`~whetstone.kernel.render.MAX_VALUE`. Redaction runs on the rendered
     document, so a value longer than 220 characters has already been truncated
-    and ``/Users/<name>`` can survive as ``/Users/<na…`` — which is a partial
-    account name that no table entry matches. It is not fixable at the other end
+    and ``/Users/<name>`` can survive as ``/Users/<na…`` — a partial account
+    name that no table entry matches. It is not fixable at the other end
     either: truncation lives in ``whetstone/kernel/render.py`` and the runtime
     deliberately does not import anything under ``training/``. What makes it
-    tolerable is the arithmetic and a measurement: the longest literal here is
-    56 characters, so a straddle needs a value with 164 characters of prefix
-    before the path, and a scan of all 13,206 documents in the current cache
-    found none. If that ever stops being true the answer is to substitute the
-    truncated spellings too, not to widen what counts as clean.
+    tolerable is the arithmetic and a measurement: the longest literal on this
+    machine is 62 characters (the JSON-doubled backslash spelling of the
+    per-user temp directory), so a straddle needs a value with 158 characters
+    of prefix before it, and a scan of the built cache found none. If that ever
+    stops being true the answer is to substitute the truncated spellings too,
+    not to widen what counts as clean.
+
+    **Replacements are varied on purpose, and not everywhere.** The name
+    sources get one fixed placeholder each because each of them is *one*
+    literal — one account, one person, one home, one machine — so the mapping
+    is already injective and there is nothing to spread; ``operator``
+    additionally has to stay fixed because the sandbox worlds in this module
+    name their synthetic account that, and ``examples/runs/`` is published with
+    that spelling. The network sources are the opposite case: fifteen MACs and
+    a dozen addresses collapsed onto one token each would teach the model that
+    a machine has one address, repeated three thousand times, which passes the
+    privacy gate and makes the model worse. Those draw from the pools above,
+    keyed on a digest of the literal, and every address on one real /64 is
+    given the same documentation /64 so that "these two addresses are on the
+    same network" survives redaction as a fact about the text.
 
     Ordered longest first, and the order is load-bearing: the alternation
     compiled from this table is matched leftmost-first by :mod:`re`, not
     longest-first, so ``/Users/alice`` has to precede ``alice`` or the home path
     is half-substituted into ``/Users/operator`` by the shorter rule and the
-    longer one never fires. Ties are broken on the text so that two machines
-    with equally long names still build the table in one order.
+    longer one never fires. The /64 prefix sits below the full addresses for
+    the same reason. Ties are broken on the text so that two machines with
+    equally long names still build the table in one order.
     """
+    global _LOOKUP_FAILURES, _LOOKUP_NOTES
     pairs: list[tuple[str, str]] = []
+    failures: list[str] = []
+    notes: list[str] = []
 
     def add(secret: str | None, replacement: str) -> None:
+        """Enter one value under every spelling it can take.
+
+        Two axes, composed: :func:`_separator_forms` is the separator axis and
+        :func:`_spellings` is the JSON-escape axis. Composing them here rather
+        than widening either one is what closes the gap an audit found, where a
+        POSIX home directory spelled with backslashes was structurally
+        ungeneratable and :func:`identity_leaks` called it clean.
+        """
         if not secret:
             return
-        for form, repl in _spellings(secret, replacement):
-            if form.lower() in repl.lower():
-                # Substituting would be a no-op *and* the verification in
-                # redact_identity would then fire on every document forever,
-                # because the literal is still there afterwards. A machine
-                # genuinely called ``operator-host`` is not leaking anything.
-                continue
-            pairs.append((form, repl))
+        separators = _separator_forms(secret)
+        replacements = _separator_forms(replacement)
+        for index, spelling in enumerate(separators):
+            paired = replacements[min(index, len(replacements) - 1)]
+            for form, repl in _spellings(spelling, paired):
+                if _fold(form) in _fold(repl):
+                    # Substituting would be a no-op *and* the verification in
+                    # redact_identity would then fire on every document
+                    # forever, because the literal is still there afterwards.
+                    # A machine genuinely called ``operator-host`` is not
+                    # leaking anything.
+                    continue
+                pairs.append((form, repl))
 
-    user = getpass.getuser()
+    try:
+        user = getpass.getuser()
+    except Exception as exc:
+        user = ""
+        failures.append(f"account:{type(exc).__name__}")
     if _is_identifying(user):
         add(user, _OPERATOR)
 
@@ -2219,60 +3039,59 @@ def _identity_table() -> tuple[tuple[str, str], ...]:
     # observation that identifies a human rather than a machine. Read from
     # ``pwd`` rather than by shelling out to ``dscl``: this module must be able
     # to build its table without running a command, and ``pwd`` is absent on
-    # Windows, where there is no GECOS field to read.
+    # Windows, where there is no GECOS field to read — so ImportError is a
+    # platform fact and anything else is a lookup that failed.
+    gecos = ""
     try:
         import pwd
 
         gecos = pwd.getpwuid(os.getuid()).pw_gecos.split(",")[0].strip()
-    except (ImportError, KeyError):
-        gecos = ""
+    except ImportError:
+        pass
+    except Exception as exc:
+        failures.append(f"displayname:{type(exc).__name__}")
     if _is_identifying(gecos):
         add(gecos, _OPERATOR)
 
-    home = Path.home()
+    home: Path | None
+    try:
+        home = Path.home()
+    except Exception as exc:
+        home = None
+        failures.append(f"home:{type(exc).__name__}")
     # Keyed on the basename rather than on ``user``: the two usually agree, and
     # when they do not it is the directory name that is written into paths.
-    if _is_identifying(home.name):
+    if home is not None and _is_identifying(home.name):
         add(str(home), str(home.parent / _OPERATOR))
 
-    # Every temp directory this machine could have written into a path, not
-    # only the one TMPDIR names right now. ``gettempdir()`` follows TMPDIR, so
-    # pointing the corpus build's scratch at the external volume -- which this
-    # project now does, because forty-four sources unpacking into the internal
-    # disk filled it and took the machine down mid-build -- drops the per-user
-    # ``/var/folders`` path straight out of this table, while every document
-    # captured before the move still carries it. That is not a hypothetical:
-    # it put a real ``/var/folders/<x>/<hash>/T`` into a built corpus, seven
-    # times in one document, and the build reported zero leaks because the
-    # literal it was checking for was no longer the literal that was there.
-    # A directory identifies its owner whether or not anything is using it, so
-    # the table is keyed on ownership rather than on the current environment.
-    # Found by ownership rather than by ``getconf``: this module must build its
-    # table without running a command, and ``CS_DARWIN_USER_TEMP_DIR`` is not
-    # in every build's ``os.confstr_names``.
-    temps = {tempfile.gettempdir()}
-    for candidate in glob.glob("/var/folders/*/*/T"):
-        try:
-            if os.stat(candidate).st_uid == os.getuid():
-                temps.add(candidate)
-        except OSError:
-            continue
+    temps, temp_failures, temp_notes = _temp_directories()
+    failures.extend(temp_failures)
+    notes.extend(temp_notes)
     generic_tmp = "C:\\Temp" if os.name == "nt" else "/tmp"
-    for tmp in sorted(temps):
+    for tmp in sorted(set(temps)):
         if tmp == generic_tmp:
             continue
         add(tmp, generic_tmp)
         # macOS reports the same directory both with and without the /private
         # prefix depending on whether anything resolved it, and the sandbox
         # observations in this corpus contain both.
-        resolved = str(Path(tmp).resolve())
+        try:
+            resolved = str(Path(tmp).resolve())
+        except OSError as exc:
+            failures.append(f"tempdirs:resolve:{type(exc).__name__}")
+            continue
         if resolved != tmp:
             add(resolved, generic_tmp)
 
     # ``socket.getfqdn()`` is deliberately not consulted: it can block on a
     # reverse lookup, and the name the adapters actually report is the one
     # ``hostname`` prints, which is what these two return.
-    for name in sorted({socket.gethostname(), platform.node()}):
+    try:
+        host_names = sorted({socket.gethostname(), platform.node()})
+    except OSError as exc:
+        host_names = []
+        failures.append(f"hostname:{type(exc).__name__}")
+    for name in host_names:
         if not name:
             continue
         short, dot, domain = name.partition(".")
@@ -2286,13 +3105,134 @@ def _identity_table() -> tuple[tuple[str, str], ...]:
         if dot and _is_identifying(short):
             add(short, _OPERATOR_HOST)
 
+    # ----- the network layer -------------------------------------------------
+    # Every literal is collected before any replacement is chosen, because a
+    # replacement must not contain another entry's literal and that cannot be
+    # checked until all of them are known.
+    records, address_failures, address_notes = _host_addresses()
+    failures.extend(address_failures)
+    notes.extend(address_notes)
+    volumes, volume_failures, volume_notes = _host_volumes()
+    failures.extend(volume_failures)
+    notes.extend(volume_notes)
+
+    macs = _dedupe(_fold(value) for kind, value in records
+                   if kind == "mac" and _identifying_mac(value))
+    v4: list[tuple[str, str]] = []
+    for kind, value in records:
+        if kind != "ipv4":
+            continue
+        scope = _identifying_ipv4(value)
+        if scope is not None and (scope, value) not in v4:
+            v4.append((scope, value))
+    v6: list[tuple[str, ipaddress.IPv6Address]] = []
+    for kind, value in records:
+        if kind != "ipv6":
+            continue
+        scope = _identifying_ipv6(value)
+        if scope is None:
+            continue
+        entry = (scope, ipaddress.IPv6Address(value))
+        if entry not in v6:
+            v6.append(entry)
+    prefixes = _dedupe(_v6_network(addr) for scope, addr in v6
+                       if scope == "global")
+    names = _dedupe(name for name in volumes if _identifying_volume(name))
+
+    literals = (
+        [form for form, _repl in pairs]
+        + [form for mac in macs for form in _mac_forms(mac)]
+        + [value for _scope, value in v4]
+        + [form for _scope, addr in v6 for form in _v6_forms(addr)]
+        + [form for prefix in prefixes
+           for form in _v6_prefix_forms(ipaddress.IPv6Address(prefix))]
+        + names)
+
+    taken: set[Any] = set()
+    exhausted: set[str] = set()
+
+    def pick(pool: Sequence[Any], literal: str, kind: str,
+             render: Callable[[Any], str] = str) -> Any:
+        choice = _assign(pool, literal, literals, taken, render)
+        if choice is None:
+            exhausted.add(kind)
+        return choice
+
+    for mac in macs:
+        replacement = pick(_DOC_MACS, mac, "mac")
+        if replacement is None:
+            continue
+        for form, repl in zip(_mac_forms(mac), _mac_forms(replacement)):
+            add(form, repl)
+
+    for scope, value in v4:
+        octets = value.split(".")
+        if scope == "private":
+            keep = 1 if octets[0] == "10" else 2
+
+            def render_v4(tail: tuple[int, ...],
+                          octets: list[str] = octets,
+                          keep: int = keep) -> str:
+                return ".".join(octets[:keep]
+                                + [str(part) for part in tail[keep - 1:]])
+        else:
+            def render_v4(tail: tuple[int, ...]) -> str:
+                return str(_DOC_V4_PUBLIC.network_address + tail[-1])
+        tail = pick(_DOC_V4_TAILS, value, "ipv4", render_v4)
+        if tail is not None:
+            add(value, render_v4(tail))
+
+    prefix_choice: dict[str, str] = {}
+    for prefix in prefixes:
+        choice = pick(_DOC_V6_PREFIXES, prefix, "ipv6-prefix",
+                      lambda candidate: str(
+                          ipaddress.IPv6Address(f"{candidate}::")))
+        if choice is None:
+            continue
+        prefix_choice[prefix] = choice
+        for form, repl in zip(
+                _v6_prefix_forms(ipaddress.IPv6Address(prefix)),
+                _v6_prefix_forms(ipaddress.IPv6Address(f"{choice}::"))):
+            add(form, repl)
+
+    for scope, addr in v6:
+        if scope == "local":
+            # ``fe80::`` is the prefix on every machine on earth, so it is kept
+            # and only the interface identifier moves. Replacing it would be
+            # rewriting a constant with a constant, and the thing that
+            # identifies a link-local address is its identifier — which on many
+            # interfaces is derived from the MAC.
+            head = "fe80:0:0:0"
+        else:
+            head = prefix_choice.get(_v6_network(addr))
+            if head is None:
+                continue
+
+        def render_v6(iid: str, head: str = head) -> str:
+            return str(ipaddress.IPv6Address(f"{head}:{iid}"))
+
+        iid = pick(_DOC_V6_IIDS, str(addr), "ipv6-iid", render_v6)
+        if iid is None:
+            continue
+        replacement = ipaddress.IPv6Address(render_v6(iid))
+        for form, repl in zip(_v6_forms(addr), _v6_forms(replacement)):
+            add(form, repl)
+
+    for name in names:
+        replacement = pick(_DOC_VOLUMES, name, "volume")
+        if replacement is not None:
+            add(name, replacement)
+
+    for kind in sorted(exhausted):
+        failures.append(f"vocabulary-exhausted:{kind}")
+
     # One entry per distinct literal, first writer wins, so a name that is both
     # the account and the short host name resolves to exactly one replacement
     # and the substitution below cannot pick a different one than the
     # verification does.
     seen: dict[str, tuple[str, str]] = {}
     for form, repl in pairs:
-        seen.setdefault(form.lower(), (form, repl))
+        seen.setdefault(_fold(form), (form, repl))
 
     # Drop any literal that occurs inside a replacement this module chose. The
     # per-pair guard above only catches a value that replaces itself; this
@@ -2300,33 +3240,79 @@ def _identity_table() -> tuple[tuple[str, str], ...]:
     # an account named ``host`` would be rewritten to ``operator``, the host
     # name rewritten to ``operator-host``, and then the verification in
     # redact_identity would find ``host`` inside ``operator-host`` and refuse
-    # every document forever. The replacement vocabulary is a handful of short
-    # strings, so the only names this can drop are ones that are a substring of
-    # ``operator``, ``operator-host``, ``/tmp`` or the redacted home — names
-    # that identify nobody and that substituting would have shredded the corpus
-    # to remove.
-    replacements = " ".join(repl for _form, repl in seen.values()).lower()
-    kept = [pair for pair in seen.values() if pair[0].lower() not in replacements]
+    # every document forever. :func:`_assign` already refuses a replacement
+    # that contains a literal, so for the network kinds this is a backstop
+    # rather than a filter; the only names it can still drop are ones that are
+    # a substring of ``operator``, ``operator-host``, ``/tmp`` or the redacted
+    # home — names that identify nobody and that substituting would have
+    # shredded the corpus to remove.
+    chosen = " ".join(_fold(repl) for _form, repl in seen.values())
+    kept = [pair for pair in seen.values() if _fold(pair[0]) not in chosen]
+    _LOOKUP_FAILURES = tuple(_dedupe(failures))
+    _LOOKUP_NOTES = tuple(_dedupe(notes))
     return tuple(sorted(kept, key=lambda kv: (-len(kv[0]), kv[0])))
+
+
+def _identity_failures() -> tuple[str, ...]:
+    """Which lookups could not be made, named and without values.
+
+    Empty means every source answered — including answering "nothing here",
+    which is what a container with a generic account and nothing routable bound
+    legitimately does. Non-empty means this module cannot certify a document,
+    and both callers below refuse rather than return the text.
+    """
+    _identity_table()  # the one lookup pass; it sets the globals
+    return _LOOKUP_FAILURES
+
+
+def _identity_notes() -> tuple[str, ...]:
+    """Candidates that could not be classified and were therefore kept.
+
+    Not a failure: the conservative branch was taken and coverage is intact.
+    Recorded because the alternative is the ``except OSError: continue`` this
+    section replaced, and a scan that quietly looked at less than it was asked
+    to is how a corpus gets certified clean by a check that never ran.
+    """
+    _identity_table()
+    return _LOOKUP_NOTES
+
+
+@lru_cache(maxsize=4)
+def _table_matcher(
+        table: tuple[tuple[str, str], ...]) -> re.Pattern[str] | None:
+    """Compile a table into the one matcher the substituter and the verifier
+    both run, or ``None`` for an empty table.
+
+    Each alternative is its own capturing group, so the replacement is found by
+    ``m.lastindex`` — by *position in the table* rather than by folding the
+    matched text back into a key. That is what closes the fold mismatch: the
+    previous version compiled with ``re.IGNORECASE`` and then looked the
+    replacement up under ``m.group(0).lower()``, and those two disagree on
+    U+0130, which is reachable on this account name and raises ``KeyError``
+    mid-build.
+
+    Case-insensitive because Windows reports the same account as ``alice`` in a
+    path and ``ALICE`` in a SAM query, hex addresses are printed in both cases,
+    and a case-sensitive pass would leave the second spelling in the corpus.
+    Matching case-insensitively and *replacing* rather than refusing means the
+    differently-cased spelling is fixed instead of aborting a forty-minute
+    generation run over something the table already knows about.
+
+    Keyed on the table itself rather than memoised with ``maxsize=1``: a test
+    that fabricates a machine changes the table, and a cache keyed on the table
+    cannot answer for the new one out of the old one's compiled pattern.
+    """
+    if not table:
+        return None
+    return re.compile("|".join(f"({re.escape(form)})" for form, _ in table),
+                      re.IGNORECASE)
 
 
 @lru_cache(maxsize=1)
 def _identity_pattern() -> re.Pattern[str] | None:
-    """One alternation over the whole table, or ``None`` on a machine with
-    nothing identifying to hide.
-
-    Case-insensitive because Windows reports the same account as ``alice`` in a
-    path and ``ALICE`` in a SAM query, and a case-sensitive pass would leave the
-    second spelling in the corpus. Matching case-insensitively and *replacing*
-    rather than refusing means the differently-cased spelling is fixed instead
-    of aborting a forty-minute generation run over something the table already
-    knows about.
-    """
-    table = _identity_table()
-    if not table:
-        return None
-    return re.compile("|".join(re.escape(form) for form, _ in table),
-                      re.IGNORECASE)
+    """The matcher for this machine's table, or ``None`` on a machine with
+    nothing identifying to hide."""
+    return _table_matcher(_identity_table())
 
 
 def identity_leaks(text: str) -> list[str]:
@@ -2338,9 +3324,31 @@ def identity_leaks(text: str) -> list[str]:
     trust that redaction happened upstream. It answers only about the literals
     this machine can be asked for; it cannot certify that text from some other
     machine is clean, and nothing should read it as saying so.
+
+    It runs the *same compiled pattern* as :func:`redact_identity`, so it
+    reports exactly the set of literals that function would rewrite. It used to
+    compare ``str.lower()`` substrings instead, which disagrees with
+    ``re.IGNORECASE`` in both directions — and the direction that matters is
+    the one where a document the substituter would have rewritten is called
+    clean by the checker standing in for it at the file boundary.
+
+    Raises when a lookup failed, because a verifier that answers "clean"
+    because it could not look is the same fail-open this module exists to
+    prevent, reached through the checking door instead of the substituting one.
     """
-    low = text.lower()
-    return [form for form, _ in _identity_table() if form.lower() in low]
+    failures = _identity_failures()
+    if failures:
+        raise RuntimeError(
+            "identity lookups failed, so nothing can be certified clean: "
+            f"{failures!r}. Fix the lookup rather than reading an empty table "
+            "as a clean machine — a table that came back empty because a read "
+            "failed is how Mac-captured text reaches a checkpoint.")
+    table = _identity_table()
+    matcher = _table_matcher(table)
+    if matcher is None:
+        return []
+    hit = {match.lastindex for match in matcher.finditer(text)}
+    return [table[index - 1][0] for index in sorted(hit)]
 
 
 def redact_identity(text: str) -> str:
@@ -2352,12 +3360,29 @@ def redact_identity(text: str) -> str:
     belief is cashed in is a checkpoint nobody can grep. So the substitution is
     followed by a scan for survivors and a survivor raises, loudly, naming what
     it found, at generation time rather than after a training run.
+
+    There are two ways to have nothing to substitute and they are not the same
+    thing. A machine with no identifying values — ``root`` in ``/root`` on a
+    hex-named container with nothing routable bound — is leaking nothing, and
+    returning the text unchanged is correct. A machine whose *lookups failed*
+    is a machine this function knows nothing about, and the previous version
+    returned Mac-captured text unchanged and silently in exactly that case.
+    The first branch passes; the second raises and names the lookup.
     """
+    failures = _identity_failures()
+    if failures:
+        raise RuntimeError(
+            "identity lookups failed and this document must not be written: "
+            f"{failures!r}. An empty table is only safe when every source "
+            "answered; one that failed to read means the literals it would "
+            "have held are still in this text.")
     pattern = _identity_pattern()
     if pattern is None:
+        # Nothing identifies this host. Every lookup answered, so this is a
+        # fact about the machine rather than an absence of information.
         return text
-    table = {form.lower(): repl for form, repl in _identity_table()}
-    out = pattern.sub(lambda m: table[m.group(0).lower()], text)
+    table = _identity_table()
+    out = pattern.sub(lambda m: table[m.lastindex - 1][1], text)
 
     survivors = identity_leaks(out)
     if survivors:
@@ -2608,8 +3633,20 @@ def _write_jsonl(out: Path, texts: Iterator[str]) -> tuple[int, int]:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Generate real agent trajectories.")
+    # Relative, resolved through the repo's `data` symlink, exactly as
+    # training/corpus/build.py spells its own --out and --cache defaults.
+    #
+    # It used to be an absolute /Volumes/<name>/... path, which hardcoded the
+    # external volume's name into this module's source — and that name is a
+    # needle: the corpus audit found it in 1,776 training documents. The corpus
+    # side is covered, because the name is a table literal and the chokepoint
+    # substitutes it, but a literal sitting in source is a literal in anything
+    # that ships the source, and `ownrepos` used to walk this repository into
+    # the corpus as prose. tests/test_identity.py carried an xfail recording
+    # exactly this line and saying "when somebody fixes that default this xfail
+    # starts failing, which is the point". This is that fix.
     p.add_argument("--out", type=Path,
-                   default=Path("/Volumes/at0m_b0mb/whetstone/corpus/raw/trajectories"),
+                   default=Path("data/corpus/raw/trajectories"),
                    help="a directory of trajectory-*.txt files, or a path "
                         "ending in .jsonl for one row per episode")
     p.add_argument("--repeats", type=int, default=6,
