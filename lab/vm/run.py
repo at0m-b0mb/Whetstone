@@ -60,6 +60,10 @@ from lab.profiles import PROFILE_NAMES, engagement_for
 
 from .adapter import (AUDIT_KEY, AUDIT_RULE_ARGV, SERVICE_PATH,
                       TELEMETRY_SOURCE, VMAdapter, _LIMA_HOME, _VM)
+from whetstone.paths import data_root
+
+#: Resolved once: this module is only ever run as a CLI entry point.
+_DATA_ROOT = data_root()
 
 #: The path scope every VM engagement carries, handed to the profile builders as
 #: their ``root``.
@@ -426,7 +430,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--model", type=Path,
                    help="drive with a trained checkpoint (constrained decoding)")
     p.add_argument("--tokenizer", type=Path,
-                   default=Path("/Volumes/at0m_b0mb/whetstone/models/tokenizer-v1/tokenizer.json"))
+                   default=_DATA_ROOT / "models/tokenizer-v1/tokenizer.json")
     args = p.parse_args(argv)
 
     mode = MODES[args.profile]

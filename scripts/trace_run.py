@@ -41,6 +41,7 @@ from whetstone.kernel import Kernel
 from lab.adapter import SandboxAdapter
 from lab.run import _engagement
 from lab.target import SandboxTarget
+from whetstone.paths import data_root
 
 C = {"dim": "\033[2m", "b": "\033[1m", "g": "\033[32m", "y": "\033[33m",
      "c": "\033[36m", "r": "\033[31m", "m": "\033[35m", "blue": "\033[34m",
@@ -217,7 +218,7 @@ class _TracingExecutor:
 
 
 def main(argv: list[str] | None = None) -> int:
-    D = Path("/Volumes/at0m_b0mb/whetstone")
+    D = data_root()
     p = argparse.ArgumentParser(description="Watch the agent think and act.")
     p.add_argument("--model", type=Path,
                    default=D / "models/checkpoints-v5/small/best")

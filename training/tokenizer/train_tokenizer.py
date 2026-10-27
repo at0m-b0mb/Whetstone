@@ -47,6 +47,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Iterator
@@ -121,16 +122,34 @@ SAMPLES: tuple[str, ...] = (
 )
 
 
-def iter_corpus(paths: list[Path], sample_limit: int | None = None) -> Iterator[str]:
-    """Yield text from the given roots.
+def iter_corpus(paths: list[Path], sample_limit: int | None = None, *,
+                accept_leaking_corpus: str | None = None) -> Iterator[str]:
+    """Yield text from the given roots, **after verifying them**.
 
     A root holding ``*.jsonl`` is read as a **built corpus** — the output of
     ``training/corpus/build.py``, with register and side metadata intact.
-    Anything else is globbed as raw text files. Supporting both matters: the
+    Anything else is walked as raw text files. Supporting both matters: the
     raw path is how a new source gets smoke-tested before it has an adapter,
     and the built path is the one that carries the register information the
     first tokenizer attempt was missing.
+
+    Neither path applied any redaction and neither checked anything, which made
+    this the widest bypass of the chokepoint in the project: a tokenizer fitted
+    here keeps whatever it was shown as BPE merges, and a tokenizer.json is a
+    shipped artifact. :func:`training.data.require_clean_corpus` now runs first
+    and refuses on a leak — see it for ``accept_leaking_corpus``, which is the
+    only way past and is not a boolean.
+
+    ``os.walk(followlinks=False)``, never ``rglob``. ``Path.rglob`` follows
+    symlinks, and this repository contains ``data`` as a symlink to the data
+    volume: ``iter_corpus([Path('.')])`` walked straight into the SSD and
+    could pull the corpus cache back in as raw prose. That is exactly how the
+    ``ownrepos`` adapter once made the corpus eat itself.
     """
+    from ..data import STAMP_NAME, require_clean_corpus
+
+    require_clean_corpus(paths, accept_leaking_corpus=accept_leaking_corpus)
+
     seen = 0
     for root in paths:
         if root.is_dir() and any(root.glob("*.jsonl")):
@@ -142,9 +161,7 @@ def iter_corpus(paths: list[Path], sample_limit: int | None = None) -> Iterator[
                     return
             continue
 
-        files = [root] if root.is_file() else sorted(
-            p for p in root.rglob("*") if p.is_file()
-        )
+        files = [root] if root.is_file() else _raw_files(root, skip=STAMP_NAME)
         for path in files:
             if path.suffix.lower() in {".bin", ".npy", ".png", ".jpg", ".zip", ".gz"}:
                 continue
@@ -158,6 +175,27 @@ def iter_corpus(paths: list[Path], sample_limit: int | None = None) -> Iterator[
             seen += 1
             if sample_limit and seen >= sample_limit:
                 return
+
+
+def _raw_files(root: Path, *, skip: str) -> list[Path]:
+    """Every plain file under ``root``, without following a single symlink.
+
+    ``skip`` is the verification stamp. A corpus directory that has been
+    verified holds one, and the raw path must not ingest the record of its own
+    verification as training text — the corpus eating its own metadata is a
+    smaller version of the bug that once pulled the corpus cache in as prose.
+    """
+    out: list[Path] = []
+    for directory, dirs, names in os.walk(root, followlinks=False):
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        for name in sorted(names):
+            if name == skip or name.startswith("."):
+                continue
+            path = Path(directory) / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            out.append(path)
+    return out
 
 
 def build_tokenizer(vocab_size: int) -> tuple[Tokenizer, trainers.BpeTrainer]:
@@ -183,10 +221,13 @@ def build_tokenizer(vocab_size: int) -> tuple[Tokenizer, trainers.BpeTrainer]:
     return tok, trainer
 
 
-def train(corpus: list[Path], out: Path, vocab_size: int = 16384) -> Tokenizer:
+def train(corpus: list[Path], out: Path, vocab_size: int = 16384, *,
+          accept_leaking_corpus: str | None = None) -> Tokenizer:
     tok, trainer = build_tokenizer(vocab_size)
 
-    texts = list(iter_corpus(corpus)) if corpus else []
+    texts = (list(iter_corpus(corpus,
+                              accept_leaking_corpus=accept_leaking_corpus))
+             if corpus else [])
     if not texts:
         print("no corpus found — training on the built-in samples only.\n"
               "This is a smoke test, not a usable tokenizer: build the corpus "
@@ -261,6 +302,12 @@ def corpus_identity(clean_dir: Path) -> str:
     a gigabyte to label a measurement would cost more than the measurement does.
     Any rebuild that changes what a source contributed changes that source's file
     size, which is the whole of what this has to notice.
+
+    It is **not** a safety check, and must not be used as one. An edit that
+    preserves a file's length — which is exactly what substituting a redaction
+    placeholder does — leaves this string unchanged. The verification stamp in
+    :mod:`training.data` hashes every byte for that reason; two different
+    questions, two different instruments.
     """
     h = hashlib.sha256()
     for path in sorted(clean_dir.glob("*.jsonl")):
@@ -268,8 +315,38 @@ def corpus_identity(clean_dir: Path) -> str:
     return h.hexdigest()[:16]
 
 
-def iter_split(clean_dir: Path, *, holdout: bool) -> Iterator[tuple[str, str]]:
+def corpus_record(clean_dir: Path) -> dict:
+    """What a tokenizer should write down about the corpus it actually read.
+
+    ``clean-v8`` is a symlink to ``clean-v7``. A meta.json that records
+    ``"dir": "…/clean-v8"`` is therefore a claim about v7's bytes wearing v8's
+    name, and every measurement filed under v8 inherits the mistake. So the
+    name that was asked for and the name that was *read* are both recorded, by
+    **basename**: the absolute path is not written down, because the volume
+    name is one of the kinds the artifact verifier hunts for and this record
+    goes to disk.
+    """
+    given = Path(clean_dir)
+    resolved = Path(os.path.realpath(given))
+    record = {
+        "identity": corpus_identity(resolved),
+        "given": given.name,
+        "resolved": resolved.name,
+    }
+    if resolved != given.absolute():
+        record["symlink"] = True
+    return record
+
+
+def iter_split(clean_dir: Path, *, holdout: bool,
+               accept_leaking_corpus: str | None = None,
+               ) -> Iterator[tuple[str, str]]:
     """Yield ``(register, text)`` from the built corpus, train or holdout side.
+
+    Verified before anything is yielded, like every other reader of a corpus
+    directory in this project. ``--clean`` is the mode ``overnight.sh`` uses to
+    fit the shipped tokenizer, so this is the exact path an unverified corpus
+    would take into a shipped artifact.
 
     A document's side is decided by its own content, never by where it sits in
     the directory.
@@ -302,6 +379,10 @@ def iter_split(clean_dir: Path, *, holdout: bool) -> Iterator[tuple[str, str]]:
     """
     from ..corpus.build import read_documents
     from ..corpus.source import fingerprint
+    from ..data import require_clean_corpus
+
+    require_clean_corpus([clean_dir],
+                         accept_leaking_corpus=accept_leaking_corpus)
 
     for row in read_documents(clean_dir):
         is_holdout = (int(fingerprint(row["text"]), 16) % HOLDOUT_EVERY) == 0
@@ -310,7 +391,8 @@ def iter_split(clean_dir: Path, *, holdout: bool) -> Iterator[tuple[str, str]]:
 
 
 def compare_on_corpus(tok: Tokenizer, clean_dir: Path, *, meta: dict | None = None,
-                      max_chars_per_register: int = 400_000) -> None:
+                      max_chars_per_register: int = 400_000,
+                      accept_leaking_corpus: str | None = None) -> None:
     """Measure compression against gpt2 on **held-out real corpus text**, by register.
 
     This is the measurement that actually settles the domain-tokenizer question,
@@ -372,7 +454,9 @@ def compare_on_corpus(tok: Tokenizer, clean_dir: Path, *, meta: dict | None = No
 
     buckets: dict[str, list[str]] = {}
     sizes: dict[str, int] = {}
-    for register, text in iter_split(clean_dir, holdout=True):
+    for register, text in iter_split(
+            clean_dir, holdout=True,
+            accept_leaking_corpus=accept_leaking_corpus):
         if sizes.get(register, 0) >= max_chars_per_register:
             continue
         buckets.setdefault(register, []).append(text)
@@ -417,7 +501,7 @@ def compare_on_corpus(tok: Tokenizer, clean_dir: Path, *, meta: dict | None = No
               "that is a real possible outcome, not a bug to tune away.")
 
 
-def main(argv: list[str] | None = None) -> int:
+def _main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Train the Whetstone security BPE.")
     p.add_argument("--corpus", type=Path, nargs="*", default=[],
                    help="directories or files of cleaned corpus text")
@@ -429,7 +513,32 @@ def main(argv: list[str] | None = None) -> int:
                    help="built corpus directory (*.jsonl) — enables the "
                         "per-register held-out measurement, which is the one "
                         "that actually settles the domain-tokenizer question")
+    # The override, and the reason it takes a value. A corpus that the artifact
+    # verifier says leaks is refused; this is the one way past, and it wants the
+    # token the refusal printed. The token names exactly those leaks, so it
+    # expires the moment the corpus changes and cannot be parked in
+    # overnight.sh. There is deliberately no environment variable and no
+    # default: `default=None` here and nothing in training/data.py reads
+    # os.environ, which a test asserts. It is not called --force, because
+    # --force is a word people type from memory.
+    p.add_argument("--accept-leaking-corpus", metavar="TOKEN", default=None,
+                   help="fit on a corpus the verifier says leaks. Requires the "
+                        "token printed by the refusal, which names exactly the "
+                        "leaks found; it stops matching as soon as the corpus "
+                        "changes. Every value it permits ends up in the "
+                        "tokenizer's merges, which ship.")
     args = p.parse_args(argv)
+    accept = args.accept_leaking_corpus
+
+    # Verified before anything is built, fetched or measured. The readers below
+    # all gate themselves and the check is memoised, so this costs nothing twice
+    # — but a refusal should arrive before a vocabulary has been allocated and
+    # before gpt2 has been downloaded for a comparison that is not going to
+    # happen. Refuse early, refuse cheaply.
+    from ..data import require_clean_corpus
+    roots = [args.clean] if args.clean else list(args.corpus)
+    if roots:
+        require_clean_corpus(roots, accept_leaking_corpus=accept)
 
     existing = args.out / "tokenizer.json"
     if args.compare and existing.is_file():
@@ -442,7 +551,8 @@ def main(argv: list[str] | None = None) -> int:
             meta_path = args.out / "meta.json"
             meta = (json.loads(meta_path.read_text(encoding="utf-8"))
                     if meta_path.is_file() else {})
-            compare_on_corpus(tok, args.clean, meta=meta)
+            compare_on_corpus(tok, args.clean, meta=meta,
+                              accept_leaking_corpus=accept)
         return 0
 
     # Train on the training side of the split only, so the held-out measurement
@@ -459,7 +569,8 @@ def main(argv: list[str] | None = None) -> int:
 
         def _training_texts():
             nonlocal seen
-            for _reg, text in iter_split(args.clean, holdout=False):
+            for _reg, text in iter_split(args.clean, holdout=False,
+                                         accept_leaking_corpus=accept):
                 seen += 1
                 yield text
 
@@ -470,7 +581,9 @@ def main(argv: list[str] | None = None) -> int:
         if not seen:
             raise SystemExit(f"no documents under {args.clean}")
         print(f"trained on {seen:,} documents")
-        texts = None  # noqa: F841  — nothing below may rely on the materialised list
+        # Nothing below may rely on a materialised list of texts: the stream
+        # above is consumed once, by `train_from_iterator`, and there is no
+        # second pass to be had. See the comment above for why.
         args.out.mkdir(parents=True, exist_ok=True)
         tok.save(str(args.out / "tokenizer.json"))
         # The holdout block replaces the bare `holdout_every` this used to write.
@@ -485,7 +598,11 @@ def main(argv: list[str] | None = None) -> int:
                 "scheme": HOLDOUT_SCHEME,
                 "every": HOLDOUT_EVERY,
                 "corpus": corpus_identity(args.clean),
-                "dir": str(args.clean),
+                # What was asked for and what was READ, by name. `dir` used to
+                # be `str(args.clean)` — which, for the `clean-v8` symlink,
+                # filed v7's bytes under v8's name and wrote an absolute path
+                # containing the volume name into a file.
+                **corpus_record(args.clean),
             },
         }
         (args.out / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -494,9 +611,26 @@ def main(argv: list[str] | None = None) -> int:
         compare_on_corpus(tok, args.clean, meta=meta)
         return 0
 
-    tok = train(args.corpus, args.out, args.vocab_size)
+    tok = train(args.corpus, args.out, args.vocab_size,
+                accept_leaking_corpus=accept)
     compare(tok)
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """The CLI, with the corpus gate's refusal reported rather than raised.
+
+    A traceback is the wrong shape for "your corpus leaks and here is the token
+    to say you know": the refusal is the message, so it is printed whole and the
+    exit status is 2.
+    """
+    from ..data import CorpusLeakError, CorpusUnverifiable
+
+    try:
+        return _main(argv)
+    except (CorpusLeakError, CorpusUnverifiable) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

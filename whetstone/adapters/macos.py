@@ -164,7 +164,7 @@ def parse_dscl_pairs(text: str, *, value_is_int: bool = False) -> dict[str, Any]
 
 
 def parse_group_membership(text: str) -> list[str]:
-    """``GroupMembership: root b0mba_at0mica`` -> ``["root", "b0mba_at0mica"]``."""
+    """``GroupMembership: root demo_operator`` -> ``["root", "demo_operator"]``."""
     m = re.search(r"GroupMembership:\s*(.*)", text)
     if not m:
         return []

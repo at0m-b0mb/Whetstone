@@ -33,12 +33,14 @@ from typing import Any
 from whetstone.actions import Action, Observation, Verb
 from whetstone.adapters import linux as linux_adapter
 from whetstone.adapters.base import Adapter, AdapterError
+from whetstone.paths import lima_home
 
 __all__ = ["VMAdapter", "vm_available", "AUDIT_KEY", "SERVICE_PATH",
            "SERVICE_IMAGE", "TELEMETRY_SOURCE", "LAB_PATHS", "AUDIT_RULE_ARGV"]
 
-_LIMA_HOME = os.environ.get(
-    "LIMA_HOME", "/Volumes/at0m_b0mb/whetstone/lab/lima")
+#: ``lima_home`` already honours an exported ``LIMA_HOME``; kept a ``str``
+#: because this is handed straight to the subprocess environment.
+_LIMA_HOME = str(lima_home())
 _VM = os.environ.get("WHETSTONE_LAB_VM", "whetstone-lab")
 
 #: The binary the lab planted world-writable, and the name a detection probe

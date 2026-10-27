@@ -233,6 +233,7 @@ import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Sequence
+from whetstone.paths import data_root
 
 __all__ = [
     "ActionValidityError", "DefenceGroundTruthError",
@@ -1675,8 +1676,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--model", type=Path,
                    help="checkpoint to drive the loop with (constrained decoding)")
     p.add_argument("--tokenizer", type=Path,
-                   default=Path("/Volumes/at0m_b0mb/whetstone/models/"
-                                "tokenizer-v1/tokenizer.json"))
+                   default=data_root() / "models/tokenizer-v1/tokenizer.json")
     p.add_argument("--baseline", action="store_true",
                    help="also score the scripted sweep — the hand-written "
                         "ceiling for coverage, not a competitor")

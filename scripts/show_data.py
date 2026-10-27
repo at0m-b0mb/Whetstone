@@ -19,9 +19,19 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import sys
 from pathlib import Path
 
-D = Path("/Volumes/at0m_b0mb/whetstone")
+# ``scripts/`` is not a package: a bare ``python3 scripts/x.py`` puts
+# ``scripts/`` on sys.path and not the repo. Make the repo importable
+# either way, so the data-root policy has exactly one home.
+if str(Path(__file__).resolve().parents[1]) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from whetstone.paths import data_root  # noqa: E402
+
+
+D = data_root()
 C = {"dim": "\033[2m", "b": "\033[1m", "c": "\033[36m", "y": "\033[33m",
      "g": "\033[32m", "m": "\033[35m", "x": "\033[0m"}
 

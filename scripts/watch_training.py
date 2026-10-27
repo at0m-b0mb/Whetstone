@@ -26,7 +26,16 @@ import sys
 import time
 from pathlib import Path
 
-D = Path("/Volumes/at0m_b0mb/whetstone")
+# ``scripts/`` is not a package: a bare ``python3 scripts/x.py`` puts
+# ``scripts/`` on sys.path and not the repo. Make the repo importable
+# either way, so the data-root policy has exactly one home.
+if str(Path(__file__).resolve().parents[1]) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from whetstone.paths import data_root  # noqa: E402
+
+
+D = data_root()
 # The version is not a constant. This read overnight-v5 while v6 was the live
 # run, so the watcher sat all night reporting six green stages and a finished
 # model -- the most convincing possible way to be told nothing is wrong. Takes
@@ -162,9 +171,25 @@ def read_sft() -> list[dict]:
     return rows
 
 
+#: Which model this run trains. Read from the environment, defaulting to the
+#: historical value so an older run renders exactly as it did.
+#:
+#: **This used to be hardcoded to "small" in two places and it made the watcher
+#: lie.** The header read "small 61.5M" and :func:`checkpoints` looked only under
+#: ``small``/``small/best``/``small-sft`` — so a ``tiny`` run showed the wrong
+#: model name *and* no training progress whatsoever, because the checkpoint it
+#: was looking for did not exist. A watcher that reports nothing while a run is
+#: healthy is worse than no watcher: it sends you looking for a failure that is
+#: not there.
+MODEL = os.environ.get("MODEL", "small")
+
+#: Parameter counts from training/config.py's staircase, for the header only.
+_PARAMS = {"tiny": "14.6M", "small": "61.5M", "base": "151M"}
+
+
 def checkpoints() -> list[str]:
     out = []
-    for name in ("small", "small/best", "small-sft"):
+    for name in (MODEL, f"{MODEL}/best", f"{MODEL}-sft"):
         sj = D / f"models/checkpoints-{VER}" / name / "state.json"
         if sj.is_file():
             try:
@@ -182,7 +207,7 @@ def render() -> tuple[str, bool]:
     L: list[str] = []
     A = L.append
     A(f"{C['b']}{C['c']}  WHETSTONE — pipeline {VER}{C['x']}"
-      f"{C['dim']}   small 61.5M · {_corpus_stats()}{C['x']}")
+      f"{C['dim']}   {MODEL} {_PARAMS.get(MODEL, '?')} · {_corpus_stats()}{C['x']}")
     A("")
     A("  " + stage_strip(cur))
     A("")

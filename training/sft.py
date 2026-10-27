@@ -54,6 +54,7 @@ import numpy as np
 from .config import TrainConfig
 from .model import Whetstone
 from .pretrain import cosine_lr, load_checkpoint, save_checkpoint
+from whetstone.paths import data_root
 
 __all__ = [
     "ExampleStats", "build_examples", "replay_share", "sft", "size_replay",
@@ -651,7 +652,7 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Fine-tune on agent trajectories.")
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--trajectories", type=Path,
-                   default=Path("/Volumes/at0m_b0mb/whetstone/corpus/raw/trajectories"))
+                   default=data_root() / "corpus/raw/trajectories")
     p.add_argument("--tokenizer", type=Path, required=True)
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--epochs", type=int, default=3)

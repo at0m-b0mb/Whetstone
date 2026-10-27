@@ -83,6 +83,7 @@ from .capture import (attack_beats, findings_for, fix_blocks,
                       pair_fix_blocks)
 from .profiles import PROFILE_NAMES, engagement_for, purple
 from .target import SandboxTarget
+from whetstone.paths import data_root
 
 # A chooser that runs a full purple sweep: look, assess, exploit, and the
 # kernel pairs each exploit with its detection automatically.
@@ -1134,7 +1135,7 @@ def main(argv: list[str] | None = None) -> int:
                    help="drive the loop with a trained checkpoint instead of "
                         "the scripted sweep (constrained decoding)")
     p.add_argument("--tokenizer", type=Path,
-                   default=Path("/Volumes/at0m_b0mb/whetstone/models/tokenizer-v1/tokenizer.json"))
+                   default=data_root() / "models/tokenizer-v1/tokenizer.json")
     args = p.parse_args(argv)
     profile = Profile(args.mode)
 

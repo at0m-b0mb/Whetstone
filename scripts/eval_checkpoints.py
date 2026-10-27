@@ -2,9 +2,9 @@
 """Re-score saved checkpoints against the FIXED validation set, after the fact.
 
     PYTHONPATH=. python3 scripts/eval_checkpoints.py \
-        --data /Volumes/at0m_b0mb/whetstone/corpus/tokenized-v5 \
-        /Volumes/at0m_b0mb/whetstone/models/checkpoints-v5/small \
-        /Volumes/at0m_b0mb/whetstone/models/checkpoints-v5/small/best
+        --data data/corpus/tokenized-v5 \
+        data/models/checkpoints-v5/small \
+        data/models/checkpoints-v5/small/best
 
 **Why this exists.** Until ``training.pretrain`` was fixed, every evaluation
 drew a *fresh random subsample* of the validation split — 80 windows out of
