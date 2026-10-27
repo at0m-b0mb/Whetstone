@@ -47,12 +47,12 @@ from bench.whetbench import (
     run_bench,
 )
 from training.tokenizer.protocol import BOS
+from whetstone.paths import data_root
 
 #: The real tokenizer, when this machine has one. Everything that needs it skips
 #: rather than failing: a laptop with no data volume mounted must still be able
 #: to run the suite, but the id-level checks are worth having where they can run.
-REAL_TOKENIZER = Path(
-    "/Volumes/at0m_b0mb/whetstone/models/tokenizer-v1/tokenizer.json")
+REAL_TOKENIZER = data_root() / "models/tokenizer-v1/tokenizer.json"
 
 #: A continuation in each register, and one in the wrong register for each. The
 #: wrong ones are deliberately fluent security text: the failure being caught is
@@ -316,14 +316,21 @@ class TestRunBenchScoresTheContinuation:
         they do not both say it at once."""
         probes = _stub_run(monkeypatch, tmp_path, SHELL_CONTINUATION)
         by_name = {p.name: p.passed for p in probes}
-        assert by_name["shell-routing"] == 5
+        # Against each probe's declared sample count, not a literal. These read
+        # `== 5` until the probes were widened to 100, at which point the tests
+        # failed for arithmetic reasons while the instrument was fine — the same
+        # staleness that made `shell-routing 10/10 -> 1/5` look like a
+        # regression when the sample count, not the model, had changed.
+        n = {p.name: p.samples for p in probes}
+        assert by_name["shell-routing"] == n["shell-routing"]
         assert by_name["detection-routing"] == 0
 
     def test_a_sigma_continuation_passes_only_the_detection_probe(
             self, monkeypatch, tmp_path, capsys):
         probes = _stub_run(monkeypatch, tmp_path, SIGMA_CONTINUATION)
         by_name = {p.name: p.passed for p in probes}
-        assert by_name["detection-routing"] == 5
+        n = {p.name: p.samples for p in probes}
+        assert by_name["detection-routing"] == n["detection-routing"]
         assert by_name["shell-routing"] == 0
 
     def test_a_second_run_does_not_accumulate_samples(
@@ -348,6 +355,18 @@ class TestRunBenchScoresTheContinuation:
         test. So this asserts the shape of the calls instead. The checker sees
         its prompt exactly once, from ``assert_probes_can_fail``, and then sees
         the continuation and nothing but the continuation, once per sample.
+
+        **Asserted on the tail, not the whole list, and that is deliberate.** The
+        widened bench added guards that legitimately call the checker before any
+        scoring happens — ``assert_probes_can_pass`` hands it each probe's
+        ``exemplar``, and the degenerate-strategy guards hand it prompt-repeats to
+        measure what an echo scores. Pinning the entire call list would make this
+        test fail whenever a new guard is added, which is the staleness that made
+        ``shell-routing 10/10 -> 1/5`` read as a regression when only the sample
+        count had moved. The property worth guarding is narrower and unchanged:
+        **the scoring calls see the bare continuation and nothing else.** So the
+        prompt is asserted absent from the scored window rather than the preamble
+        being enumerated.
         """
         probe = next(p for p in PROBES if p.name == "shell-routing")
         seen: list[str] = []
@@ -359,8 +378,17 @@ class TestRunBenchScoresTheContinuation:
         monkeypatch.setattr(probe, "check", recorder, raising=True)
         _stub_run(monkeypatch, tmp_path, SHELL_CONTINUATION)
 
-        assert seen == [probe.prompt] + [SHELL_CONTINUATION] * probe.samples, (
-            "the checker was handed something other than the bare continuation")
+        scored = seen[-probe.samples:]
+        assert scored == [SHELL_CONTINUATION] * probe.samples, (
+            "the checker was handed something other than the bare continuation "
+            "while scoring")
+        # The guards ran, and none of their calls is a prompt joined to a
+        # continuation — the specific shape this test exists to forbid.
+        preamble = seen[:-probe.samples]
+        assert preamble, "no guard called the checker; assert_probes_can_fail is gone"
+        joined = probe.prompt + SHELL_CONTINUATION
+        assert joined not in seen, (
+            "a caller joined the prompt to the continuation before checking")
 
     def test_a_broken_probe_stops_the_run_before_the_model_loads(
             self, monkeypatch, tmp_path, capsys):
